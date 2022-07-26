@@ -153,7 +153,6 @@ struct mvm_device {
 	int wfi_irq;
 	int wdog_irq;
 	int pas_id;
-	int mvm_load_fw_cmd;
 	unsigned int incoming_msgs;
 	unsigned int outgoing_results;
 	dev_t mvm_cdev_devid;
@@ -170,7 +169,6 @@ struct mvm_device {
 	struct completion p0_fifo_slot_available;
 	struct completion p1_fifo_slot_available;
 	struct completion mvm_core_collapse_done;
-	struct work_struct mvm_load_fw_work;
 	struct kobject *kobj;
 	struct kobj_attribute attr;
 	struct dma_pool *ring_buffers_pool;
@@ -246,20 +244,17 @@ static void restore_mvm_core(struct mvm_device *mvm_dev)
 	disable_irq(mvm_dev->wfi_irq);
 }
 
-static void mvm_load_fw(struct work_struct *work)
+static int mvm_load_fw(struct mvm_device *mvm_dev)
 {
 	const struct firmware *fw;
 	char fw_name[32];
 	void *virt;
-	int ret;
-	struct mvm_device *mvm_dev;
-
-	mvm_dev = container_of(work, struct mvm_device, mvm_load_fw_work);
+	int ret = -1;
 
 	ret = request_firmware(&fw, fw_name, mvm_dev->dev);
 	if (ret) {
 		dev_err(mvm_dev->dev, "request_firmware for mvm failed\n");
-		return;
+		return ret;
 	}
 
 	virt = mvm_dev->mvm_fw;
@@ -275,35 +270,20 @@ static void mvm_load_fw(struct work_struct *work)
 	}
 
 	ret = qcom_scm_pas_auth_and_reset(mvm_dev->pas_id);
-	if (ret)
+	if (ret) {
 		dev_err(mvm_dev->dev, "Error authenticating mvm firmware\n");
+		goto unmap_memory;
+	}
+
+	return 0;
 
 unmap_memory:
 	memunmap(virt);
 
 out_release_firmware:
 	release_firmware(fw);
-}
 
-static ssize_t mvm_load_fw_store(struct kobject *kobj,
-				 struct kobj_attribute *attr,
-				 const char *buf,
-				 size_t count)
-{
-	int value = 0;
-	struct mvm_device *mvm_dev = container_of(attr,
-						  struct mvm_device,
-						  attr);
-
-	if (sscanf(buf, "%du", &value) != 1) {
-		pr_err("%s: failed to read mvm_fw_cmd info from string\n", __func__);
-		return -EINVAL;
-	}
-	mvm_dev->mvm_load_fw_cmd = value;
-
-	if (mvm_dev->mvm_load_fw_cmd == MVM_LOAD_FW)
-		schedule_work(&mvm_dev->mvm_load_fw_work);
-	return count;
+	return ret;
 }
 
 static int mvm_sysfs_init(struct mvm_device *mvm_dev)
@@ -312,28 +292,13 @@ static int mvm_sysfs_init(struct mvm_device *mvm_dev)
 
 	mvm_dev->kobj = kobject_create_and_add("mvm", kernel_kobj);
 	if (!mvm_dev->kobj) {
-		dev_err(mvm_dev->dev, "%s: mvm_load_fw sysfs creation failed\n",
+		dev_err(mvm_dev->dev, "%s: sysfs creation failed\n",
 					__func__);
 		return -ENOMEM;
 	}
 
-	sysfs_attr_init(&mvm_dev->attr.attr);
-	mvm_dev->attr.attr.mode = 0222;
-	mvm_dev->attr.attr.name = "mvm_load_fw";
-	mvm_dev->attr.show = NULL;
-	mvm_dev->attr.store = mvm_load_fw_store;
-
-	ret = sysfs_create_file(mvm_dev->kobj, &mvm_dev->attr.attr);
-	if (ret) {
-		dev_err(mvm_dev->dev, "%s: sysfs_create_file failed\n",
-					__func__);
-		goto fail_sysfs;
-	}
+	/*TODO Add a sysfs file to indicate the health of mvm subsystem */
 	return 0;
-
-fail_sysfs:
-	kobject_put(mvm_dev->kobj);
-	return ret;
 }
 
 static bool fifo_full(unsigned int fifo_head, unsigned int fifo_size, unsigned int fifo_tail)
@@ -1125,7 +1090,6 @@ static int mvm_probe(struct platform_device *pdev)
 		dev_err(mvm_dev->dev, "mvm sysfs initialisation failed\n");
 		goto mutex_err;
 	}
-	INIT_WORK(&mvm_dev->mvm_load_fw_work, mvm_load_fw);
 
 	ret = of_property_read_u32(mvm_dev->dev->of_node, "qcom,mvm-pas-id",
 							&mvm_dev->pas_id);
@@ -1134,7 +1098,13 @@ static int mvm_probe(struct platform_device *pdev)
 		goto mutex_err;
 	}
 
-/*TODO
+	ret = mvm_load_fw(mvm_dev);
+
+	if (ret)
+		goto mutex_err;
+
+	dev_info(mvm_dev->dev, "MVM subsystem brought out of reset\n");
+	/*TODO
 
 	 * 1. Turn on gcc clocks
 	 * 2. Turn on MVM_CC clocks
