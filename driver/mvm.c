@@ -250,23 +250,12 @@ static void mvm_load_fw(struct work_struct *work)
 {
 	const struct firmware *fw;
 	char fw_name[32];
-	phys_addr_t phys;
 	void *virt;
 	int ret;
 	struct mvm_device *mvm_dev;
 
 	mvm_dev = container_of(work, struct mvm_device, mvm_load_fw_work);
 
-	mvm_dev->mvm_fw_pool = dmam_pool_create("mvm_fw_pool", mvm_dev->dev, 0x10000,
-						512, 0);
-	if (!mvm_dev->mvm_fw_pool)
-		return;
-
-	mvm_dev->mvm_fw = dma_pool_zalloc(mvm_dev->mvm_fw_pool, GFP_KERNEL, &mvm_dev->mvm_fw_dma);
-	if (!mvm_dev->mvm_fw)
-		return;
-
-	phys = mvm_dev->mvm_fw_dma;
 	ret = request_firmware(&fw, fw_name, mvm_dev->dev);
 	if (ret) {
 		dev_err(mvm_dev->dev, "request_firmware for mvm failed\n");
@@ -279,7 +268,7 @@ static void mvm_load_fw(struct work_struct *work)
 		goto out_release_firmware;
 	}
 
-	ret = qcom_mdt_load(mvm_dev->dev, fw, fw_name, mvm_dev->pas_id, virt, phys, 0x10000, NULL);
+	ret = qcom_mdt_load(mvm_dev->dev, fw, fw_name, mvm_dev->pas_id, virt, mvm_dev->mvm_fw_dma, 0x10000, NULL);
 	if (ret) {
 		dev_err(mvm_dev->dev, "Failed to load mvm firmware\n");
 		goto unmap_memory;
@@ -928,6 +917,53 @@ static int register_isrs(struct platform_device *pdev)
 	return 0;
 }
 
+static int mvm_dma_pool_create(struct mvm_device *mvm_dev)
+{
+	/* dma pool for ddr ring buffers */
+	mvm_dev->ring_buffers_pool = dma_pool_create("mvm_ring_buffers", mvm_dev->dev,
+						     sizeof(struct ring_buffers), 512, 0);
+	if (!mvm_dev->ring_buffers_pool) {
+		dev_err(mvm_dev->dev,
+			"can't create ring buffer dma_pool, %d\n", -ENOMEM);
+		return -ENOMEM;
+	}
+
+	mvm_dev->ring_buff = dma_pool_zalloc(mvm_dev->ring_buffers_pool, GFP_KERNEL, &mvm_dev->ring_buff_dma);
+	if (!mvm_dev->ring_buff) {
+		dev_err(mvm_dev->dev,
+			"can't allocate memory for ring buffer dma_pool, %d\n", -ENOMEM);
+		goto ring_buff_dma_pool_alloc_fail;
+	}
+
+	/* dma pool for mvm firmware */
+	mvm_dev->mvm_fw_pool = dma_pool_create("mvm_fw_pool", mvm_dev->dev,
+						0x10000, 512, 0);
+	if (!mvm_dev->mvm_fw_pool) {
+		dev_err(mvm_dev->dev,
+			"can't create firmware buffer dma_pool, %d\n", -ENOMEM);
+		goto fw_dma_pool_create_fail;
+	}
+
+	mvm_dev->mvm_fw = dma_pool_zalloc(mvm_dev->mvm_fw_pool, GFP_KERNEL, &mvm_dev->mvm_fw_dma);
+	if (!mvm_dev->mvm_fw) {
+		dev_err(mvm_dev->dev,
+			"can't allocate memory for fw dma_pool, %d\n", -ENOMEM);
+		goto fw_dma_pool_alloc_fail;
+	}
+
+	return 0;
+
+fw_dma_pool_alloc_fail:
+	dma_pool_destroy(mvm_dev->mvm_fw_pool);
+fw_dma_pool_create_fail:
+	dma_pool_free(mvm_dev->ring_buffers_pool, mvm_dev->ring_buff,
+			mvm_dev->ring_buff_dma);
+ring_buff_dma_pool_alloc_fail:
+	dma_pool_destroy(mvm_dev->ring_buffers_pool);
+
+	return -ENOMEM;
+}
+
 static const struct file_operations mvm_fileops = {
 	.open = mvm_open,
 	.release = mvm_release,
@@ -1055,19 +1091,14 @@ static int mvm_probe(struct platform_device *pdev)
 
 	dev_info(mvm_dev->dev, "mvm character device driver created\n");
 
-	mvm_dev->ring_buffers_pool = dmam_pool_create("mvm_ring_buffers", mvm_dev->dev, sizeof(struct ring_buffers),
-								512, 0);
-	if (!mvm_dev->ring_buffers_pool)
-		return -ENOMEM;
-
-	mvm_dev->ring_buff = dma_pool_zalloc(mvm_dev->ring_buffers_pool, GFP_KERNEL, &mvm_dev->ring_buff_dma);
-	if (!mvm_dev->ring_buff)
-		return -ENOMEM;
+	ret = mvm_dma_pool_create(mvm_dev);
+	if (ret)
+		goto device_fail;
 
 	ret = ioremap_resources(pdev);
 	if (ret) {
 		dev_err(mvm_dev->dev, "Cant ioremap resources\n");
-		goto ioremap_fail;
+		goto device_fail;
 	}
 
 	initialise_fifos(mvm_dev);
@@ -1076,7 +1107,7 @@ static int mvm_probe(struct platform_device *pdev)
 	if (ret < 0) {
 		dev_err(mvm_dev->dev,
 			"registration of isrs failed\n");
-		goto ioremap_fail;
+		goto device_fail;
 	}
 
 	mutex_init(&mvm_dev->mvm_cli_lock);
@@ -1116,7 +1147,7 @@ static int mvm_probe(struct platform_device *pdev)
 mutex_err:
 	mutex_destroy(&mvm_dev->mvm_csr_lock);
 	mutex_destroy(&mvm_dev->mvm_cli_lock);
-ioremap_fail:
+device_fail:
 	device_destroy(mvm_dev->mvm_class, mvm_dev->mvm_cdev_devid);
 class_fail:
 	class_destroy(mvm_dev->mvm_class);
@@ -1139,6 +1170,12 @@ static int mvm_remove(struct platform_device *pdev)
 	kobject_put(mvm_dev->kobj);
 	mutex_destroy(&mvm_dev->mvm_csr_lock);
 	mutex_destroy(&mvm_dev->mvm_cli_lock);
+	dma_pool_free(mvm_dev->ring_buffers_pool, mvm_dev->ring_buff,
+					mvm_dev->ring_buff_dma);
+	dma_pool_destroy(mvm_dev->ring_buffers_pool);
+	dma_pool_free(mvm_dev->mvm_fw_pool, mvm_dev->mvm_fw,
+					mvm_dev->mvm_fw_dma);
+	dma_pool_destroy(mvm_dev->mvm_fw_pool);
 	device_destroy(mvm_dev->mvm_class, mvm_dev->mvm_cdev_devid);
 	class_destroy(mvm_dev->mvm_class);
 	cdev_del(&mvm_dev->mvm_cdev);
