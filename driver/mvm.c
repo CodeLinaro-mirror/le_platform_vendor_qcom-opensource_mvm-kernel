@@ -871,13 +871,13 @@ static int register_isrs(struct platform_device *pdev)
 
 	ret = devm_request_threaded_irq(mvm_dev->dev, mvm_dev->wdog_irq,
 					NULL, mvm_wdog_irq_handler,
-					IRQF_TRIGGER_HIGH | IRQF_ONESHOT,
+					IRQF_TRIGGER_RISING | IRQF_ONESHOT,
 					"mvm_dog", mvm_dev);
 	if (ret) {
 		dev_err(mvm_dev->dev, "mvm_wdog irq request failed\n");
 		return ret;
 	}
-	dev_info(mvm_dev->dev, "wdog registered\n");
+	dev_info(mvm_dev->dev, "wdog irq registered\n");
 
 	return 0;
 }
