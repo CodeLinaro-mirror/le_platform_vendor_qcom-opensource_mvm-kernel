@@ -288,8 +288,6 @@ out_release_firmware:
 
 static int mvm_sysfs_init(struct mvm_device *mvm_dev)
 {
-	int ret = 0;
-
 	mvm_dev->kobj = kobject_create_and_add("mvm", kernel_kobj);
 	if (!mvm_dev->kobj) {
 		dev_err(mvm_dev->dev, "%s: sysfs creation failed\n",
