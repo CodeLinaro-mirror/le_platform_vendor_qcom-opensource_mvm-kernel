@@ -32,10 +32,10 @@
 #define OUT_BUFF_SIZE			32
 #define TIMEOUT_MS			10000
 #define MAX_CLIENT_COUNT		16
-#define NUM_PKES			3
-#define MVM_LOAD_FW                     1
 /* TODO Remove this once power management is enabled for MVM */
 #define CONFIG_MVM_PM                   0
+/*TODO Remove this once PIL validation is complete */
+#define KEEP_FW_IN_DDR			1
 
 /* CSR to enable WFI interrupt from E21 to APPS */
 #define MVMSS_CSR_RVSS_CFG_OFFSET	0x02000010
@@ -66,6 +66,9 @@
 #define MVMSS_CSR_OUTPUT_RING1_TAIL_PTR_OFFSET	0x02008004
 #define MVMSS_CSR_OUTPUT_RING1_HEAD_PTR_OFFSET	0x02004004
 
+#define MVMSS_CSR_APSS_MVM_SCRATCH_PAD0 	0x02005000
+#define MVMSS_CSR_APSS_MVM_SCRATCH_PAD1 	0x02005004
+#define MVM_INIT_DONE_COOKIE			0xc0deba5e
 #define SW_COLLAPSE_MASK			0xFFFFFFFE
 #define MVM_CC_MVM_GDSCR_OFFSET			0x02028004
 #define MVM_CC_AHB_CORE_CBCR_OFFSET     	0x02028120
@@ -105,6 +108,7 @@
 
 #define GDSC_POWER_SLEEP_US             10
 #define GDSC_POWER_TIMEOUT_US           1000000
+#define MVM_DUMP_COLL_TIMEOUT_MS	3000
 
 struct input_fifo {
 	unsigned int head;
@@ -166,17 +170,22 @@ struct mvm_device {
 	struct mutex mvm_csr_lock;
 	wait_queue_head_t mvm_waitqueue;
 	struct work_struct drain_out_fifo_work;
+	struct work_struct trigger_ssr_work;
 	struct completion p0_fifo_slot_available;
 	struct completion p1_fifo_slot_available;
 	struct completion mvm_core_collapse_done;
+	struct completion mvm_dump_collection_done;
 	struct kobject *kobj;
 	struct kobj_attribute attr;
 	struct dma_pool *ring_buffers_pool;
 	struct dma_pool *mvm_fw_pool;
+	struct dma_pool *mvm_dump_pool;
 	uint32_t *mvm_fw;
+	uint32_t *mvm_dump;
 	struct ring_buffers *ring_buff;
 	dma_addr_t ring_buff_dma;
 	dma_addr_t mvm_fw_dma;
+	dma_addr_t mvm_dump_dma;
 };
 
 static void enable_wfi_int(struct mvm_device *mvm_dev, bool enable)
@@ -242,48 +251,6 @@ static void restore_mvm_core(struct mvm_device *mvm_dev)
 	enable_mvm_gdsc(mvm_dev, true);
 	enable_wfi_int(mvm_dev, false);
 	disable_irq(mvm_dev->wfi_irq);
-}
-
-static int mvm_load_fw(struct mvm_device *mvm_dev)
-{
-	const struct firmware *fw;
-	char fw_name[32];
-	void *virt;
-	int ret = -1;
-
-	ret = request_firmware(&fw, fw_name, mvm_dev->dev);
-	if (ret) {
-		dev_err(mvm_dev->dev, "request_firmware for mvm failed\n");
-		return ret;
-	}
-
-	virt = mvm_dev->mvm_fw;
-	if (!virt) {
-		dev_err(mvm_dev->dev, "Failed to remap firmware memory\n");
-		goto out_release_firmware;
-	}
-
-	ret = qcom_mdt_load(mvm_dev->dev, fw, fw_name, mvm_dev->pas_id, virt, mvm_dev->mvm_fw_dma, 0x10000, NULL);
-	if (ret) {
-		dev_err(mvm_dev->dev, "Failed to load mvm firmware\n");
-		goto unmap_memory;
-	}
-
-	ret = qcom_scm_pas_auth_and_reset(mvm_dev->pas_id);
-	if (ret) {
-		dev_err(mvm_dev->dev, "Error authenticating mvm firmware\n");
-		goto unmap_memory;
-	}
-
-	return 0;
-
-unmap_memory:
-	memunmap(virt);
-
-out_release_firmware:
-	release_firmware(fw);
-
-	return ret;
 }
 
 static int mvm_sysfs_init(struct mvm_device *mvm_dev)
@@ -438,7 +405,7 @@ static irqreturn_t mvm_ssr_done_irq_handler(int irq, void *dev_id)
 	value = (value & (~(1 << ((mvm_dev->mvm_ssr_done_hw_irq - 432)))));
 	writel_relaxed(value, mvm_dev->mvm_base+MVMSS_CSR_MVMSS_APSS);
 
-	/*TODO Implement me */
+	complete(&mvm_dev->mvm_dump_collection_done);
 	return IRQ_HANDLED;
 }
 
@@ -629,7 +596,7 @@ ret:
 
 	dev_dbg(mvm_dev->dev, "no_of_msgs_written %d\n", no_of_msgs_written);
 
-	writel_relaxed(IRQ_APSS0, mvm_dev->apss_shared_base);
+	writel_relaxed(IRQ_APSS1, mvm_dev->apss_shared_base);
 	return no_of_msgs_written;
 }
 
@@ -703,22 +670,13 @@ static irqreturn_t mvm_wfi_irq_handler(int irq, void *dev_id)
 	return IRQ_HANDLED;
 }
 
-static irqreturn_t mvm_wdog_irq_handler(int irq, void *dev_id)
-{
-	struct mvm_device *mvm_dev = dev_id;
-
-	dev_info(mvm_dev->dev, "%s\n", __func__);
-	/*TODO Implement me */
-	return IRQ_HANDLED;
-}
-
 static void initialise_fifos(struct mvm_device *mvm_dev)
 {
 	uint32_t infifo_size, outfifo_size;
 	infifo_size = sizeof(struct input_fifo);
 	outfifo_size = sizeof(struct output_fifo);
 
-	/*IN_FIFO[0] */
+	/*initialise P0 Input Ring buffer pointers */
 	mvm_dev->ring_buff->in_fifo[0].head = 0;
 	writel_relaxed(mvm_dev->ring_buff->in_fifo[0].head,
 			mvm_dev->mvm_base + MVMSS_CSR_INPUT_RING0_HEAD_PTR_OFFSET);
@@ -732,7 +690,7 @@ static void initialise_fifos(struct mvm_device *mvm_dev)
 	writel_relaxed(mvm_dev->ring_buff_dma + 0x10,
 			mvm_dev->mvm_base + MVMSS_CSR_INPUT_RING0_BASE_ADDR);
 
-	/*IN_FIFO[1] */
+	/*initialise P1 Input Ring buffer pointers */
 	mvm_dev->ring_buff->in_fifo[1].head = 0;
 	writel_relaxed(mvm_dev->ring_buff->in_fifo[1].head,
 		mvm_dev->mvm_base + MVMSS_CSR_INPUT_RING1_HEAD_PTR_OFFSET);
@@ -747,7 +705,7 @@ static void initialise_fifos(struct mvm_device *mvm_dev)
 		mvm_dev->mvm_base + MVMSS_CSR_INPUT_RING1_BASE_ADDR);
 
 
-	/*OUT_FIFO[0] */
+	/*initialise P0 Output Ring buffer pointers */
 	mvm_dev->ring_buff->out_fifo[0].head = 0;
 	writel_relaxed(mvm_dev->ring_buff->out_fifo[0].head,
 		mvm_dev->mvm_base + MVMSS_CSR_OUTPUT_RING0_HEAD_PTR_OFFSET);
@@ -761,7 +719,7 @@ static void initialise_fifos(struct mvm_device *mvm_dev)
 	writel_relaxed(mvm_dev->ring_buff_dma + (2 * infifo_size) + 0x10,
 		mvm_dev->mvm_base + MVMSS_CSR_OUTPUT_RING0_BASE_ADDR);
 
-	/*OUT_FIFO[1] */
+	/*initialise P1 Output Ring buffer pointers */
 	mvm_dev->ring_buff->out_fifo[1].head = 0;
 	writel_relaxed(mvm_dev->ring_buff->out_fifo[1].head,
 		mvm_dev->mvm_base + MVMSS_CSR_OUTPUT_RING1_HEAD_PTR_OFFSET);
@@ -774,6 +732,9 @@ static void initialise_fifos(struct mvm_device *mvm_dev)
 		mvm_dev->mvm_base + MVMSS_CSR_OUTPUT_RING1_BUFFER_LENGTH);
 	writel_relaxed(mvm_dev->ring_buff_dma + (2 * infifo_size) + outfifo_size + 0x10,
 		mvm_dev->mvm_base + MVMSS_CSR_OUTPUT_RING1_BASE_ADDR);
+
+	writel_relaxed(MVM_INIT_DONE_COOKIE,
+				mvm_dev->mvm_base + MVMSS_CSR_APSS_MVM_SCRATCH_PAD1);
 }
 
 static int ioremap_resources(struct platform_device *pdev)
@@ -797,6 +758,109 @@ static int ioremap_resources(struct platform_device *pdev)
 		return -ENOMEM;
 	}
 	return 0;
+}
+
+static int mvm_load_fw(struct mvm_device *mvm_dev)
+{
+	const struct firmware *fw;
+	char fw_name[32];
+	void *virt;
+	int ret = -1;
+
+	/* Allocate dma pool for mvm firmware */
+	mvm_dev->mvm_fw_pool = dma_pool_create("mvm_fw_pool", mvm_dev->dev,
+							0x10000, 512, 0);
+	if (!mvm_dev->mvm_fw_pool) {
+		dev_err(mvm_dev->dev,
+				"can't create firmware buffer dma_pool, %d\n", -ENOMEM);
+		return ret;
+	}
+
+	mvm_dev->mvm_fw = dma_pool_zalloc(mvm_dev->mvm_fw_pool, GFP_KERNEL, &mvm_dev->mvm_fw_dma);
+	if (!mvm_dev->mvm_fw) {
+		dev_err(mvm_dev->dev,
+			"can't allocate memory for fw dma_pool, %d\n", -ENOMEM);
+		goto fw_dma_pool_alloc_fail;
+	}
+
+	scnprintf(fw_name, ARRAY_SIZE(fw_name), "mvm_ecc.mdt");
+	ret = request_firmware(&fw, fw_name, mvm_dev->dev);
+	if (ret) {
+		dev_err(mvm_dev->dev, "request_firmware for mvm failed\n");
+		goto release_fw_dma_mem;
+	}
+
+	virt = mvm_dev->mvm_fw;
+	if (!virt) {
+		dev_err(mvm_dev->dev, "Failed to remap firmware memory\n");
+		goto out_release_firmware;
+	}
+
+	ret = qcom_mdt_load(mvm_dev->dev, fw, fw_name, mvm_dev->pas_id,
+			    virt, mvm_dev->mvm_fw_dma, 0x10000, NULL);
+	if (ret) {
+		dev_err(mvm_dev->dev, "Failed to load mvm firmware\n");
+		goto out_release_firmware;
+	}
+
+	ret = qcom_scm_pas_auth_and_reset(mvm_dev->pas_id);
+	if (ret) {
+		dev_err(mvm_dev->dev, "Error authenticating mvm firmware\n");
+		goto out_release_firmware;
+	}
+	dev_info(mvm_dev->dev, "MVM subsystem brought out of reset\n");
+
+	initialise_fifos(mvm_dev);
+	/*Send an interrupt to MVM to indicate MVM_Init done */
+	writel_relaxed(IRQ_APSS0, mvm_dev->apss_shared_base);
+#ifdef KEEP_FW_IN_DDR
+	return 0;
+#else
+	goto release_fw_dma_mem;
+#endif
+
+out_release_firmware:
+	release_firmware(fw);
+
+release_fw_dma_mem:
+        dma_pool_free(mvm_dev->mvm_fw_pool, mvm_dev->mvm_fw,
+                                mvm_dev->mvm_fw_dma);
+fw_dma_pool_alloc_fail:
+        dma_pool_destroy(mvm_dev->mvm_fw_pool);
+	return ret;
+}
+
+static void trigger_ssr_work_hdlr(struct work_struct *work)
+{
+	struct mvm_device *mvm_dev = container_of(work, struct mvm_device, trigger_ssr_work);
+	int ret = 0;
+
+	ret = qcom_scm_pas_shutdown(mvm_dev->pas_id);
+	if (ret) {
+		dev_err(mvm_dev->dev, "Error sending shutdown request to MVM\n");
+		return;
+	}
+
+	ret = wait_for_completion_interruptible_timeout(
+			&mvm_dev->mvm_dump_collection_done,
+			msecs_to_jiffies(MVM_DUMP_COLL_TIMEOUT_MS));
+	if (ret == 0) {
+		dev_err(mvm_dev->dev, "Timed out as mvm dump collection is not complete\n");
+		return;
+	}
+	/*TODO Power on GDSC */
+	mvm_load_fw(mvm_dev);
+
+	return;
+}
+
+static irqreturn_t mvm_wdog_irq_handler(int irq, void *dev_id)
+{
+	struct mvm_device *mvm_dev = dev_id;
+
+	dev_info(mvm_dev->dev, "%s\n", __func__);
+	schedule_work(&mvm_dev->trigger_ssr_work);
+	return IRQ_HANDLED;
 }
 
 static int register_isrs(struct platform_device *pdev)
@@ -880,6 +944,14 @@ static int register_isrs(struct platform_device *pdev)
 	return 0;
 }
 
+static void mvm_dma_pool_release(struct mvm_device *mvm_dev)
+{
+	dma_pool_free(mvm_dev->mvm_dump_pool, mvm_dev->mvm_dump, mvm_dev->mvm_dump_dma);
+	dma_pool_destroy(mvm_dev->mvm_dump_pool);
+	dma_pool_free(mvm_dev->ring_buffers_pool, mvm_dev->ring_buff, mvm_dev->ring_buff_dma);
+	dma_pool_destroy(mvm_dev->ring_buffers_pool);
+}
+
 static int mvm_dma_pool_create(struct mvm_device *mvm_dev)
 {
 	/* dma pool for ddr ring buffers */
@@ -898,27 +970,27 @@ static int mvm_dma_pool_create(struct mvm_device *mvm_dev)
 		goto ring_buff_dma_pool_alloc_fail;
 	}
 
-	/* dma pool for mvm firmware */
-	mvm_dev->mvm_fw_pool = dma_pool_create("mvm_fw_pool", mvm_dev->dev,
-						0x10000, 512, 0);
-	if (!mvm_dev->mvm_fw_pool) {
+	/*Allocate memory for mvm crash dump */
+	mvm_dev->mvm_dump_pool = dma_pool_create("mvm_dump", mvm_dev->dev,
+							0x10000, 512, 0);
+	if (!mvm_dev->mvm_dump_pool) {
 		dev_err(mvm_dev->dev,
-			"can't create firmware buffer dma_pool, %d\n", -ENOMEM);
-		goto fw_dma_pool_create_fail;
+			"can't create mvm dump buffer dma_pool, %d\n", -ENOMEM);
+		goto dump_dma_pool_create_fail;
 	}
 
-	mvm_dev->mvm_fw = dma_pool_zalloc(mvm_dev->mvm_fw_pool, GFP_KERNEL, &mvm_dev->mvm_fw_dma);
-	if (!mvm_dev->mvm_fw) {
+	mvm_dev->mvm_dump = dma_pool_zalloc(mvm_dev->mvm_dump_pool, GFP_KERNEL, &mvm_dev->mvm_dump_dma);
+	if (!mvm_dev->mvm_dump) {
 		dev_err(mvm_dev->dev,
-			"can't allocate memory for fw dma_pool, %d\n", -ENOMEM);
-		goto fw_dma_pool_alloc_fail;
+			"can't allocate memory for mvm dump dma_pool, %d\n", -ENOMEM);
+		goto dump_dma_pool_alloc_fail;
 	}
 
 	return 0;
 
-fw_dma_pool_alloc_fail:
-	dma_pool_destroy(mvm_dev->mvm_fw_pool);
-fw_dma_pool_create_fail:
+dump_dma_pool_alloc_fail:
+	dma_pool_destroy(mvm_dev->mvm_dump_pool);
+dump_dma_pool_create_fail:
 	dma_pool_free(mvm_dev->ring_buffers_pool, mvm_dev->ring_buff,
 			mvm_dev->ring_buff_dma);
 ring_buff_dma_pool_alloc_fail:
@@ -1033,7 +1105,6 @@ static int mvm_probe(struct platform_device *pdev)
 
 	cdev_init(&mvm_dev->mvm_cdev, &mvm_fileops);
 	cdev_add(&mvm_dev->mvm_cdev, mvm_dev->mvm_cdev_devid, 1);
-
 	mvm_dev->mvm_class = class_create(THIS_MODULE, "mvm");
 	if (IS_ERR(mvm_dev->mvm_class)) {
 		dev_err(mvm_dev->dev,
@@ -1057,31 +1128,35 @@ static int mvm_probe(struct platform_device *pdev)
 	ret = mvm_dma_pool_create(mvm_dev);
 	if (ret)
 		goto device_fail;
-
 	ret = ioremap_resources(pdev);
 	if (ret) {
 		dev_err(mvm_dev->dev, "Cant ioremap resources\n");
-		goto device_fail;
+		goto ioremap_fail;
 	}
 
-	initialise_fifos(mvm_dev);
+	/* Write crash dump DDR location to SCRATCH_PAD0 register so that E21 can store the crash
+	 * dump information here.
+	 */
+	writel_relaxed(mvm_dev->mvm_dump_dma,
+			mvm_dev->mvm_base + MVMSS_CSR_APSS_MVM_SCRATCH_PAD0);
 
 	ret = register_isrs(pdev);
 	if (ret < 0) {
 		dev_err(mvm_dev->dev,
 			"registration of isrs failed\n");
-		goto device_fail;
+		goto ioremap_fail;
 	}
-
 	mutex_init(&mvm_dev->mvm_cli_lock);
 	mutex_init(&mvm_dev->mvm_csr_lock);
 	INIT_LIST_HEAD(&mvm_dev->client_list);
 	init_waitqueue_head(&mvm_dev->mvm_waitqueue);
 	bitmap_zero(mvm_dev->client_id_bitmap, MAX_CLIENT_COUNT);
 	INIT_WORK(&mvm_dev->drain_out_fifo_work, drain_out_fifo_work_hdlr);
+	INIT_WORK(&mvm_dev->trigger_ssr_work, trigger_ssr_work_hdlr);
 	init_completion(&mvm_dev->p0_fifo_slot_available);
 	init_completion(&mvm_dev->p1_fifo_slot_available);
 	init_completion(&mvm_dev->mvm_core_collapse_done);
+	init_completion(&mvm_dev->mvm_dump_collection_done);
 
 	ret = mvm_sysfs_init(mvm_dev);
 	if (ret) {
@@ -1101,27 +1176,18 @@ static int mvm_probe(struct platform_device *pdev)
 	if (ret)
 		goto mutex_err;
 
-	dev_info(mvm_dev->dev, "MVM subsystem brought out of reset\n");
-	/*TODO
-
-	 * 1. Turn on gcc clocks
-	 * 2. Turn on MVM_CC clocks
-	 * 3. Turn on GDSC
-	 */
-
 	mvm_dev->resume_frm_pwr_collapse = true;
 	return 0;
-
 mutex_err:
 	mutex_destroy(&mvm_dev->mvm_csr_lock);
 	mutex_destroy(&mvm_dev->mvm_cli_lock);
+ioremap_fail:
+	mvm_dma_pool_release(mvm_dev);
 device_fail:
 	device_destroy(mvm_dev->mvm_class, mvm_dev->mvm_cdev_devid);
 class_fail:
 	class_destroy(mvm_dev->mvm_class);
 cdev_fail:
-	device_destroy(mvm_dev->mvm_class, mvm_dev->mvm_cdev_devid);
-	class_destroy(mvm_dev->mvm_class);
 	cdev_del(&mvm_dev->mvm_cdev);
 	unregister_chrdev_region(mvm_dev->mvm_cdev_devid, 1);
 drv_err:
@@ -1141,9 +1207,6 @@ static int mvm_remove(struct platform_device *pdev)
 	dma_pool_free(mvm_dev->ring_buffers_pool, mvm_dev->ring_buff,
 					mvm_dev->ring_buff_dma);
 	dma_pool_destroy(mvm_dev->ring_buffers_pool);
-	dma_pool_free(mvm_dev->mvm_fw_pool, mvm_dev->mvm_fw,
-					mvm_dev->mvm_fw_dma);
-	dma_pool_destroy(mvm_dev->mvm_fw_pool);
 	device_destroy(mvm_dev->mvm_class, mvm_dev->mvm_cdev_devid);
 	class_destroy(mvm_dev->mvm_class);
 	cdev_del(&mvm_dev->mvm_cdev);
