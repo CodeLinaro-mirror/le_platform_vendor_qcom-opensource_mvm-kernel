@@ -25,6 +25,7 @@
 #include <linux/bitops.h>
 #include <linux/dmapool.h>
 #include <linux/dma-mapping.h>
+#include <linux/clk.h>
 
 #define DDR_FIFO_COUNT			2
 #define DDR_FIFO_SIZE			128
@@ -186,6 +187,8 @@ struct mvm_device {
 	dma_addr_t ring_buff_dma;
 	dma_addr_t mvm_fw_dma;
 	dma_addr_t mvm_dump_dma;
+	struct clk *xo;
+	struct clk *cnoc_s_ahb_clk;
 };
 
 static void enable_wfi_int(struct mvm_device *mvm_dev, bool enable)
@@ -1009,6 +1012,36 @@ static const struct file_operations mvm_fileops = {
 	.owner = THIS_MODULE,
 };
 
+static int enable_gcc_clocks(struct mvm_device *mvm_dev)
+{
+	int ret = 0;
+
+	mvm_dev->xo = devm_clk_get(mvm_dev->dev, "xo");
+	if (IS_ERR(mvm_dev->xo))
+		return PTR_ERR(mvm_dev->xo);
+
+	mvm_dev->cnoc_s_ahb_clk = devm_clk_get(mvm_dev->dev, "mvmss_cnoc_ahb_clk");
+	if (IS_ERR(mvm_dev->cnoc_s_ahb_clk))
+		return PTR_ERR(mvm_dev->cnoc_s_ahb_clk);
+
+	ret = clk_prepare_enable(mvm_dev->xo);
+	if (ret) {
+		dev_err(mvm_dev->dev, "Failed to vote for XO clk\n");
+		return ret;
+	}
+
+	ret = clk_prepare_enable(mvm_dev->cnoc_s_ahb_clk);
+	if (ret) {
+		dev_err(mvm_dev->dev, "Failed to vote for cnoc_s_ahb_clk\n");
+		goto err;
+	}
+	return 0;
+
+err:
+	clk_disable_unprepare(mvm_dev->xo);
+	return ret;
+}
+
 #if (defined CONFIG_PM && defined CONFIG_MVM_PM)
 
 static int mvm_suspend(struct device *dev)
@@ -1164,6 +1197,18 @@ static int mvm_probe(struct platform_device *pdev)
 		goto mutex_err;
 	}
 
+	ret = enable_gcc_clocks(mvm_dev);
+        if (ret) {
+                dev_err(mvm_dev->dev, "Failed to turn on gcc clocks\n");
+		goto mutex_err;
+	}
+
+	ret = enable_mvm_gdsc(mvm_dev, true);
+	if (ret) {
+		dev_err(mvm_dev->dev, "Failed to turn on mvm gdsc\n");
+		goto gdsc_err;
+	}
+
 	ret = of_property_read_u32(mvm_dev->dev->of_node, "qcom,mvm-pas-id",
 							&mvm_dev->pas_id);
 	if (ret) {
@@ -1178,6 +1223,10 @@ static int mvm_probe(struct platform_device *pdev)
 
 	mvm_dev->resume_frm_pwr_collapse = true;
 	return 0;
+
+gdsc_err:
+	clk_disable_unprepare(mvm_dev->cnoc_s_ahb_clk);
+	clk_disable_unprepare(mvm_dev->xo);
 mutex_err:
 	mutex_destroy(&mvm_dev->mvm_csr_lock);
 	mutex_destroy(&mvm_dev->mvm_cli_lock);
