@@ -111,6 +111,31 @@
 #define GDSC_POWER_TIMEOUT_US           1000000
 #define MVM_DUMP_COLL_TIMEOUT_MS	3000
 
+/**
+ * enum mvm_state - state of mvm subsystem
+ * @MVM_OFFLINE: MVM firmware is not loaded/authenticated yet.
+ * @MVM_ONLINE: The MVM firmware has been loaded, authenticate and MVMSS is up and running.
+ * @MVM_CRASHED: Watchdog bite is received from MVM to APSS.
+ * @MVM_RESTARTING: The mvm dump has been collected and ssr_done_irq is received from MVM to APSS.
+ * @MVM_SLEEP: The gdsc core collapse sequence has been completed from APSS.
+**/
+
+enum mvm_state {
+	MVM_OFFLINE,
+	MVM_ONLINE,
+	MVM_CRASHED,
+	MVM_RESTARTING,
+	MVM_SLEEP,
+};
+
+static const char * const mvm_states[] = {
+	[MVM_OFFLINE] = "OFFLINE",
+	[MVM_ONLINE] = "ONLINE",
+	[MVM_CRASHED] = "CRASHED",
+	[MVM_RESTARTING] = "RESTARTING",
+	[MVM_SLEEP] = "SLEEP",
+};
+
 struct input_fifo {
 	unsigned int head;
 	unsigned int tail;
@@ -189,6 +214,7 @@ struct mvm_device {
 	dma_addr_t mvm_dump_dma;
 	struct clk *xo;
 	struct clk *cnoc_s_ahb_clk;
+	enum mvm_state state;
 };
 
 static void enable_wfi_int(struct mvm_device *mvm_dev, bool enable)
@@ -256,8 +282,20 @@ static void restore_mvm_core(struct mvm_device *mvm_dev)
 	disable_irq(mvm_dev->wfi_irq);
 }
 
+static ssize_t mvm_state_show(struct kobject *kobj,
+				 struct kobj_attribute *attr,
+				 char *buf)
+{
+	struct mvm_device *mvm_dev = container_of(attr,
+						  struct mvm_device,
+						  attr);
+	return snprintf(buf, 0x10, "%s\n", mvm_states[mvm_dev->state]);
+}
+
 static int mvm_sysfs_init(struct mvm_device *mvm_dev)
 {
+	int ret = 0;
+
 	mvm_dev->kobj = kobject_create_and_add("mvm", kernel_kobj);
 	if (!mvm_dev->kobj) {
 		dev_err(mvm_dev->dev, "%s: sysfs creation failed\n",
@@ -265,8 +303,23 @@ static int mvm_sysfs_init(struct mvm_device *mvm_dev)
 		return -ENOMEM;
 	}
 
-	/*TODO Add a sysfs file to indicate the health of mvm subsystem */
+	sysfs_attr_init(&mvm_dev->attr.attr);
+	mvm_dev->attr.attr.mode = 0444;
+	mvm_dev->attr.attr.name = "mvm_state";
+	mvm_dev->attr.show = mvm_state_show;
+	mvm_dev->attr.store = NULL;
+
+	ret = sysfs_create_file(mvm_dev->kobj, &mvm_dev->attr.attr);
+	if (ret) 	{
+		dev_err(mvm_dev->dev, "%s: sysfs_create_file failed\n",
+							__func__);
+		goto fail_sysfs;
+	}
 	return 0;
+
+fail_sysfs:
+	kobject_put(mvm_dev->kobj);
+	return ret;
 }
 
 static bool fifo_full(unsigned int fifo_head, unsigned int fifo_size, unsigned int fifo_tail)
@@ -813,6 +866,8 @@ static int mvm_load_fw(struct mvm_device *mvm_dev)
 	}
 	dev_info(mvm_dev->dev, "MVM subsystem brought out of reset\n");
 
+	mvm_dev->state = MVM_ONLINE;
+
 	initialise_fifos(mvm_dev);
 	/*Send an interrupt to MVM to indicate MVM_Init done */
 	writel_relaxed(IRQ_APSS0, mvm_dev->apss_shared_base);
@@ -851,6 +906,7 @@ static void trigger_ssr_work_hdlr(struct work_struct *work)
 		dev_err(mvm_dev->dev, "Timed out as mvm dump collection is not complete\n");
 		return;
 	}
+	mvm_dev->state = MVM_RESTARTING;
 	/*TODO Power on GDSC */
 	mvm_load_fw(mvm_dev);
 
@@ -861,7 +917,9 @@ static irqreturn_t mvm_wdog_irq_handler(int irq, void *dev_id)
 {
 	struct mvm_device *mvm_dev = dev_id;
 
-	dev_info(mvm_dev->dev, "%s\n", __func__);
+	dev_info(mvm_dev->dev, "Received watchdog bite from MVM\n");
+	mvm_dev->state = MVM_CRASHED;
+	dev_dbg(mvm_dev->dev, "The current state of MVM is CRASHED\n");
 	schedule_work(&mvm_dev->trigger_ssr_work);
 	return IRQ_HANDLED;
 }
@@ -1029,7 +1087,6 @@ static int enable_gcc_clocks(struct mvm_device *mvm_dev)
 		dev_err(mvm_dev->dev, "Failed to vote for XO clk\n");
 		return ret;
 	}
-
 	ret = clk_prepare_enable(mvm_dev->cnoc_s_ahb_clk);
 	if (ret) {
 		dev_err(mvm_dev->dev, "Failed to vote for cnoc_s_ahb_clk\n");
@@ -1086,6 +1143,8 @@ static int mvm_suspend(struct device *dev)
 		 */
 	}
 	mutex_unlock(&mvm_dev->mvm_csr_lock);
+	mvm_dev->state = MVM_SLEEP;
+
 	return ret;
 }
 
@@ -1172,7 +1231,6 @@ static int mvm_probe(struct platform_device *pdev)
 	 */
 	writel_relaxed(mvm_dev->mvm_dump_dma,
 			mvm_dev->mvm_base + MVMSS_CSR_APSS_MVM_SCRATCH_PAD0);
-
 	ret = register_isrs(pdev);
 	if (ret < 0) {
 		dev_err(mvm_dev->dev,
@@ -1196,6 +1254,8 @@ static int mvm_probe(struct platform_device *pdev)
 		dev_err(mvm_dev->dev, "mvm sysfs initialisation failed\n");
 		goto mutex_err;
 	}
+	mvm_dev->state = MVM_OFFLINE;
+	dev_dbg(mvm_dev->dev, "The current state of MVM is OFFLINE\n");
 
 	ret = enable_gcc_clocks(mvm_dev);
         if (ret) {
