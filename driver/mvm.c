@@ -283,19 +283,18 @@ static void restore_mvm_core(struct mvm_device *mvm_dev)
 }
 
 static ssize_t mvm_state_show(struct kobject *kobj,
-				 struct kobj_attribute *attr,
-				 char *buf)
+				struct kobj_attribute *attr,
+				char *buf)
 {
 	struct mvm_device *mvm_dev = container_of(attr,
-						  struct mvm_device,
-						  attr);
+						struct mvm_device,
+						attr);
 	return snprintf(buf, 0x10, "%s\n", mvm_states[mvm_dev->state]);
 }
 
 static int mvm_sysfs_init(struct mvm_device *mvm_dev)
 {
 	int ret = 0;
-
 	mvm_dev->kobj = kobject_create_and_add("mvm", kernel_kobj);
 	if (!mvm_dev->kobj) {
 		dev_err(mvm_dev->dev, "%s: sysfs creation failed\n",
@@ -310,7 +309,7 @@ static int mvm_sysfs_init(struct mvm_device *mvm_dev)
 	mvm_dev->attr.store = NULL;
 
 	ret = sysfs_create_file(mvm_dev->kobj, &mvm_dev->attr.attr);
-	if (ret) 	{
+	if (ret)        {
 		dev_err(mvm_dev->dev, "%s: sysfs_create_file failed\n",
 							__func__);
 		goto fail_sysfs;
@@ -367,13 +366,68 @@ static int send_ctrl_msg_to_mvm(struct mvm_control *mvm_ctrl, struct mvm_device 
 	return 0;
 }
 
-static void drain_out_fifo(struct mvm_device *mvm_dev, unsigned int fifo_index)
+static bool drain_out_fifo(struct mvm_device *mvm_dev, unsigned int fifo_index, unsigned int count)
 {
 	struct mvm_client *mvm_cli;
-	unsigned int count;
 	unsigned int client_id;
-	bool full;
+	bool full = false;
+	bool out_buff_written = false;
 
+	while (count && !full) {
+		client_id =
+		mvm_dev->ring_buff->out_fifo[fifo_index].base[mvm_dev->ring_buff->out_fifo[fifo_index].tail].client_id;
+		dev_dbg(mvm_dev->dev, "client_id is %d\n", client_id);
+		list_for_each_entry(mvm_cli, &mvm_dev->client_list, list) {
+			if (mvm_cli->client_id == client_id) {
+				full = fifo_full(mvm_cli->out_buff->head, mvm_cli->out_buff->size,
+								mvm_cli->out_buff->tail);
+				if (!full) {
+					memcpy(&mvm_cli->out_buff->out_msg[mvm_cli->out_buff->head],
+					&mvm_dev->ring_buff->out_fifo[fifo_index].base[
+					mvm_dev->ring_buff->out_fifo[fifo_index].tail],
+					sizeof(struct output_msg));
+					mvm_cli->out_buff->head =
+						(mvm_cli->out_buff->head+1) % (mvm_cli->out_buff->size);
+					/*TODO Need to protect count using mutex */
+					mvm_cli->out_buff->count++;
+					mvm_dev->ring_buff->out_fifo[fifo_index].tail =
+						(mvm_dev->ring_buff->out_fifo[fifo_index].tail+1) %
+						mvm_dev->ring_buff->out_fifo[fifo_index].size;
+					count--;
+					mvm_dev->outgoing_results++;
+					out_buff_written = true;
+					break;
+				}
+			}
+		}
+	}
+
+	if (out_buff_written) {
+		//update OUTPUT_RING TAIL PTR CSRs
+		mutex_lock(&mvm_dev->mvm_csr_lock);
+		writel_relaxed(mvm_dev->ring_buff->out_fifo[0].tail,
+			mvm_dev->mvm_base + MVMSS_CSR_OUTPUT_RING0_TAIL_PTR_OFFSET);
+		writel_relaxed(mvm_dev->ring_buff->out_fifo[1].tail,
+			mvm_dev->mvm_base + MVMSS_CSR_OUTPUT_RING1_TAIL_PTR_OFFSET);
+		mutex_unlock(&mvm_dev->mvm_csr_lock);
+
+		dev_info(mvm_dev->dev, "OUTPUT_RING0_TAIL_PTR_OFFSET %d OUTPUT_RING1_TAIL_PTR_OFFSET %d\n",
+		readl_relaxed(mvm_dev->mvm_base + MVMSS_CSR_OUTPUT_RING0_TAIL_PTR_OFFSET),
+		readl_relaxed(mvm_dev->mvm_base + MVMSS_CSR_OUTPUT_RING1_TAIL_PTR_OFFSET));
+
+		if (fifo_index == 0)
+			complete(&mvm_dev->p0_fifo_slot_available);
+		else
+			complete(&mvm_dev->p1_fifo_slot_available);
+	}
+
+	return out_buff_written;
+}
+
+bool out_fifo_get_results(struct mvm_device *mvm_dev, unsigned int fifo_index)
+{
+	bool ret = false;
+	unsigned int count;
 	//Read OUTPUT_RING CSRS
 	if (fifo_index == 0) {
 		mvm_dev->ring_buff->out_fifo[0].tail =
@@ -394,62 +448,30 @@ static void drain_out_fifo(struct mvm_device *mvm_dev, unsigned int fifo_index)
 		count = mvm_dev->ring_buff->out_fifo[fifo_index].head - mvm_dev->ring_buff->out_fifo[fifo_index].tail;
 	else
 		count = (mvm_dev->ring_buff->out_fifo[fifo_index].size - mvm_dev->ring_buff->out_fifo[fifo_index].tail) +
-					mvm_dev->ring_buff->out_fifo[fifo_index].head;
+							mvm_dev->ring_buff->out_fifo[fifo_index].head;
 
-	dev_info(mvm_dev->dev, "count is %d\n", count);
-	while (count) {
-		client_id =
-		mvm_dev->ring_buff->out_fifo[fifo_index].base[mvm_dev->ring_buff->out_fifo[fifo_index].tail].client_id;
-		dev_dbg(mvm_dev->dev, "client_id is %d\n", client_id);
-		list_for_each_entry(mvm_cli, &mvm_dev->client_list, list) {
-			if (mvm_cli->client_id == client_id) {
-				full = fifo_full(mvm_cli->out_buff->head, mvm_cli->out_buff->size,
-								mvm_cli->out_buff->tail);
-				if (!full) {
-					memcpy(&mvm_cli->out_buff->out_msg[mvm_cli->out_buff->head],
-					&mvm_dev->ring_buff->out_fifo[fifo_index].base[
-					mvm_dev->ring_buff->out_fifo[fifo_index].tail],
-					sizeof(struct output_msg));
-					mvm_cli->out_buff->head =
-						(mvm_cli->out_buff->head+1 %
-						mvm_cli->out_buff->size);
-					/*TODO Need to protect count using mutex */
-					mvm_cli->out_buff->count++;
-					break;
-				}
-			}
-		}
-		mvm_dev->ring_buff->out_fifo[fifo_index].tail =
-			(mvm_dev->ring_buff->out_fifo[fifo_index].tail+1) % mvm_dev->ring_buff->out_fifo[fifo_index].size;
-		count--;
-		mvm_dev->outgoing_results++;
-	}
 
-	//update OUTPUT_RING TAIL PTR CSRs
-	mutex_lock(&mvm_dev->mvm_csr_lock);
-	writel_relaxed(mvm_dev->ring_buff->out_fifo[0].tail,
-			mvm_dev->mvm_base + MVMSS_CSR_OUTPUT_RING0_TAIL_PTR_OFFSET);
-	writel_relaxed(mvm_dev->ring_buff->out_fifo[1].tail,
-			mvm_dev->mvm_base + MVMSS_CSR_OUTPUT_RING1_TAIL_PTR_OFFSET);
-	mutex_unlock(&mvm_dev->mvm_csr_lock);
+	if (count > 0)
+		ret = drain_out_fifo(mvm_dev, fifo_index, count);
 
-	dev_info(mvm_dev->dev, "OUTPUT_RING0_TAIL_PTR_OFFSET %d OUTPUT_RING1_TAIL_PTR_OFFSET %d\n",
-	readl_relaxed(mvm_dev->mvm_base + MVMSS_CSR_OUTPUT_RING0_TAIL_PTR_OFFSET),
-	readl_relaxed(mvm_dev->mvm_base + MVMSS_CSR_OUTPUT_RING1_TAIL_PTR_OFFSET));
-
-	if (fifo_index == 0)
-		complete(&mvm_dev->p0_fifo_slot_available);
-	else
-		complete(&mvm_dev->p1_fifo_slot_available);
+	return ret;
 }
 
 static void drain_out_fifo_work_hdlr(struct work_struct *work)
 {
 	struct mvm_device *mvm_dev = container_of(work, struct mvm_device, drain_out_fifo_work);
+	bool p0_fifo_has_results, p1_fifo_has_results, wake_up;
 
-	drain_out_fifo(mvm_dev, 0);
-	drain_out_fifo(mvm_dev, 1);
-	wake_up_interruptible_poll(&mvm_dev->mvm_waitqueue, POLLIN | POLLPRI);
+	p0_fifo_has_results = out_fifo_get_results(mvm_dev, 0);
+	if (p0_fifo_has_results)
+		wake_up = true;
+
+	p1_fifo_has_results = out_fifo_get_results(mvm_dev, 1);
+	if (p1_fifo_has_results)
+		wake_up = true;
+
+	if (wake_up)
+		wake_up_interruptible_poll(&mvm_dev->mvm_waitqueue, POLLIN | POLLPRI);
 }
 
 static irqreturn_t mvm_ssr_done_irq_handler(int irq, void *dev_id)
@@ -663,12 +685,12 @@ static unsigned int mvm_poll(struct file *filp,
 	struct mvm_client *mvm_cli = filp->private_data;
 	struct mvm_device *mvm_dev = mvm_cli->mvm_dev;
 
-	poll_wait(filp, &mvm_dev->mvm_waitqueue, pt);
-
-/*TODO Protect count with mutex */
-	if (mvm_cli->out_buff->count >= 1)
+	if (mvm_cli->out_buff->count >= 1) {
 		events = POLLIN | POLLPRI;
+		return events;
+	}
 
+	poll_wait(filp, &mvm_dev->mvm_waitqueue, pt);
 	return events;
 }
 
@@ -676,8 +698,10 @@ static ssize_t mvm_read(struct file *filp,
 		char __user *buf, size_t count, loff_t *off)
 {
 	struct mvm_client *mvm_cli = filp->private_data;
-	unsigned int max_size;
+	struct mvm_device *mvm_dev = mvm_cli->mvm_dev;
+	unsigned int size, out_buff_rem_count;
 	int ret = 0, bytes_copied = 0;
+	unsigned int bytes_to_copy = 0;
 
 	if (!buf || count < 1)
 		return -EINVAL;
@@ -685,31 +709,49 @@ static ssize_t mvm_read(struct file *filp,
 	/*TODO Protect count with mutex */
 	/*TODO update out_buff->head correctly */
 	if ((mvm_cli->out_buff->tail + mvm_cli->out_buff->count) <= OUT_BUFF_SIZE) {
-		max_size = mvm_cli->out_buff->count *  sizeof(struct output_msg);
+		if (count <= mvm_cli->out_buff->count) {
+			bytes_to_copy = count *  sizeof(struct output_msg);
+		}
+		else {
+			bytes_to_copy = mvm_cli->out_buff->count * sizeof(struct output_msg);
+		}
 		ret = copy_to_user(buf,
-				   &mvm_cli->out_buff->out_msg[mvm_cli->out_buff->tail],
-				   max_size);
-		bytes_copied = max_size - ret;
+				&mvm_cli->out_buff->out_msg[mvm_cli->out_buff->tail],
+				bytes_to_copy);
+		bytes_copied = bytes_to_copy - ret;
 		goto update_tail;
 	} else {
-		max_size = (OUT_BUFF_SIZE - mvm_cli->out_buff->tail) * sizeof(struct output_msg);
+		size = (OUT_BUFF_SIZE - mvm_cli->out_buff->tail);
+		if (size > count)
+			size = count;
+		bytes_to_copy = size * sizeof(struct output_msg);
 		ret = copy_to_user(buf,
 				   &mvm_cli->out_buff->out_msg[mvm_cli->out_buff->tail],
-				   max_size);
-		bytes_copied += max_size - ret;
-		if (ret)
+				   bytes_to_copy);
+		bytes_copied += bytes_to_copy - ret;
+
+		if (ret || (size == count))
 			goto update_tail;
-		max_size = ((mvm_cli->out_buff->count)*sizeof(struct output_msg)) - max_size;
-		ret = copy_to_user(buf,
+
+		count = count - size;
+		out_buff_rem_count = mvm_cli->out_buff->count - ((bytes_copied / sizeof(struct output_msg)));
+
+		if (count <= out_buff_rem_count)
+			bytes_to_copy = count *  sizeof(struct output_msg);
+		else
+			bytes_to_copy = out_buff_rem_count * sizeof(struct output_msg);
+
+		ret = copy_to_user(buf + bytes_copied,
 			     &mvm_cli->out_buff->out_msg[0],
-			     max_size);
-		bytes_copied += max_size - ret;
+			     bytes_to_copy);
+		bytes_copied += bytes_to_copy - ret;
 	}
 update_tail:
 	mvm_cli->out_buff->tail = (mvm_cli->out_buff->tail +
 				  (bytes_copied / sizeof(struct output_msg))) %
 				   mvm_cli->out_buff->size;
 	mvm_cli->out_buff->count -= (bytes_copied / sizeof(struct output_msg));
+	schedule_work(&mvm_dev->drain_out_fifo_work);
 	return bytes_copied;
 }
 
@@ -759,7 +801,6 @@ static void initialise_fifos(struct mvm_device *mvm_dev)
 		mvm_dev->mvm_base + MVMSS_CSR_INPUT_RING1_BUFFER_LENGTH);
 	writel_relaxed(mvm_dev->ring_buff_dma + infifo_size + 0x10,
 		mvm_dev->mvm_base + MVMSS_CSR_INPUT_RING1_BASE_ADDR);
-
 
 	/*initialise P0 Output Ring buffer pointers */
 	mvm_dev->ring_buff->out_fifo[0].head = 0;
