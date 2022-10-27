@@ -493,7 +493,7 @@ static irqreturn_t mvm_verif_done_irq_handler(int irq, void *dev_id)
 	uint32_t value;
 
 	value = readl_relaxed(mvm_dev->mvm_base+MVMSS_CSR_MVMSS_APSS);
-	value = (value & (~(1 << ((mvm_dev->mvm_ssr_done_hw_irq - 432)))));
+	value = (value & (~(1 << ((mvm_dev->mvm_verif_done_hw_irq - 432)))));
 	writel_relaxed(value, mvm_dev->mvm_base+MVMSS_CSR_MVMSS_APSS);
 
 	schedule_work(&mvm_dev->drain_out_fifo_work);
