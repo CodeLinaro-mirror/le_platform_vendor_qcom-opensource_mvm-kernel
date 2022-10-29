@@ -110,7 +110,7 @@
 #define GDSC_POWER_SLEEP_US             10
 #define GDSC_POWER_TIMEOUT_US           1000000
 #define MVM_DUMP_COLL_TIMEOUT_MS	3000
-
+#define MVM_PROC_ID			0x2B
 /**
  * enum mvm_state - state of mvm subsystem
  * @MVM_OFFLINE: MVM firmware is not loaded/authenticated yet.
@@ -182,7 +182,6 @@ struct mvm_device {
 	int mvm_verif_done_hw_irq;
 	int wfi_irq;
 	int wdog_irq;
-	int pas_id;
 	unsigned int incoming_msgs;
 	unsigned int outgoing_results;
 	dev_t mvm_cdev_devid;
@@ -893,14 +892,14 @@ static int mvm_load_fw(struct mvm_device *mvm_dev)
 		goto out_release_firmware;
 	}
 
-	ret = qcom_mdt_load(mvm_dev->dev, fw, fw_name, mvm_dev->pas_id,
+	ret = qcom_mdt_load(mvm_dev->dev, fw, fw_name, MVM_PROC_ID,
 			    virt, mvm_dev->mvm_fw_dma, 0x10000, NULL);
 	if (ret) {
 		dev_err(mvm_dev->dev, "Failed to load mvm firmware\n");
 		goto out_release_firmware;
 	}
 
-	ret = qcom_scm_pas_auth_and_reset(mvm_dev->pas_id);
+	ret = qcom_scm_pas_auth_and_reset(MVM_PROC_ID);
 	if (ret) {
 		dev_err(mvm_dev->dev, "Error authenticating mvm firmware\n");
 		goto out_release_firmware;
@@ -934,7 +933,7 @@ static void trigger_ssr_work_hdlr(struct work_struct *work)
 	struct mvm_device *mvm_dev = container_of(work, struct mvm_device, trigger_ssr_work);
 	int ret = 0;
 
-	ret = qcom_scm_pas_shutdown(mvm_dev->pas_id);
+	ret = qcom_scm_pas_shutdown(MVM_PROC_ID);
 	if (ret) {
 		dev_err(mvm_dev->dev, "Error sending shutdown request to MVM\n");
 		return;
@@ -1308,13 +1307,6 @@ static int mvm_probe(struct platform_device *pdev)
 	if (ret) {
 		dev_err(mvm_dev->dev, "Failed to turn on mvm gdsc\n");
 		goto gdsc_err;
-	}
-
-	ret = of_property_read_u32(mvm_dev->dev->of_node, "qcom,mvm-pas-id",
-							&mvm_dev->pas_id);
-	if (ret) {
-		dev_err(mvm_dev->dev, "pas_id not defined\n");
-		goto mutex_err;
 	}
 
 	ret = mvm_load_fw(mvm_dev);
