@@ -411,11 +411,6 @@ static bool drain_out_fifo(struct mvm_device *mvm_dev, unsigned int fifo_index, 
 		dev_dbg(mvm_dev->dev, "%s OUTPUT_RING0_TAIL_PTR_OFFSET %d OUTPUT_RING1_TAIL_PTR_OFFSET %d\n",__func__,
 			readl_relaxed(mvm_dev->mvm_base + MVMSS_CSR_OUTPUT_RING0_TAIL_PTR_OFFSET),
 			readl_relaxed(mvm_dev->mvm_base + MVMSS_CSR_OUTPUT_RING1_TAIL_PTR_OFFSET));
-
-		if (fifo_index == 0)
-			complete(&mvm_dev->p0_fifo_slot_available);
-		else
-			complete(&mvm_dev->p1_fifo_slot_available);
 	}
 
 	return out_buff_written;
@@ -458,6 +453,27 @@ static void drain_out_fifo_work_hdlr(struct work_struct *work)
 {
 	struct mvm_device *mvm_dev = container_of(work, struct mvm_device, drain_out_fifo_work);
 	bool p0_fifo_has_results, p1_fifo_has_results, wake_up;
+
+	mvm_dev->ring_buff->in_fifo[0].tail =
+		readl_relaxed(mvm_dev->mvm_base + MVMSS_CSR_INPUT_RING0_TAIL_PTR_OFFSET);
+	mvm_dev->ring_buff->in_fifo[0].head =
+		readl_relaxed(mvm_dev->mvm_base + MVMSS_CSR_INPUT_RING0_HEAD_PTR_OFFSET);
+	mvm_dev->ring_buff->in_fifo[1].tail =
+		readl_relaxed(mvm_dev->mvm_base + MVMSS_CSR_INPUT_RING1_TAIL_PTR_OFFSET);
+	mvm_dev->ring_buff->in_fifo[1].head =
+		readl_relaxed(mvm_dev->mvm_base + MVMSS_CSR_INPUT_RING1_HEAD_PTR_OFFSET);
+
+	if(!fifo_full(mvm_dev->ring_buff->in_fifo[0].head,
+			mvm_dev->ring_buff->in_fifo[0].size,
+			mvm_dev->ring_buff->in_fifo[0].tail)){
+		complete(&mvm_dev->p0_fifo_slot_available);
+	}
+
+	if(!fifo_full(mvm_dev->ring_buff->in_fifo[1].head,
+			mvm_dev->ring_buff->in_fifo[1].size,
+			mvm_dev->ring_buff->in_fifo[1].tail)){
+		complete(&mvm_dev->p1_fifo_slot_available);
+	}
 
 	mutex_lock(&mvm_dev->out_fifo_lock);
 	p0_fifo_has_results = out_fifo_get_results(mvm_dev, 0);
