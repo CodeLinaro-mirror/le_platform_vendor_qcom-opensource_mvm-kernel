@@ -673,8 +673,9 @@ ret:
 
 	dev_dbg(mvm_dev->dev, "no_of_msgs_written %d\n", no_of_msgs_written);
 
-	writel_relaxed(IRQ_APSS1, mvm_dev->apss_shared_base);
-	return no_of_msgs_written;
+	if (no_of_msgs_written > 0)
+		writel_relaxed(IRQ_APSS1, mvm_dev->apss_shared_base);
+	return (no_of_msgs_written * sizeof(struct input_msg));
 }
 
 static unsigned int mvm_poll(struct file *filp,
