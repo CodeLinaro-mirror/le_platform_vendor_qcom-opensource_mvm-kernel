@@ -193,6 +193,8 @@ struct mvm_device {
 	struct class *mvm_class;
 	struct mutex mvm_cli_lock;
 	struct mutex mvm_csr_lock;
+	struct mutex in_fifo_lock;
+	struct mutex out_fifo_lock;
 	wait_queue_head_t mvm_waitqueue;
 	struct work_struct drain_out_fifo_work;
 	struct work_struct trigger_ssr_work;
@@ -248,7 +250,7 @@ static int enable_mvm_gdsc(struct mvm_device *mvm_dev, bool powerup)
 		if (ret < 0)
 			dev_err(mvm_dev->dev, "mvm gdsc couldn't power up\n");
 		else
-			dev_info(mvm_dev->dev, "mvm gdsc powered up\n");
+			dev_info(mvm_dev->dev, "MVM GSDC powered up\n");
 	} else {
 		ret = readl_poll_timeout(mvm_dev->mvm_base + MVM_CC_MVM_CFG_GDSCR_OFFSET,
 					reg_val,
@@ -258,7 +260,7 @@ static int enable_mvm_gdsc(struct mvm_device *mvm_dev, bool powerup)
 		if (ret < 0)
 			dev_err(mvm_dev->dev, "mvm gdsc couldn't power down\n");
 		else
-			dev_info(mvm_dev->dev, "mvm gdsc powered down\n");
+			dev_info(mvm_dev->dev, "MVM GDSC powered down\n");
 	}
 	return ret;
 }
@@ -387,7 +389,6 @@ static bool drain_out_fifo(struct mvm_device *mvm_dev, unsigned int fifo_index, 
 					sizeof(struct output_msg));
 					mvm_cli->out_buff->head =
 						(mvm_cli->out_buff->head+1) % (mvm_cli->out_buff->size);
-					/*TODO Need to protect count using mutex */
 					mvm_cli->out_buff->count++;
 					mvm_dev->ring_buff->out_fifo[fifo_index].tail =
 						(mvm_dev->ring_buff->out_fifo[fifo_index].tail+1) %
@@ -402,17 +403,14 @@ static bool drain_out_fifo(struct mvm_device *mvm_dev, unsigned int fifo_index, 
 	}
 
 	if (out_buff_written) {
-		//update OUTPUT_RING TAIL PTR CSRs
-		mutex_lock(&mvm_dev->mvm_csr_lock);
 		writel_relaxed(mvm_dev->ring_buff->out_fifo[0].tail,
 			mvm_dev->mvm_base + MVMSS_CSR_OUTPUT_RING0_TAIL_PTR_OFFSET);
 		writel_relaxed(mvm_dev->ring_buff->out_fifo[1].tail,
 			mvm_dev->mvm_base + MVMSS_CSR_OUTPUT_RING1_TAIL_PTR_OFFSET);
-		mutex_unlock(&mvm_dev->mvm_csr_lock);
 
-		dev_info(mvm_dev->dev, "OUTPUT_RING0_TAIL_PTR_OFFSET %d OUTPUT_RING1_TAIL_PTR_OFFSET %d\n",
-		readl_relaxed(mvm_dev->mvm_base + MVMSS_CSR_OUTPUT_RING0_TAIL_PTR_OFFSET),
-		readl_relaxed(mvm_dev->mvm_base + MVMSS_CSR_OUTPUT_RING1_TAIL_PTR_OFFSET));
+		dev_dbg(mvm_dev->dev, "%s OUTPUT_RING0_TAIL_PTR_OFFSET %d OUTPUT_RING1_TAIL_PTR_OFFSET %d\n",__func__,
+			readl_relaxed(mvm_dev->mvm_base + MVMSS_CSR_OUTPUT_RING0_TAIL_PTR_OFFSET),
+			readl_relaxed(mvm_dev->mvm_base + MVMSS_CSR_OUTPUT_RING1_TAIL_PTR_OFFSET));
 
 		if (fifo_index == 0)
 			complete(&mvm_dev->p0_fifo_slot_available);
@@ -440,7 +438,7 @@ bool out_fifo_get_results(struct mvm_device *mvm_dev, unsigned int fifo_index)
 			readl_relaxed(mvm_dev->mvm_base + MVMSS_CSR_OUTPUT_RING1_HEAD_PTR_OFFSET);
 	}
 
-	dev_info(mvm_dev->dev, "%s tail is %d head is %d\n", __func__,
+	dev_dbg(mvm_dev->dev, "%s fifo_index %d tail is %d head is %d\n", __func__,fifo_index,
 				mvm_dev->ring_buff->out_fifo[fifo_index].tail,
 				mvm_dev->ring_buff->out_fifo[fifo_index].head);
 	if (mvm_dev->ring_buff->out_fifo[fifo_index].tail <= mvm_dev->ring_buff->out_fifo[fifo_index].head)
@@ -461,6 +459,7 @@ static void drain_out_fifo_work_hdlr(struct work_struct *work)
 	struct mvm_device *mvm_dev = container_of(work, struct mvm_device, drain_out_fifo_work);
 	bool p0_fifo_has_results, p1_fifo_has_results, wake_up;
 
+	mutex_lock(&mvm_dev->out_fifo_lock);
 	p0_fifo_has_results = out_fifo_get_results(mvm_dev, 0);
 	if (p0_fifo_has_results)
 		wake_up = true;
@@ -468,6 +467,7 @@ static void drain_out_fifo_work_hdlr(struct work_struct *work)
 	p1_fifo_has_results = out_fifo_get_results(mvm_dev, 1);
 	if (p1_fifo_has_results)
 		wake_up = true;
+	mutex_unlock(&mvm_dev->out_fifo_lock);
 
 	if (wake_up)
 		wake_up_interruptible_poll(&mvm_dev->mvm_waitqueue, POLLIN | POLLPRI);
@@ -583,6 +583,7 @@ static ssize_t mvm_write(
 	unsigned int no_of_msgs_written = 0;
 	unsigned int count;
 
+	mutex_lock(&mvm_dev->in_fifo_lock);
 	inp_msg = kzalloc(sizeof(struct input_msg), GFP_KERNEL);
 	ret = copy_from_user(inp_msg, buf, sizeof(struct input_msg));
 	if (ret)
@@ -600,19 +601,16 @@ static ssize_t mvm_write(
 			readl_relaxed(mvm_dev->mvm_base + MVMSS_CSR_INPUT_RING0_TAIL_PTR_OFFSET);
 		mvm_dev->ring_buff->in_fifo[0].head =
 			readl_relaxed(mvm_dev->mvm_base + MVMSS_CSR_INPUT_RING0_HEAD_PTR_OFFSET);
-		dev_info(mvm_dev->dev, "INPUT_RING0_TAIL %d INPUT_RING0_HEAD %d\n",
+		dev_dbg(mvm_dev->dev, "%s : before INPUT_RING0_TAIL %d INPUT_RING0_HEAD %d\n", __func__,
 			 mvm_dev->ring_buff->in_fifo[0].tail, mvm_dev->ring_buff->in_fifo[0].head);
 	} else {
 		mvm_dev->ring_buff->in_fifo[1].tail =
 			readl_relaxed(mvm_dev->mvm_base + MVMSS_CSR_INPUT_RING1_TAIL_PTR_OFFSET);
 		mvm_dev->ring_buff->in_fifo[1].head =
 			readl_relaxed(mvm_dev->mvm_base + MVMSS_CSR_INPUT_RING1_HEAD_PTR_OFFSET);
-		dev_info(mvm_dev->dev, "INPUT_RING1_TAIL %d INPUT_RING1_HEAD %d\n",
+		dev_dbg(mvm_dev->dev, "%s : before INPUT_RING1_TAIL %d INPUT_RING1_HEAD %d\n", __func__,
 			 mvm_dev->ring_buff->in_fifo[1].tail, mvm_dev->ring_buff->in_fifo[1].head);
 	}
-	dev_info(mvm_dev->dev, "tail %d head %d\n",
-				mvm_dev->ring_buff->in_fifo[fifo_index].tail,
-				mvm_dev->ring_buff->in_fifo[fifo_index].head);
 	for (i = 0; i < count; i++) {
 push_to_input_ring:
 		dev_dbg(mvm_dev->dev, "Head %d tail %d size %d\n",
@@ -624,7 +622,6 @@ push_to_input_ring:
 				 mvm_dev->ring_buff->in_fifo[fifo_index].tail);
 		dev_dbg(mvm_dev->dev, "fifo %d is %d\n", fifo_index, full);
 		if (full) {
-			dev_info(mvm_dev->dev, "fifo %d is full\n", fifo_index);
 			if (fifo_index == 0) {
 				reinit_completion(&mvm_dev->p0_fifo_slot_available);
 				rc = wait_for_completion_interruptible_timeout(
@@ -650,7 +647,6 @@ push_to_input_ring:
 			(buf+(i * sizeof(struct input_msg))),
 			sizeof(struct input_msg));
 			if (!ret) {
-				mutex_lock(&mvm_dev->mvm_csr_lock);
 				mvm_dev->ring_buff->in_fifo[fifo_index].head =
 					(mvm_dev->ring_buff->in_fifo[fifo_index].head + 1)
 					% mvm_dev->ring_buff->in_fifo[fifo_index].size;
@@ -662,16 +658,16 @@ push_to_input_ring:
 				else
 					writel_relaxed(mvm_dev->ring_buff->in_fifo[1].head,
 					mvm_dev->mvm_base + MVMSS_CSR_INPUT_RING1_HEAD_PTR_OFFSET);
-				mutex_unlock(&mvm_dev->mvm_csr_lock);
 			}
 		}
 	}
 ret:
-	dev_info(mvm_dev->dev, "INPUT_RING0_HEAD_PTR_OFFSET %d INPUT_RING1_HEAD_PTR_OFFSET %d\n",
+	dev_dbg(mvm_dev->dev, "%s : after INPUT_RING0_HEAD_PTR_OFFSET %d INPUT_RING1_HEAD_PTR_OFFSET %d\n", __func__,
 	readl_relaxed(mvm_dev->mvm_base + MVMSS_CSR_INPUT_RING0_HEAD_PTR_OFFSET),
 	readl_relaxed(mvm_dev->mvm_base + MVMSS_CSR_INPUT_RING1_HEAD_PTR_OFFSET));
 
 	dev_dbg(mvm_dev->dev, "no_of_msgs_written %d\n", no_of_msgs_written);
+	mutex_unlock(&mvm_dev->in_fifo_lock);
 
 	if (no_of_msgs_written > 0)
 		writel_relaxed(IRQ_APSS1, mvm_dev->apss_shared_base);
@@ -706,8 +702,7 @@ static ssize_t mvm_read(struct file *filp,
 	if (!buf || count < 1)
 		return -EINVAL;
 
-	/*TODO Protect count with mutex */
-	/*TODO update out_buff->head correctly */
+	mutex_lock(&mvm_dev->out_fifo_lock);
 	if ((mvm_cli->out_buff->tail + mvm_cli->out_buff->count) <= OUT_BUFF_SIZE) {
 		if (count <= mvm_cli->out_buff->count) {
 			bytes_to_copy = count *  sizeof(struct output_msg);
@@ -751,6 +746,10 @@ update_tail:
 				  (bytes_copied / sizeof(struct output_msg))) %
 				   mvm_cli->out_buff->size;
 	mvm_cli->out_buff->count -= (bytes_copied / sizeof(struct output_msg));
+	dev_dbg(mvm_dev->dev, "mvm_read bytes_copied %x sizeof(struct output_msg) %x\n",bytes_copied,
+					 sizeof(struct output_msg));
+	dev_dbg(mvm_dev->dev, "mvm_read out_buff_count is %d\n",mvm_cli->out_buff->count);
+	mutex_unlock(&mvm_dev->out_fifo_lock);
 	schedule_work(&mvm_dev->drain_out_fifo_work);
 	return bytes_copied;
 }
@@ -1256,7 +1255,7 @@ static int mvm_probe(struct platform_device *pdev)
 		goto class_fail;
 	}
 
-	dev_info(mvm_dev->dev, "mvm character device driver created\n");
+	dev_dbg(mvm_dev->dev, "mvm character device driver created\n");
 
 	ret = mvm_dma_pool_create(mvm_dev);
 	if (ret)
@@ -1280,6 +1279,8 @@ static int mvm_probe(struct platform_device *pdev)
 	}
 	mutex_init(&mvm_dev->mvm_cli_lock);
 	mutex_init(&mvm_dev->mvm_csr_lock);
+	mutex_init(&mvm_dev->in_fifo_lock);
+	mutex_init(&mvm_dev->out_fifo_lock);
 	INIT_LIST_HEAD(&mvm_dev->client_list);
 	init_waitqueue_head(&mvm_dev->mvm_waitqueue);
 	bitmap_zero(mvm_dev->client_id_bitmap, MAX_CLIENT_COUNT);
