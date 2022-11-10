@@ -215,6 +215,8 @@ struct mvm_device {
 	dma_addr_t mvm_dump_dma;
 	struct clk *xo;
 	struct clk *cnoc_s_ahb_clk;
+	struct clk *snoc_m_axi_clk;
+	struct clk *sysnoc_mvmss_clk;
 	enum mvm_state state;
 };
 
@@ -1138,6 +1140,14 @@ static int enable_gcc_clocks(struct mvm_device *mvm_dev)
 	if (IS_ERR(mvm_dev->cnoc_s_ahb_clk))
 		return PTR_ERR(mvm_dev->cnoc_s_ahb_clk);
 
+	mvm_dev->snoc_m_axi_clk = devm_clk_get(mvm_dev->dev, "mvmss_snoc_axi_clk");
+	if (IS_ERR(mvm_dev->snoc_m_axi_clk))
+		return PTR_ERR(mvm_dev->snoc_m_axi_clk);
+
+	mvm_dev->sysnoc_mvmss_clk = devm_clk_get(mvm_dev->dev, "sysnoc_mvmss_clk");
+	if (IS_ERR(mvm_dev->sysnoc_mvmss_clk))
+		return PTR_ERR(mvm_dev->sysnoc_mvmss_clk);
+
 	ret = clk_prepare_enable(mvm_dev->xo);
 	if (ret) {
 		dev_err(mvm_dev->dev, "Failed to vote for XO clk\n");
@@ -1146,11 +1156,25 @@ static int enable_gcc_clocks(struct mvm_device *mvm_dev)
 	ret = clk_prepare_enable(mvm_dev->cnoc_s_ahb_clk);
 	if (ret) {
 		dev_err(mvm_dev->dev, "Failed to vote for cnoc_s_ahb_clk\n");
-		goto err;
+		goto unprepare_xo;
+	}
+	ret = clk_prepare_enable(mvm_dev->snoc_m_axi_clk);
+	if (ret) {
+		dev_err(mvm_dev->dev, "Failed to vote for snoc_m_axi_clk\n");
+		goto unprepare_cnoc_s_ahb;
+	}
+	ret = clk_prepare_enable(mvm_dev->sysnoc_mvmss_clk);
+	if (ret) {
+		dev_err(mvm_dev->dev, "Failed to vote for sysnoc_mvmss_clk\n");
+		goto unprepare_snoc_m_axi;
 	}
 	return 0;
 
-err:
+unprepare_snoc_m_axi:
+	clk_disable_unprepare(mvm_dev->snoc_m_axi_clk);
+unprepare_cnoc_s_ahb:
+	clk_disable_unprepare(mvm_dev->cnoc_s_ahb_clk);
+unprepare_xo:
 	clk_disable_unprepare(mvm_dev->xo);
 	return ret;
 }
@@ -1338,6 +1362,8 @@ static int mvm_probe(struct platform_device *pdev)
 gdsc_err:
 	clk_disable_unprepare(mvm_dev->cnoc_s_ahb_clk);
 	clk_disable_unprepare(mvm_dev->xo);
+	clk_disable_unprepare(mvm_dev->snoc_m_axi_clk);
+	clk_disable_unprepare(mvm_dev->sysnoc_mvmss_clk);
 mutex_err:
 	mutex_destroy(&mvm_dev->mvm_csr_lock);
 	mutex_destroy(&mvm_dev->mvm_cli_lock);
