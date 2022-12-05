@@ -458,12 +458,8 @@ static void drain_out_fifo_work_hdlr(struct work_struct *work)
 
 	mvm_dev->ring_buff->in_fifo[0].tail =
 		readl_relaxed(mvm_dev->mvm_base + MVMSS_CSR_INPUT_RING0_TAIL_PTR_OFFSET);
-	mvm_dev->ring_buff->in_fifo[0].head =
-		readl_relaxed(mvm_dev->mvm_base + MVMSS_CSR_INPUT_RING0_HEAD_PTR_OFFSET);
 	mvm_dev->ring_buff->in_fifo[1].tail =
 		readl_relaxed(mvm_dev->mvm_base + MVMSS_CSR_INPUT_RING1_TAIL_PTR_OFFSET);
-	mvm_dev->ring_buff->in_fifo[1].head =
-		readl_relaxed(mvm_dev->mvm_base + MVMSS_CSR_INPUT_RING1_HEAD_PTR_OFFSET);
 
 	if(!fifo_full(mvm_dev->ring_buff->in_fifo[0].head,
 			mvm_dev->ring_buff->in_fifo[0].size,
