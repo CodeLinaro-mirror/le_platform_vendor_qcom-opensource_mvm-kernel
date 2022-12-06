@@ -29,9 +29,9 @@ enum mvm_balance_policy {
 };
 
 typedef enum {
-    MVM_DEBUG_LOG_POLICY = 0,
-    MVM_DEBUG_LOG_TRANSFER_REQUEST,
-    MVM_DEBUG_LOG_TRANSFER_COMPLETE
+	MVM_DEBUG_LOG_POLICY = 0,
+	MVM_DEBUG_LOG_TRANSFER_REQUEST,
+	MVM_DEBUG_LOG_TRANSFER_COMPLETE
 } mvm_debug_msg_type;
 
 
@@ -82,7 +82,6 @@ struct mvm_control {
 		struct mvm_policy policy;
 		struct mvm_cpu_freq cpu;
 		struct mvm_power power;
-		//struct mvm_log_transfer transfer;
 	} mvm_ctrl_msg;
 } __attribute__((packed));
 

@@ -110,10 +110,10 @@
 
 #define GDSC_POWER_SLEEP_US             10
 #define GDSC_POWER_TIMEOUT_US           1000000
-#define MVM_ULOG_BUFFER_SEGMENT 4
-#define MVM_ULOG_BUFFER_SIZE 2048
-#define MVM_DUMP_COLL_TIMEOUT_MS    3000
-#define MVM_PROC_ID            0x2B
+#define MVM_ULOG_BUFFER_SEGMENT         4
+#define MVM_ULOG_BUFFER_SIZE            2048
+#define MVM_DUMP_COLL_TIMEOUT_MS        3000
+#define MVM_PROC_ID                     0x2B
 /**
  * enum mvm_state - state of mvm subsystem
  * @MVM_OFFLINE: MVM firmware is not loaded/authenticated yet.
@@ -171,6 +171,7 @@ struct ring_buffers {
 struct mvmlog_buffers {
 	uint32_t mvmlog_buffer[MVM_ULOG_BUFFER_SIZE];
 };
+
 struct mvm_client {
 	unsigned int client_id;
 	unsigned int timeout_ms;
@@ -233,7 +234,7 @@ struct mvm_device {
 	uint32_t *ddr_head_pos;
 	uint32_t *ddr_tail_pos;
 	uint32_t *ddr_current_addr;
-	uint32_t active_buffer_index;
+	int active_buffer_index;
 	uint32_t ddr_buf_len;
 	uint32_t filled_dma_bytes;
 };
@@ -392,18 +393,18 @@ static ssize_t mvm_log_file_read(struct file *filp, char __user *buff, size_t co
 	ssize_t actual_length = 0;
 	ssize_t ret = 0;
 	char *buff_total;
+	ssize_t length_tail_to_bufferend;
 
-	if (!mvm_dev) {// check for mvm_dev if its null or not
-		printk("\n mvm_log_file_read::invalid mvm device address");
-	}
 	if (mvm_dev->ddr_tail_pos >= &mvm_dev->log_buff->mvmlog_buffer[MVM_ULOG_BUFFER_SIZE]) {
 		mvm_dev->ddr_tail_pos = &mvm_dev->log_buff->mvmlog_buffer[0];
 	}
+
 	if (mvm_dev->ddr_head_pos > mvm_dev->ddr_tail_pos) {
 		if (count > (mvm_dev->ddr_head_pos - mvm_dev->ddr_tail_pos)) {
 			if (copy_to_user(buff, mvm_dev->ddr_tail_pos, (mvm_dev->ddr_head_pos - mvm_dev->ddr_tail_pos)*4)) {//multiplied by 4 to calculate size of int
 				return actual_length;//Actual length will be zero if copy to user not success
 			}
+
 			actual_length = (mvm_dev->ddr_head_pos - mvm_dev->ddr_tail_pos)*4;
 			mvm_dev->ddr_tail_pos = mvm_dev->ddr_head_pos;
 			return actual_length;
@@ -414,7 +415,6 @@ static ssize_t mvm_log_file_read(struct file *filp, char __user *buff, size_t co
 			return count;
 		}
 	} else if (mvm_dev->ddr_head_pos < mvm_dev->ddr_tail_pos) {
-		ssize_t length_tail_to_bufferend;
 		ret = copy_to_user(buff, mvm_dev->ddr_tail_pos, (&mvm_dev->log_buff->mvmlog_buffer[MVM_ULOG_BUFFER_SIZE] - mvm_dev->ddr_tail_pos));
 		length_tail_to_bufferend = &mvm_dev->log_buff->mvmlog_buffer[MVM_ULOG_BUFFER_SIZE] - mvm_dev->ddr_tail_pos;
 		if (length_tail_to_bufferend == (&mvm_dev->log_buff->mvmlog_buffer[MVM_ULOG_BUFFER_SIZE] - mvm_dev->ddr_tail_pos)) {
@@ -425,6 +425,7 @@ static ssize_t mvm_log_file_read(struct file *filp, char __user *buff, size_t co
 		mvm_dev->ddr_tail_pos = mvm_dev->ddr_head_pos;
 		return actual_length;
 	}
+
 	return actual_length;
 }
 
@@ -432,6 +433,7 @@ static __poll_t mvm_log_poll(struct file *filp, struct poll_table_struct *wait)
 {
 	unsigned int events = 0;
 	struct mvm_device *mvm_dev = filp->private_data;
+
 	events = mvm_dev->ddr_head_pos - mvm_dev->ddr_tail_pos;
 	if (events) {
 		events = POLLIN | POLLPRI;
@@ -461,11 +463,13 @@ static int mvm_log_policy_open(struct inode *inode, struct file *filp)
 	filp->private_data = mvm_dev;
 	return 0;
 }
+
 static ssize_t mvm_log_policy_store(struct file *filp, const char __user *ubuf, size_t count, loff_t *ppos)
 {
 	ssize_t ret = 0;
 	struct mvm_control *mvm_ctrl;
 	struct mvm_device *mvm_dev = filp->private_data;
+
 	mvm_ctrl = kzalloc(sizeof(struct mvm_control), GFP_KERNEL);
 	mvm_ctrl->type = MVM_DEBUG;
 	count = sizeof(mvm_ctrl->mvm_ctrl_msg.debug.log_policy);
@@ -498,6 +502,7 @@ static ssize_t mvm_log_transfer_store(struct file *filp, const char __user *ubuf
 	ssize_t ret = 0;
 	struct mvm_control *mvm_ctrl;
 	struct mvm_device *mvm_dev = filp->private_data;
+
 	mvm_ctrl = kzalloc(sizeof(struct mvm_control), GFP_KERNEL);
 	mvm_ctrl->type = MVM_DEBUG;
 	mvm_dev->filled_dma_bytes = mvm_dev->filled_dma_bytes + (mvm_dev->ddr_buf_len * 0x4);
@@ -508,6 +513,7 @@ static ssize_t mvm_log_transfer_store(struct file *filp, const char __user *ubuf
 		ret = -EFAULT;
 		return ret;
 	}
+
 	mvm_ctrl->mvm_ctrl_msg.debug.msg_type = MVM_DEBUG_LOG_TRANSFER_REQUEST;
 	ret = send_ctrl_msg_to_mvm(mvm_ctrl, mvm_dev);
 	kfree(mvm_ctrl);
@@ -551,6 +557,7 @@ static void process_control_message(struct mvm_control *mvm_ctrl_recv, struct mv
 {
 	ssize_t ret = 0;
 	struct mvm_control *mvm_ctrl_send;
+
 	mvm_ctrl_send = kzalloc(sizeof(struct mvm_control), GFP_KERNEL);
 	mvm_ctrl_send->type = MVM_DEBUG;
 	if ( mvm_ctrl_recv->mvm_ctrl_msg.debug.msg_type == MVM_DEBUG_LOG_TRANSFER_REQUEST) {
@@ -559,18 +566,18 @@ static void process_control_message(struct mvm_control *mvm_ctrl_recv, struct mv
 			mvm_ctrl_send->mvm_ctrl_msg.debug.ddr_log_buf_addr = mvm_dev->mvmlog_buff_dma + mvm_dev->filled_dma_bytes;
 			mvm_ctrl_send->mvm_ctrl_msg.debug.active_buffer_index = mvm_dev->active_buffer_index;
 			ret = send_ctrl_msg_to_mvm(mvm_ctrl_send, mvm_dev);
-			}
 		}
-		if ( mvm_ctrl_recv->mvm_ctrl_msg.debug.msg_type == MVM_DEBUG_LOG_TRANSFER_COMPLETE) {
-			wake_up_interruptible_poll(&mvm_dev->log_poll_wait, POLLIN | POLLPRI);
-			mvm_dev->ddr_buf_len = mvm_ctrl_recv->mvm_ctrl_msg.debug.num_bytes_transferred /4;
-			mvm_dev->ddr_head_pos = &mvm_dev->ddr_head_pos[mvm_dev->ddr_buf_len];
-			if( mvm_dev->ddr_head_pos >= &mvm_dev->log_buff->mvmlog_buffer[MVM_ULOG_BUFFER_SIZE]) {
-				mvm_dev->filled_dma_bytes = 0;//Reset filled ddr bytes to zero
+	}
+	if ( mvm_ctrl_recv->mvm_ctrl_msg.debug.msg_type == MVM_DEBUG_LOG_TRANSFER_COMPLETE) {
+		wake_up_interruptible_poll(&mvm_dev->log_poll_wait, POLLIN | POLLPRI);
+		mvm_dev->ddr_buf_len = mvm_ctrl_recv->mvm_ctrl_msg.debug.num_bytes_transferred /4;
+		mvm_dev->ddr_head_pos = &mvm_dev->ddr_head_pos[mvm_dev->ddr_buf_len];
+		if( mvm_dev->ddr_head_pos >= &mvm_dev->log_buff->mvmlog_buffer[MVM_ULOG_BUFFER_SIZE]) {
+			mvm_dev->filled_dma_bytes = 0;//Reset filled ddr bytes to zero
 				mvm_dev->ddr_head_pos = &mvm_dev->log_buff->mvmlog_buffer[0];
-				}
-			mvm_dev->ddr_current_addr = mvm_dev->ddr_head_pos;
 		}
+		mvm_dev->ddr_current_addr = mvm_dev->ddr_head_pos;
+	}
 	kfree(mvm_ctrl_send);
 }
 
@@ -614,6 +621,7 @@ static bool drain_out_fifo(struct mvm_device *mvm_dev, unsigned int fifo_index, 
 				break;
 			}
 			count--;
+			kfree(mvm_ctrl_recv);
 		}
 		list_for_each_entry(mvm_cli, &mvm_dev->client_list, list) {
 			if (mvm_cli->client_id == client_id) {
@@ -638,7 +646,6 @@ static bool drain_out_fifo(struct mvm_device *mvm_dev, unsigned int fifo_index, 
 			}
 		}
 	}
-	kfree(mvm_ctrl_recv);
 	if (out_buff_written || control_message_written) {
 		writel_relaxed(mvm_dev->ring_buff->out_fifo[0].tail,
 			mvm_dev->mvm_base + MVMSS_CSR_OUTPUT_RING0_TAIL_PTR_OFFSET);
