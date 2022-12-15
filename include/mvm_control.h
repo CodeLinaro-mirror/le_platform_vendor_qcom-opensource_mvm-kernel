@@ -10,7 +10,7 @@ enum mvm_ctrl_msg_type {
 	MVM_POLICY,          /* Control message for load balancing policy */
 	MVM_CPU_FREQ,        /* Control message for DSVC */
 	MVM_POWER,           /* Control message for power collapse */
-	MVM_MAX
+	MVM_MAX,
 };
 
 enum mvm_log_policy {
@@ -18,7 +18,8 @@ enum mvm_log_policy {
 	MVM_FLUSH_DDR_ON_DEMAND = 0,
 	MVM_FLUSH_DDR_PER_MSG,       /* Flush log to DDR as it arrives - DDR memory mapped */
 	MVM_FLUSH_DDR_OVERFLOW,       /* Flush log to DDR when buffer is full */
-	MVM_FLUSH_QDSS                /* Flush log to QDSS */
+	MVM_FLUSH_QDSS,                /* Flush log to QDSS */
+	MVM_FLUSH_PERIODIC                /* Flush log to QDSS */
 };
 
 enum mvm_balance_policy {
@@ -27,18 +28,27 @@ enum mvm_balance_policy {
 	MVM_PKE_1_2                   /* Equally distribute jobs between PKE 1 and 2 */
 };
 
+typedef enum {
+	MVM_DEBUG_LOG_POLICY = 0,
+	MVM_DEBUG_LOG_TRANSFER_REQUEST,
+	MVM_DEBUG_LOG_TRANSFER_COMPLETE
+} mvm_debug_msg_type;
+
+
 /*
  * struct mvm_debug
  * size = 4*5 = 20 bytes
  */
 struct mvm_debug {
 	enum mvm_log_policy log_policy;       /* Logging policy */
-	uint32_t ddr_log_buf_addr_high;  /* DDR address to push logs to - higher word */
-	uint32_t ddr_log_buf_addr_low;   /* DDR address to push logs to - lower word */
+	uint32_t ddr_log_buf_addr;  /* DDR address to push logs to */
 	uint32_t ddr_buf_len;            /* Length of buffer in DDR */
 	/* Time in msecs to flush logs to DDR when log_policy == MVM_FLUSH_PERIODIC */
 	uint32_t flush_period;
-};
+	mvm_debug_msg_type  msg_type;
+	uint32_t active_buffer_index;			 /* Micro_ulog buffer index */
+	uint32_t num_bytes_transferred;
+} __attribute__((packed));
 
 /*
  * struct mvm_policy
@@ -56,6 +66,10 @@ struct mvm_power {
 	uint8_t enter_pwr_collapse;
 };
 
+struct mvm_log_transfer{
+	bool is_transfer;
+};
+
 /*
  * struct mvm_control
  * Max Size possible = 240 bytes
@@ -69,6 +83,6 @@ struct mvm_control {
 		struct mvm_cpu_freq cpu;
 		struct mvm_power power;
 	} mvm_ctrl_msg;
-};
+} __attribute__((packed));
 
 #endif /* __MVM_CONTROL_H */

@@ -22,6 +22,7 @@
 #include <linux/firmware.h>
 #include <linux/of_address.h>
 #include <linux/sysfs.h>
+#include <linux/debugfs.h>
 #include <linux/bitops.h>
 #include <linux/dmapool.h>
 #include <linux/dma-mapping.h>
@@ -109,8 +110,10 @@
 
 #define GDSC_POWER_SLEEP_US             10
 #define GDSC_POWER_TIMEOUT_US           1000000
-#define MVM_DUMP_COLL_TIMEOUT_MS	3000
-#define MVM_PROC_ID			0x2B
+#define MVM_ULOG_BUFFER_SEGMENT         4
+#define MVM_ULOG_BUFFER_SIZE            2048
+#define MVM_DUMP_COLL_TIMEOUT_MS        3000
+#define MVM_PROC_ID                     0x2B
 /**
  * enum mvm_state - state of mvm subsystem
  * @MVM_OFFLINE: MVM firmware is not loaded/authenticated yet.
@@ -165,12 +168,17 @@ struct ring_buffers {
 	struct output_fifo out_fifo[DDR_FIFO_COUNT];
 };
 
+struct mvmlog_buffers {
+	uint32_t mvmlog_buffer[MVM_ULOG_BUFFER_SIZE];
+};
+
 struct mvm_client {
 	unsigned int client_id;
 	unsigned int timeout_ms;
 	struct mvm_device *mvm_dev;
 	struct list_head list;
 	struct output_buffer *out_buff;
+	enum mvm_log_policy log_policy;
 };
 
 struct mvm_device {
@@ -196,6 +204,7 @@ struct mvm_device {
 	struct mutex in_fifo_lock;
 	struct mutex out_fifo_lock;
 	wait_queue_head_t mvm_waitqueue;
+	wait_queue_head_t log_poll_wait;
 	struct work_struct drain_out_fifo_work;
 	struct work_struct trigger_ssr_work;
 	struct completion p0_fifo_slot_available;
@@ -204,6 +213,7 @@ struct mvm_device {
 	struct completion mvm_dump_collection_done;
 	struct kobject *kobj;
 	struct kobj_attribute attr;
+	struct dentry *dir;
 	struct dma_pool *ring_buffers_pool;
 	struct dma_pool *mvm_fw_pool;
 	struct dma_pool *mvm_dump_pool;
@@ -211,6 +221,8 @@ struct mvm_device {
 	uint32_t *mvm_dump;
 	struct ring_buffers *ring_buff;
 	dma_addr_t ring_buff_dma;
+	struct dma_pool *mvmlog_buffer_pool;
+	struct mvmlog_buffers *log_buff;
 	dma_addr_t mvm_fw_dma;
 	dma_addr_t mvm_dump_dma;
 	struct clk *xo;
@@ -218,6 +230,13 @@ struct mvm_device {
 	struct clk *snoc_m_axi_clk;
 	struct clk *sysnoc_mvmss_clk;
 	enum mvm_state state;
+	dma_addr_t mvmlog_buff_dma;
+	uint32_t *ddr_head_pos;
+	uint32_t *ddr_tail_pos;
+	uint32_t *ddr_current_addr;
+	int active_buffer_index;
+	uint32_t ddr_buf_len;
+	uint32_t filled_dma_bytes;
 };
 
 static void enable_wfi_int(struct mvm_device *mvm_dev, bool enable)
@@ -361,25 +380,249 @@ static int send_ctrl_msg_to_mvm(struct mvm_control *mvm_ctrl, struct mvm_device 
 	inp_msg->opcode = CTL_MSG_OPCODE;
 	memcpy(in_fifo_addr, inp_msg, sizeof(struct input_msg));
 
-	memcpy(in_fifo_addr+1, mvm_ctrl, sizeof(struct mvm_control));
-	mvm_dev->ring_buff->in_fifo[0].head = (mvm_dev->ring_buff->in_fifo[0].head + 1)
-						% mvm_dev->ring_buff->in_fifo[0].size;
-
-	/*TODO Send interrupt to mvm */
+	memcpy(in_fifo_addr + 1, mvm_ctrl, sizeof(struct mvm_control));
+	mvm_dev->ring_buff->in_fifo[0].head = (mvm_dev->ring_buff->in_fifo[0].head + 1) % mvm_dev->ring_buff->in_fifo[0].size;
+	writel_relaxed(mvm_dev->ring_buff->in_fifo[0].head, mvm_dev->mvm_base + MVMSS_CSR_INPUT_RING0_HEAD_PTR_OFFSET);
+	writel_relaxed(IRQ_APSS1, mvm_dev->apss_shared_base);
 	return 0;
+}
+
+static ssize_t mvm_log_file_read(struct file *filp, char __user *buff, size_t count, loff_t *offset)
+{
+	struct mvm_device *mvm_dev = filp->private_data;
+	ssize_t actual_length = 0;
+	ssize_t ret = 0;
+	char *buff_total;
+	ssize_t length_tail_to_bufferend;
+
+	if (mvm_dev->ddr_tail_pos >= &mvm_dev->log_buff->mvmlog_buffer[MVM_ULOG_BUFFER_SIZE]) {
+		mvm_dev->ddr_tail_pos = &mvm_dev->log_buff->mvmlog_buffer[0];
+	}
+
+	if (mvm_dev->ddr_head_pos > mvm_dev->ddr_tail_pos) {
+		if (count > (mvm_dev->ddr_head_pos - mvm_dev->ddr_tail_pos)) {
+			if (copy_to_user(buff, mvm_dev->ddr_tail_pos, (mvm_dev->ddr_head_pos - mvm_dev->ddr_tail_pos)*4)) {//multiplied by 4 to calculate size of int
+				return actual_length;//Actual length will be zero if copy to user not success
+			}
+
+			actual_length = (mvm_dev->ddr_head_pos - mvm_dev->ddr_tail_pos)*4;
+			mvm_dev->ddr_tail_pos = mvm_dev->ddr_head_pos;
+			return actual_length;
+		} else  {
+			if (copy_to_user(buff, mvm_dev->ddr_tail_pos, count)) {
+				return actual_length;
+			}//Actual length will be zero if copy to user not success
+			return count;
+		}
+	} else if (mvm_dev->ddr_head_pos < mvm_dev->ddr_tail_pos) {
+		ret = copy_to_user(buff, mvm_dev->ddr_tail_pos, (&mvm_dev->log_buff->mvmlog_buffer[MVM_ULOG_BUFFER_SIZE] - mvm_dev->ddr_tail_pos));
+		length_tail_to_bufferend = &mvm_dev->log_buff->mvmlog_buffer[MVM_ULOG_BUFFER_SIZE] - mvm_dev->ddr_tail_pos;
+		if (length_tail_to_bufferend == (&mvm_dev->log_buff->mvmlog_buffer[MVM_ULOG_BUFFER_SIZE] - mvm_dev->ddr_tail_pos)) {
+			buff_total = (buff+length_tail_to_bufferend);
+			ret = copy_to_user(buff_total, &mvm_dev->log_buff->mvmlog_buffer[0], (mvm_dev->ddr_head_pos - &mvm_dev->log_buff->mvmlog_buffer[0]));
+			actual_length = length_tail_to_bufferend + (mvm_dev->ddr_head_pos - &mvm_dev->log_buff->mvmlog_buffer[0]);
+		}
+		mvm_dev->ddr_tail_pos = mvm_dev->ddr_head_pos;
+		return actual_length;
+	}
+
+	return actual_length;
+}
+
+static __poll_t mvm_log_poll(struct file *filp, struct poll_table_struct *wait)
+{
+	unsigned int events = 0;
+	struct mvm_device *mvm_dev = filp->private_data;
+
+	events = mvm_dev->ddr_head_pos - mvm_dev->ddr_tail_pos;
+	if (events) {
+		events = POLLIN | POLLPRI;
+		return events;
+	}
+	poll_wait(filp, &mvm_dev->log_poll_wait, wait);
+	return events;
+}
+
+static int mvm_log_open(struct inode *inode, struct file *filp)
+{
+	struct mvm_device *mvm_dev = inode->i_private;
+	filp->private_data = mvm_dev;
+	return 0;
+}
+
+static const struct file_operations debugfs_mvm_log_ops = {
+	.owner     = THIS_MODULE,
+	.open      = mvm_log_open,
+	.read      = mvm_log_file_read,
+	.poll      = mvm_log_poll
+};
+
+static int mvm_log_policy_open(struct inode *inode, struct file *filp)
+{
+	struct mvm_device *mvm_dev = inode->i_private;
+	filp->private_data = mvm_dev;
+	return 0;
+}
+
+static ssize_t mvm_log_policy_store(struct file *filp, const char __user *ubuf, size_t count, loff_t *ppos)
+{
+	ssize_t ret = 0;
+	struct mvm_control *mvm_ctrl;
+	struct mvm_device *mvm_dev = filp->private_data;
+
+	mvm_ctrl = kzalloc(sizeof(struct mvm_control), GFP_KERNEL);
+	mvm_ctrl->type = MVM_DEBUG;
+	count = sizeof(mvm_ctrl->mvm_ctrl_msg.debug.log_policy);
+	if (copy_from_user(&mvm_ctrl->mvm_ctrl_msg.debug.log_policy, ubuf, count)) {
+		kfree(mvm_ctrl);
+		ret = -EFAULT;
+		return ret;
+	}
+	mvm_ctrl->mvm_ctrl_msg.debug.log_policy = MVM_FLUSH_DDR_ON_DEMAND;
+	ret = send_ctrl_msg_to_mvm(mvm_ctrl, mvm_dev);
+	kfree(mvm_ctrl);
+	return ret;
+}
+
+static const struct file_operations debugfs_mvm_policy_ops = {
+	.owner      = THIS_MODULE,
+	.open     = mvm_log_policy_open,
+	.write    = mvm_log_policy_store,
+};
+
+
+static int mvm_log_transfer_open(struct inode *inode, struct file *filp)
+{
+	struct mvm_device *mvm_dev = inode->i_private;
+	filp->private_data = mvm_dev;
+	return 0;
+}
+static ssize_t mvm_log_transfer_store(struct file *filp, const char __user *ubuf, size_t count, loff_t *ppos)
+{
+	ssize_t ret = 0;
+	struct mvm_control *mvm_ctrl;
+	struct mvm_device *mvm_dev = filp->private_data;
+
+	mvm_ctrl = kzalloc(sizeof(struct mvm_control), GFP_KERNEL);
+	mvm_ctrl->type = MVM_DEBUG;
+	mvm_dev->filled_dma_bytes = mvm_dev->filled_dma_bytes + (mvm_dev->ddr_buf_len * 0x4);
+	mvm_ctrl->mvm_ctrl_msg.debug.ddr_log_buf_addr = mvm_dev->mvmlog_buff_dma + mvm_dev->filled_dma_bytes;
+	count = sizeof(mvm_ctrl->mvm_ctrl_msg.debug.msg_type);
+	if (copy_from_user(&mvm_ctrl->mvm_ctrl_msg.debug.msg_type, ubuf, count)) {
+		kfree(mvm_ctrl);
+		ret = -EFAULT;
+		return ret;
+	}
+
+	mvm_ctrl->mvm_ctrl_msg.debug.msg_type = MVM_DEBUG_LOG_TRANSFER_REQUEST;
+	ret = send_ctrl_msg_to_mvm(mvm_ctrl, mvm_dev);
+	kfree(mvm_ctrl);
+	return ret;
+}
+
+static const struct file_operations debugfs_mvm_transfer_ops = {
+	.owner      = THIS_MODULE,
+	.open     = mvm_log_transfer_open,
+	.write    = mvm_log_transfer_store,
+};
+
+static int mvm_log_debugfs_init(struct mvm_device *mvm_dev)
+{
+	struct dentry *file;
+	mvm_dev->dir = debugfs_create_dir("mvm", NULL);
+	if (IS_ERR_OR_NULL(mvm_dev->dir))
+		return -ENOMEM;
+	 file = debugfs_create_file("mvm_log", 0644, mvm_dev->dir, mvm_dev,
+		&debugfs_mvm_log_ops);
+	if (!file)
+		debugfs_remove(mvm_dev->dir);
+	file = debugfs_create_file("mvm_policy", 0644, mvm_dev->dir, mvm_dev,
+		&debugfs_mvm_policy_ops);
+	if (!file)
+		debugfs_remove(mvm_dev->dir);
+	file = debugfs_create_file("mvm_transfer", 0644, mvm_dev->dir, mvm_dev,
+		&debugfs_mvm_transfer_ops);
+	if (!file)
+		debugfs_remove(mvm_dev->dir);
+	mvm_dev->ddr_current_addr = &mvm_dev->log_buff->mvmlog_buffer[0];
+	mvm_dev->ddr_head_pos = &mvm_dev->log_buff->mvmlog_buffer[0];
+	mvm_dev->ddr_tail_pos = &mvm_dev->log_buff->mvmlog_buffer[0];
+	mvm_dev->active_buffer_index = -1;
+	mvm_dev->ddr_buf_len = 0;
+	mvm_dev->filled_dma_bytes = 0;
+	return 0;
+}
+
+static void process_control_message(struct mvm_control *mvm_ctrl_recv, struct mvm_device *mvm_dev)
+{
+	ssize_t ret = 0;
+	struct mvm_control *mvm_ctrl_send;
+
+	mvm_ctrl_send = kzalloc(sizeof(struct mvm_control), GFP_KERNEL);
+	mvm_ctrl_send->type = MVM_DEBUG;
+	if ( mvm_ctrl_recv->mvm_ctrl_msg.debug.msg_type == MVM_DEBUG_LOG_TRANSFER_REQUEST) {
+	    if ( mvm_ctrl_recv->mvm_ctrl_msg.debug.msg_type == MVM_FLUSH_DDR_OVERFLOW) {
+			wake_up_interruptible_poll(&mvm_dev->log_poll_wait, POLLIN | POLLPRI);//wake up poll for logging if transfer complete
+			mvm_ctrl_send->mvm_ctrl_msg.debug.ddr_log_buf_addr = mvm_dev->mvmlog_buff_dma + mvm_dev->filled_dma_bytes;
+			mvm_ctrl_send->mvm_ctrl_msg.debug.active_buffer_index = mvm_dev->active_buffer_index;
+			ret = send_ctrl_msg_to_mvm(mvm_ctrl_send, mvm_dev);
+		}
+	}
+	if ( mvm_ctrl_recv->mvm_ctrl_msg.debug.msg_type == MVM_DEBUG_LOG_TRANSFER_COMPLETE) {
+		wake_up_interruptible_poll(&mvm_dev->log_poll_wait, POLLIN | POLLPRI);
+		mvm_dev->ddr_buf_len = mvm_ctrl_recv->mvm_ctrl_msg.debug.num_bytes_transferred /4;
+		mvm_dev->ddr_head_pos = &mvm_dev->ddr_head_pos[mvm_dev->ddr_buf_len];
+		if( mvm_dev->ddr_head_pos >= &mvm_dev->log_buff->mvmlog_buffer[MVM_ULOG_BUFFER_SIZE]) {
+			mvm_dev->filled_dma_bytes = 0;//Reset filled ddr bytes to zero
+				mvm_dev->ddr_head_pos = &mvm_dev->log_buff->mvmlog_buffer[0];
+		}
+		mvm_dev->ddr_current_addr = mvm_dev->ddr_head_pos;
+	}
+	kfree(mvm_ctrl_send);
 }
 
 static bool drain_out_fifo(struct mvm_device *mvm_dev, unsigned int fifo_index, unsigned int count)
 {
 	struct mvm_client *mvm_cli;
 	unsigned int client_id;
+	unsigned int opcode;
 	bool full = false;
 	bool out_buff_written = false;
-
+	bool control_message_written = false;
+	unsigned int *out_fifo_addr = NULL;
+	struct mvm_control *mvm_ctrl_recv;
 	while (count && !full) {
 		client_id =
 		mvm_dev->ring_buff->out_fifo[fifo_index].base[mvm_dev->ring_buff->out_fifo[fifo_index].tail].client_id;
 		dev_dbg(mvm_dev->dev, "client_id is %d\n", client_id);
+		opcode =
+			mvm_dev->ring_buff->out_fifo[fifo_index].base[mvm_dev->ring_buff->out_fifo[fifo_index].tail].opcode;
+		dev_dbg(mvm_dev->dev, "opcode is %d\n", opcode);
+		if (opcode == CTL_MSG_OPCODE) {
+			mvm_ctrl_recv = kzalloc(sizeof(struct mvm_control), GFP_KERNEL);
+			out_fifo_addr = (unsigned int *) mvm_dev->ring_buff->out_fifo[fifo_index].base[mvm_dev->ring_buff->out_fifo[fifo_index].tail].data;
+			memcpy(mvm_ctrl_recv, out_fifo_addr, sizeof(struct mvm_control));
+			switch (mvm_ctrl_recv->type) {
+			case MVM_DEBUG:
+				mvm_dev->active_buffer_index = mvm_ctrl_recv->mvm_ctrl_msg.debug.active_buffer_index;
+				process_control_message(mvm_ctrl_recv, mvm_dev);
+				mvm_dev->ring_buff->out_fifo[fifo_index].tail =
+						(mvm_dev->ring_buff->out_fifo[fifo_index].tail+1) %
+						mvm_dev->ring_buff->out_fifo[fifo_index].size;
+				control_message_written = true;
+				break;
+			case MVM_POLICY:
+				break;
+			case MVM_CPU_FREQ:
+				break;
+			case MVM_POWER:
+				break;
+			default:
+				break;
+			}
+			count--;
+			kfree(mvm_ctrl_recv);
+		}
 		list_for_each_entry(mvm_cli, &mvm_dev->client_list, list) {
 			if (mvm_cli->client_id == client_id) {
 				full = fifo_full(mvm_cli->out_buff->head, mvm_cli->out_buff->size,
@@ -403,8 +646,7 @@ static bool drain_out_fifo(struct mvm_device *mvm_dev, unsigned int fifo_index, 
 			}
 		}
 	}
-
-	if (out_buff_written) {
+	if (out_buff_written || control_message_written) {
 		writel_relaxed(mvm_dev->ring_buff->out_fifo[0].tail,
 			mvm_dev->mvm_base + MVMSS_CSR_OUTPUT_RING0_TAIL_PTR_OFFSET);
 		writel_relaxed(mvm_dev->ring_buff->out_fifo[1].tail,
@@ -458,12 +700,8 @@ static void drain_out_fifo_work_hdlr(struct work_struct *work)
 
 	mvm_dev->ring_buff->in_fifo[0].tail =
 		readl_relaxed(mvm_dev->mvm_base + MVMSS_CSR_INPUT_RING0_TAIL_PTR_OFFSET);
-	mvm_dev->ring_buff->in_fifo[0].head =
-		readl_relaxed(mvm_dev->mvm_base + MVMSS_CSR_INPUT_RING0_HEAD_PTR_OFFSET);
 	mvm_dev->ring_buff->in_fifo[1].tail =
 		readl_relaxed(mvm_dev->mvm_base + MVMSS_CSR_INPUT_RING1_TAIL_PTR_OFFSET);
-	mvm_dev->ring_buff->in_fifo[1].head =
-		readl_relaxed(mvm_dev->mvm_base + MVMSS_CSR_INPUT_RING1_HEAD_PTR_OFFSET);
 
 	if(!fifo_full(mvm_dev->ring_buff->in_fifo[0].head,
 			mvm_dev->ring_buff->in_fifo[0].size,
@@ -1105,6 +1343,15 @@ static int mvm_dma_pool_create(struct mvm_device *mvm_dev)
 		goto dump_dma_pool_alloc_fail;
 	}
 
+	mvm_dev->mvmlog_buffer_pool = dmam_pool_create("mvm_log_buffers", mvm_dev->dev, sizeof(struct mvmlog_buffers),
+								512, 0);
+	if (!mvm_dev->mvmlog_buffer_pool)
+		return -ENOMEM;
+
+	mvm_dev->log_buff = dma_pool_zalloc(mvm_dev->mvmlog_buffer_pool, GFP_KERNEL, &mvm_dev->mvmlog_buff_dma);
+	if (!mvm_dev->log_buff)
+		return -ENOMEM;
+
 	return 0;
 
 dump_dma_pool_alloc_fail:
@@ -1300,6 +1547,7 @@ static int mvm_probe(struct platform_device *pdev)
 	ret = mvm_dma_pool_create(mvm_dev);
 	if (ret)
 		goto device_fail;
+
 	ret = ioremap_resources(pdev);
 	if (ret) {
 		dev_err(mvm_dev->dev, "Cant ioremap resources\n");
@@ -1323,12 +1571,14 @@ static int mvm_probe(struct platform_device *pdev)
 	mutex_init(&mvm_dev->out_fifo_lock);
 	INIT_LIST_HEAD(&mvm_dev->client_list);
 	init_waitqueue_head(&mvm_dev->mvm_waitqueue);
+	init_waitqueue_head(&mvm_dev->log_poll_wait);
 	bitmap_zero(mvm_dev->client_id_bitmap, MAX_CLIENT_COUNT);
 	INIT_WORK(&mvm_dev->drain_out_fifo_work, drain_out_fifo_work_hdlr);
 	INIT_WORK(&mvm_dev->trigger_ssr_work, trigger_ssr_work_hdlr);
 	init_completion(&mvm_dev->p0_fifo_slot_available);
 	init_completion(&mvm_dev->p1_fifo_slot_available);
 	init_completion(&mvm_dev->mvm_core_collapse_done);
+	ret = mvm_log_debugfs_init(mvm_dev);
 	init_completion(&mvm_dev->mvm_dump_collection_done);
 
 	ret = mvm_sysfs_init(mvm_dev);
