@@ -34,8 +34,6 @@
 #define OUT_BUFF_SIZE			32
 #define TIMEOUT_MS			10000
 #define MAX_CLIENT_COUNT		16
-/* TODO Remove this once power management is enabled for MVM */
-#define CONFIG_MVM_PM                   0
 /*TODO Remove this once PIL validation is complete */
 #define KEEP_FW_IN_DDR			1
 
@@ -239,6 +237,10 @@ struct mvm_device {
 	uint32_t filled_dma_bytes;
 };
 
+static int enable_gcc_clocks(struct mvm_device *mvm_dev);
+static int enable_mvm_gdsc(struct mvm_device *mvm_dev, bool powerup);
+static int mvm_suspend(struct device *dev);
+
 static void enable_wfi_int(struct mvm_device *mvm_dev, bool enable)
 {
 
@@ -281,19 +283,17 @@ static int enable_mvm_gdsc(struct mvm_device *mvm_dev, bool powerup)
 		if (ret < 0)
 			dev_err(mvm_dev->dev, "mvm gdsc couldn't power down\n");
 		else
-			dev_info(mvm_dev->dev, "MVM GDSC powered down\n");
+			dev_info(mvm_dev->dev, "mvm GDSC powered down\n");
 	}
 	return ret;
 }
 
 static void collapse_mvm_core(struct mvm_device *mvm_dev)
 {
-	uint32_t reg_val, val;
+	uint32_t reg_val;
 
-	reg_val = readl_relaxed(mvm_dev->mvm_base + MVM_CC_MVM_GDSCR_OFFSET);
-	val = 1 << RETAIN_FF_ENABLE_SHIFT;
-	writel_relaxed((reg_val & RETAIN_FF_ENABLE_MASK)| val,
-			(mvm_dev->mvm_base + MVM_CC_MVM_GDSCR_OFFSET));
+	reg_val = readl_relaxed(mvm_dev->mvm_base + MVM_CC_E21CPU_CC_CBCR_OFFSET);
+	writel_relaxed(((reg_val & SW_COLLAPSE_MASK)| 0) ,  mvm_dev->mvm_base + MVM_CC_E21CPU_CC_CBCR_OFFSET);
 	enable_mvm_gdsc(mvm_dev, false);
 }
 
@@ -526,24 +526,69 @@ static const struct file_operations debugfs_mvm_transfer_ops = {
 	.write    = mvm_log_transfer_store,
 };
 
-static int mvm_log_debugfs_init(struct mvm_device *mvm_dev)
+static int mvm_trigger_ssr_open(struct inode *inode, struct file *filp)
+{
+	struct mvm_device *mvm_dev = inode->i_private;
+	filp->private_data = mvm_dev;
+	return 0;
+}
+
+static ssize_t mvm_trigger_ssr_store(struct file *filp, const char __user *ubuf, size_t count, loff_t *ppos)
+{
+	ssize_t ret = 0;
+	unsigned int ssr = 0;
+	struct mvm_control *mvm_ctrl;
+	struct mvm_device *mvm_dev = filp->private_data;
+
+	ret = kstrtouint_from_user(ubuf, count, 10, &ssr);
+	if (ret)
+		return ret;
+
+	if (ssr == 1) {
+		mvm_ctrl = kzalloc(sizeof(struct mvm_control), GFP_KERNEL);
+		mvm_ctrl->type = MVM_TRIGGER_SSR;
+		mvm_ctrl->mvm_ctrl_msg.ssr.trigger_ssr = ssr;
+		ret = send_ctrl_msg_to_mvm(mvm_ctrl, mvm_dev);
+		kfree(mvm_ctrl);
+	}
+
+	return count;
+}
+
+static const struct file_operations debugfs_mvm_trigger_ssr_ops = {
+	.owner = THIS_MODULE,
+	.open = mvm_trigger_ssr_open,
+	.write = mvm_trigger_ssr_store,
+};
+
+static int mvm_debugfs_init(struct mvm_device *mvm_dev)
 {
 	struct dentry *file;
+
 	mvm_dev->dir = debugfs_create_dir("mvm", NULL);
 	if (IS_ERR_OR_NULL(mvm_dev->dir))
 		return -ENOMEM;
-	 file = debugfs_create_file("mvm_log", 0644, mvm_dev->dir, mvm_dev,
-		&debugfs_mvm_log_ops);
+
+	file = debugfs_create_file("mvm_log", 0644, mvm_dev->dir, mvm_dev,
+						&debugfs_mvm_log_ops);
 	if (!file)
 		debugfs_remove(mvm_dev->dir);
+
 	file = debugfs_create_file("mvm_policy", 0644, mvm_dev->dir, mvm_dev,
-		&debugfs_mvm_policy_ops);
+						&debugfs_mvm_policy_ops);
 	if (!file)
 		debugfs_remove(mvm_dev->dir);
+
 	file = debugfs_create_file("mvm_transfer", 0644, mvm_dev->dir, mvm_dev,
-		&debugfs_mvm_transfer_ops);
+						&debugfs_mvm_transfer_ops);
 	if (!file)
 		debugfs_remove(mvm_dev->dir);
+
+	file = debugfs_create_file("trigger_ssr", 0644, mvm_dev->dir, mvm_dev,
+						&debugfs_mvm_trigger_ssr_ops);
+	if (!file)
+		debugfs_remove(mvm_dev->dir);
+
 	mvm_dev->ddr_current_addr = &mvm_dev->log_buff->mvmlog_buffer[0];
 	mvm_dev->ddr_head_pos = &mvm_dev->log_buff->mvmlog_buffer[0];
 	mvm_dev->ddr_tail_pos = &mvm_dev->log_buff->mvmlog_buffer[0];
@@ -1013,11 +1058,7 @@ update_tail:
 static irqreturn_t mvm_wfi_irq_handler(int irq, void *dev_id)
 {
 	struct mvm_device *mvm_dev = dev_id;
-	uint32_t value;
 
-	value = readl_relaxed(mvm_dev->mvm_base+MVMSS_CSR_MVMSS_APSS);
-	value = (value & (~(1 << ((mvm_dev->mvm_ssr_done_hw_irq - 432)))));
-	writel_relaxed(value, mvm_dev->mvm_base+MVMSS_CSR_MVMSS_APSS);
 	collapse_mvm_core(mvm_dev);
 	complete(&mvm_dev->mvm_core_collapse_done);
 	return IRQ_HANDLED;
@@ -1164,6 +1205,12 @@ static int mvm_load_fw(struct mvm_device *mvm_dev)
 
 	mvm_dev->state = MVM_ONLINE;
 
+	/* Write crash dump DDR location to SCRATCH_PAD0 register so that E21 can store the crash
+	 * dump information here.
+	 */
+	writel_relaxed(mvm_dev->mvm_dump_dma,
+			mvm_dev->mvm_base + MVMSS_CSR_APSS_MVM_SCRATCH_PAD0);
+
 	initialise_fifos(mvm_dev);
 	/*Send an interrupt to MVM to indicate MVM_Init done */
 	writel_relaxed(IRQ_APSS0, mvm_dev->apss_shared_base);
@@ -1200,10 +1247,14 @@ static void trigger_ssr_work_hdlr(struct work_struct *work)
 			msecs_to_jiffies(MVM_DUMP_COLL_TIMEOUT_MS));
 	if (ret == 0) {
 		dev_err(mvm_dev->dev, "Timed out as mvm dump collection is not complete\n");
-		return;
 	}
+
+	dev_info(mvm_dev->dev, "MVM subsystem is restarting after SSR\n");
+	enable_gcc_clocks(mvm_dev);
+	enable_mvm_gdsc(mvm_dev, true);
+
 	mvm_dev->state = MVM_RESTARTING;
-	/*TODO Power on GDSC */
+
 	mvm_load_fw(mvm_dev);
 
 	return;
@@ -1246,7 +1297,7 @@ static int register_isrs(struct platform_device *pdev)
 	data = irq_get_irq_data(mvm_dev->mvm_ssr_done_irq);
 	mvm_dev->mvm_ssr_done_hw_irq = data->hwirq;
 
-	dev_info(mvm_dev->dev, "mvm_ssr_done irq registered\n");
+	dev_dbg(mvm_dev->dev, "mvm_ssr_done irq registered\n");
 
 	mvm_dev->mvm_verif_done_irq = platform_get_irq_byname(pdev, "mvm_verif_done");
 	if (mvm_dev->mvm_verif_done_irq < 0) {
@@ -1264,7 +1315,7 @@ static int register_isrs(struct platform_device *pdev)
 	}
 	data = irq_get_irq_data(mvm_dev->mvm_verif_done_irq);
 	mvm_dev->mvm_verif_done_hw_irq = data->hwirq;
-	dev_info(mvm_dev->dev, "mvm_verif_done registered\n");
+	dev_dbg(mvm_dev->dev, "mvm_verif_done registered\n");
 
 	mvm_dev->wfi_irq = platform_get_irq_byname(pdev, "wfi");
 	if (mvm_dev->wfi_irq < 0) {
@@ -1281,6 +1332,7 @@ static int register_isrs(struct platform_device *pdev)
 			"devm_request_threaded_irq of wfi_irq failed %d\n", ret);
 		return ret;
 	}
+	dev_dbg(mvm_dev->dev, "wfi_irq registered\n");
 
 	mvm_dev->wdog_irq = platform_get_irq_byname(pdev, "wdog");
 	if (mvm_dev->wdog_irq < 0) {
@@ -1296,7 +1348,7 @@ static int register_isrs(struct platform_device *pdev)
 		dev_err(mvm_dev->dev, "mvm_wdog irq request failed\n");
 		return ret;
 	}
-	dev_info(mvm_dev->dev, "wdog irq registered\n");
+	dev_dbg(mvm_dev->dev, "wdog irq registered\n");
 
 	return 0;
 }
@@ -1329,7 +1381,7 @@ static int mvm_dma_pool_create(struct mvm_device *mvm_dev)
 
 	/*Allocate memory for mvm crash dump */
 	mvm_dev->mvm_dump_pool = dma_pool_create("mvm_dump", mvm_dev->dev,
-							0x10000, 512, 0);
+							0x10200, 512, 0);
 	if (!mvm_dev->mvm_dump_pool) {
 		dev_err(mvm_dev->dev,
 			"can't create mvm dump buffer dma_pool, %d\n", -ENOMEM);
@@ -1426,8 +1478,6 @@ unprepare_xo:
 	return ret;
 }
 
-#if (defined CONFIG_PM && defined CONFIG_MVM_PM)
-
 static int mvm_suspend(struct device *dev)
 {
 	struct mvm_device *mvm_dev = dev_get_drvdata(dev);
@@ -1497,7 +1547,6 @@ static int mvm_resume(struct device *dev)
 
 	return ret;
 }
-#endif
 
 static int mvm_probe(struct platform_device *pdev)
 {
@@ -1554,11 +1603,6 @@ static int mvm_probe(struct platform_device *pdev)
 		goto ioremap_fail;
 	}
 
-	/* Write crash dump DDR location to SCRATCH_PAD0 register so that E21 can store the crash
-	 * dump information here.
-	 */
-	writel_relaxed(mvm_dev->mvm_dump_dma,
-			mvm_dev->mvm_base + MVMSS_CSR_APSS_MVM_SCRATCH_PAD0);
 	ret = register_isrs(pdev);
 	if (ret < 0) {
 		dev_err(mvm_dev->dev,
@@ -1578,7 +1622,7 @@ static int mvm_probe(struct platform_device *pdev)
 	init_completion(&mvm_dev->p0_fifo_slot_available);
 	init_completion(&mvm_dev->p1_fifo_slot_available);
 	init_completion(&mvm_dev->mvm_core_collapse_done);
-	ret = mvm_log_debugfs_init(mvm_dev);
+	ret = mvm_debugfs_init(mvm_dev);
 	init_completion(&mvm_dev->mvm_dump_collection_done);
 
 	ret = mvm_sysfs_init(mvm_dev);
@@ -1650,12 +1694,10 @@ static int mvm_remove(struct platform_device *pdev)
 	return 0;
 }
 
-#if (defined CONFIG_PM && defined CONFIG_MVM_PM)
 static const struct dev_pm_ops mvm_pm_ops = {
 	.suspend        =    mvm_suspend,
 	.resume         =    mvm_resume,
 };
-#endif
 
 static const struct of_device_id mvm_of_match[] = {
 	{ .compatible = "qcom,mvm"},
@@ -1670,9 +1712,7 @@ static struct platform_driver mvm_driver = {
 	.driver = {
 		.name	= "mvm",
 		.of_match_table = mvm_of_match,
-#if (defined CONFIG_PM && defined CONFIG_MVM_PM)
 		.pm = &mvm_pm_ops,
-#endif
 	},
 };
 

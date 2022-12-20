@@ -6,10 +6,11 @@
 #define __MVM_CONTROL_H
 
 enum mvm_ctrl_msg_type {
-	MVM_DEBUG = 0,       /* Control message for debug framework */
-	MVM_POLICY,          /* Control message for load balancing policy */
-	MVM_CPU_FREQ,        /* Control message for DSVC */
-	MVM_POWER,           /* Control message for power collapse */
+	MVM_DEBUG = 0,		/* Control message for debug framework */
+	MVM_POLICY,		/* Control message for load balancing policy */
+	MVM_CPU_FREQ,		/* Control message for DSVC */
+	MVM_POWER,		/* Control message for power collapse */
+	MVM_TRIGGER_SSR,	/* Control message to trigger SSR of MVM */
 	MVM_MAX,
 };
 
@@ -66,8 +67,12 @@ struct mvm_power {
 	uint8_t enter_pwr_collapse;
 };
 
-struct mvm_log_transfer{
+struct mvm_log_transfer {
 	bool is_transfer;
+};
+
+struct mvm_trigger_ssr {
+	bool trigger_ssr;
 };
 
 /*
@@ -82,6 +87,7 @@ struct mvm_control {
 		struct mvm_policy policy;
 		struct mvm_cpu_freq cpu;
 		struct mvm_power power;
+		struct mvm_trigger_ssr ssr;
 	} mvm_ctrl_msg;
 } __attribute__((packed));
 
