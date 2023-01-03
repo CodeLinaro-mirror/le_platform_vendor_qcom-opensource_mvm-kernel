@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: GPL-2.0-only
-/* Copyright (c) 2022 Qualcomm Innovation Center, Inc. All rights reserved.
+/* Copyright (c) 2022-2023 Qualcomm Innovation Center, Inc. All rights reserved.
  */
 
 #include <linux/platform_device.h>
@@ -1472,7 +1472,7 @@ static int mvm_suspend(struct device *dev)
 	mutex_unlock(&mvm_dev->mvm_csr_lock);
 	mvm_dev->state = MVM_SLEEP;
 
-	return ret;
+	return 0;
 }
 
 static int mvm_resume(struct device *dev)
