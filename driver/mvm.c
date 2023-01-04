@@ -472,13 +472,12 @@ static ssize_t mvm_log_policy_store(struct file *filp, const char __user *ubuf, 
 
 	mvm_ctrl = kzalloc(sizeof(struct mvm_control), GFP_KERNEL);
 	mvm_ctrl->type = MVM_DEBUG;
-	count = sizeof(mvm_ctrl->mvm_ctrl_msg.debug.log_policy);
-	if (copy_from_user(&mvm_ctrl->mvm_ctrl_msg.debug.log_policy, ubuf, count)) {
+	if (copy_from_user(&mvm_ctrl->mvm_ctrl_msg.debug.transfer_msg.log_policy, ubuf, count)) {
 		kfree(mvm_ctrl);
 		ret = -EFAULT;
 		return ret;
 	}
-	mvm_ctrl->mvm_ctrl_msg.debug.log_policy = MVM_FLUSH_DDR_ON_DEMAND;
+
 	ret = send_ctrl_msg_to_mvm(mvm_ctrl, mvm_dev);
 	kfree(mvm_ctrl);
 	return ret;
@@ -490,13 +489,13 @@ static const struct file_operations debugfs_mvm_policy_ops = {
 	.write    = mvm_log_policy_store,
 };
 
-
 static int mvm_log_transfer_open(struct inode *inode, struct file *filp)
 {
 	struct mvm_device *mvm_dev = inode->i_private;
 	filp->private_data = mvm_dev;
 	return 0;
 }
+
 static ssize_t mvm_log_transfer_store(struct file *filp, const char __user *ubuf, size_t count, loff_t *ppos)
 {
 	ssize_t ret = 0;
@@ -506,8 +505,7 @@ static ssize_t mvm_log_transfer_store(struct file *filp, const char __user *ubuf
 	mvm_ctrl = kzalloc(sizeof(struct mvm_control), GFP_KERNEL);
 	mvm_ctrl->type = MVM_DEBUG;
 	mvm_dev->filled_dma_bytes = mvm_dev->filled_dma_bytes + (mvm_dev->ddr_buf_len * 0x4);
-	mvm_ctrl->mvm_ctrl_msg.debug.ddr_log_buf_addr = mvm_dev->mvmlog_buff_dma + mvm_dev->filled_dma_bytes;
-	count = sizeof(mvm_ctrl->mvm_ctrl_msg.debug.msg_type);
+	mvm_ctrl->mvm_ctrl_msg.debug.transfer_msg.ddr_log_buf_addr = mvm_dev->mvmlog_buff_dma + mvm_dev->filled_dma_bytes;
 	if (copy_from_user(&mvm_ctrl->mvm_ctrl_msg.debug.msg_type, ubuf, count)) {
 		kfree(mvm_ctrl);
 		ret = -EFAULT;
@@ -561,6 +559,40 @@ static const struct file_operations debugfs_mvm_trigger_ssr_ops = {
 	.write = mvm_trigger_ssr_store,
 };
 
+static int mvm_log_level_open(struct inode *inode, struct file *filp)
+{
+	struct mvm_device *mvm_dev = inode->i_private;
+	filp->private_data = mvm_dev;
+	return 0;
+}
+
+static ssize_t mvm_log_level_store(struct file *filp, const char __user *ubuf, size_t count, loff_t *ppos)
+{
+	ssize_t ret = 0;
+	struct mvm_control *mvm_ctrl;
+	struct mvm_device *mvm_dev = filp->private_data;
+
+	mvm_ctrl = kzalloc(sizeof(struct mvm_control), GFP_KERNEL);
+	mvm_ctrl->type = MVM_DEBUG;
+
+	mvm_ctrl->mvm_ctrl_msg.debug.msg_type = MVM_DEBUG_SET_LOG_LEVEL;
+	if (copy_from_user(&mvm_ctrl->mvm_ctrl_msg.debug.transfer_msg.log_level, ubuf, count)) {
+		kfree(mvm_ctrl);
+		ret = -EFAULT;
+		return ret;
+	}
+
+	ret = send_ctrl_msg_to_mvm(mvm_ctrl, mvm_dev);
+	kfree(mvm_ctrl);
+	return ret;
+}
+
+static const struct file_operations debugfs_mvm_log_level_ops = {
+	.owner      = THIS_MODULE,
+	.open     = mvm_log_level_open,
+	.write    = mvm_log_level_store,
+};
+
 static int mvm_debugfs_init(struct mvm_device *mvm_dev)
 {
 	struct dentry *file;
@@ -589,6 +621,11 @@ static int mvm_debugfs_init(struct mvm_device *mvm_dev)
 	if (!file)
 		debugfs_remove(mvm_dev->dir);
 
+	file = debugfs_create_file("mvm_log_level", 0644, mvm_dev->dir, mvm_dev,
+		&debugfs_mvm_log_level_ops);
+	if (!file)
+		debugfs_remove(mvm_dev->dir);
+
 	mvm_dev->ddr_current_addr = &mvm_dev->log_buff->mvmlog_buffer[0];
 	mvm_dev->ddr_head_pos = &mvm_dev->log_buff->mvmlog_buffer[0];
 	mvm_dev->ddr_tail_pos = &mvm_dev->log_buff->mvmlog_buffer[0];
@@ -608,8 +645,8 @@ static void process_control_message(struct mvm_control *mvm_ctrl_recv, struct mv
 	if ( mvm_ctrl_recv->mvm_ctrl_msg.debug.msg_type == MVM_DEBUG_LOG_TRANSFER_REQUEST) {
 	    if ( mvm_ctrl_recv->mvm_ctrl_msg.debug.msg_type == MVM_FLUSH_DDR_OVERFLOW) {
 			wake_up_interruptible_poll(&mvm_dev->log_poll_wait, POLLIN | POLLPRI);//wake up poll for logging if transfer complete
-			mvm_ctrl_send->mvm_ctrl_msg.debug.ddr_log_buf_addr = mvm_dev->mvmlog_buff_dma + mvm_dev->filled_dma_bytes;
-			mvm_ctrl_send->mvm_ctrl_msg.debug.active_buffer_index = mvm_dev->active_buffer_index;
+			mvm_ctrl_send->mvm_ctrl_msg.debug.transfer_msg.ddr_log_buf_addr = mvm_dev->mvmlog_buff_dma + mvm_dev->filled_dma_bytes;
+			mvm_ctrl_send->mvm_ctrl_msg.debug.transfer_msg.active_buffer_index = mvm_dev->active_buffer_index;
 			ret = send_ctrl_msg_to_mvm(mvm_ctrl_send, mvm_dev);
 		}
 	}
@@ -649,7 +686,7 @@ static bool drain_out_fifo(struct mvm_device *mvm_dev, unsigned int fifo_index, 
 			memcpy(mvm_ctrl_recv, out_fifo_addr, sizeof(struct mvm_control));
 			switch (mvm_ctrl_recv->type) {
 			case MVM_DEBUG:
-				mvm_dev->active_buffer_index = mvm_ctrl_recv->mvm_ctrl_msg.debug.active_buffer_index;
+				mvm_dev->active_buffer_index = mvm_ctrl_recv->mvm_ctrl_msg.debug.transfer_msg.active_buffer_index;
 				process_control_message(mvm_ctrl_recv, mvm_dev);
 				mvm_dev->ring_buff->out_fifo[fifo_index].tail =
 						(mvm_dev->ring_buff->out_fifo[fifo_index].tail+1) %
