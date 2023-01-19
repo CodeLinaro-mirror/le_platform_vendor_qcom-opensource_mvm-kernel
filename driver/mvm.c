@@ -28,6 +28,7 @@
 #include <linux/dma-mapping.h>
 #include <linux/clk.h>
 
+#define SIG_MVM_STATE			0x11
 #define DDR_FIFO_COUNT			2
 #define DDR_FIFO_SIZE			128
 #define MSG_PRIORITY_BIT		BIT(19)
@@ -112,6 +113,7 @@
 #define MVM_ULOG_BUFFER_SIZE            2048
 #define MVM_DUMP_COLL_TIMEOUT_MS        3000
 #define MVM_PROC_ID                     0x2B
+#define MVM_CRASH_DUMP_SIZE		0x10200
 /**
  * enum mvm_state - state of mvm subsystem
  * @MVM_OFFLINE: MVM firmware is not loaded/authenticated yet.
@@ -166,6 +168,10 @@ struct ring_buffers {
 	struct output_fifo out_fifo[DDR_FIFO_COUNT];
 };
 
+struct mvm_crashdump_buffer {
+	uint32_t mvm_dump_buffer[MVM_CRASH_DUMP_SIZE/4];
+};
+
 struct mvmlog_buffers {
 	uint32_t mvmlog_buffer[MVM_ULOG_BUFFER_SIZE];
 };
@@ -177,6 +183,7 @@ struct mvm_client {
 	struct list_head list;
 	struct output_buffer *out_buff;
 	enum mvm_log_policy log_policy;
+	struct task_struct *task;
 };
 
 struct mvm_device {
@@ -203,6 +210,7 @@ struct mvm_device {
 	struct mutex out_fifo_lock;
 	wait_queue_head_t mvm_waitqueue;
 	wait_queue_head_t log_poll_wait;
+	wait_queue_head_t ssr_poll_wait;
 	struct work_struct drain_out_fifo_work;
 	struct work_struct trigger_ssr_work;
 	struct completion p0_fifo_slot_available;
@@ -216,7 +224,7 @@ struct mvm_device {
 	struct dma_pool *mvm_fw_pool;
 	struct dma_pool *mvm_dump_pool;
 	uint32_t *mvm_fw;
-	uint32_t *mvm_dump;
+	struct mvm_crashdump_buffer *dump_buff;
 	struct ring_buffers *ring_buff;
 	dma_addr_t ring_buff_dma;
 	struct dma_pool *mvmlog_buffer_pool;
@@ -235,11 +243,30 @@ struct mvm_device {
 	int active_buffer_index;
 	uint32_t ddr_buf_len;
 	uint32_t filled_dma_bytes;
+	bool pending_dump_read;
 };
 
 static int enable_gcc_clocks(struct mvm_device *mvm_dev);
 static int enable_mvm_gdsc(struct mvm_device *mvm_dev, bool powerup);
 static int mvm_suspend(struct device *dev);
+
+static void send_mvm_state_to_user(struct mvm_device *mvm_dev)
+{
+	struct kernel_siginfo info;
+	struct mvm_client *mvm_cli;
+
+	memset(&info, 0, sizeof(struct kernel_siginfo));
+	info.si_signo = SIG_MVM_STATE;
+	info.si_int = mvm_dev->state;
+
+	list_for_each_entry(mvm_cli, &mvm_dev->client_list, list) {
+		if (mvm_cli->task != NULL) {
+			if(send_sig_info(SIG_MVM_STATE, &info, mvm_cli->task) < 0)
+				dev_err(mvm_dev->dev, "Unable to send mvm state change signal to userspace\n");
+			dev_dbg(mvm_dev->dev, "Sent state change signal to client %d\n",mvm_cli->client_id);
+		}
+	}
+}
 
 static void enable_wfi_int(struct mvm_device *mvm_dev, bool enable)
 {
@@ -559,11 +586,53 @@ static const struct file_operations debugfs_mvm_trigger_ssr_ops = {
 	.write = mvm_trigger_ssr_store,
 };
 
-static int mvm_log_level_open(struct inode *inode, struct file *filp)
+static int mvm_crash_dump_open(struct inode *inode, struct file *filp)
 {
 	struct mvm_device *mvm_dev = inode->i_private;
 	filp->private_data = mvm_dev;
 	return 0;
+}
+
+static unsigned int mvm_crash_dump_poll(struct file *filp, struct poll_table_struct *pt)
+{
+	unsigned int events = 0;
+	struct mvm_device *mvm_dev = filp->private_data;
+
+	if (mvm_dev->pending_dump_read == true) {
+		events = POLLIN | POLLPRI;
+		goto ret;
+	}
+
+	poll_wait(filp, &mvm_dev->ssr_poll_wait, pt);
+ret:
+	return events;
+}
+
+static ssize_t mvm_crash_dump_read(struct file *filp, char __user *buff, size_t count, loff_t *offset)
+{
+	struct mvm_device *mvm_dev = filp->private_data;
+	int ret;
+
+	ret = copy_to_user(buff, &mvm_dev->dump_buff->mvm_dump_buffer[0], MVM_CRASH_DUMP_SIZE);
+	if (ret > 0)
+		dev_err(mvm_dev->dev, "couldnt copy crash dump to userspace\n");
+
+	mvm_dev->pending_dump_read = false;
+	return MVM_CRASH_DUMP_SIZE - ret;
+}
+
+static const struct file_operations debugfs_mvm_crash_dump_ops = {
+	.owner = THIS_MODULE,
+	.open = mvm_crash_dump_open,
+	.poll = mvm_crash_dump_poll,
+	.read = mvm_crash_dump_read,
+};
+
+static int mvm_log_level_open(struct inode *inode, struct file *filp)
+{
+        struct mvm_device *mvm_dev = inode->i_private;
+        filp->private_data = mvm_dev;
+        return 0;
 }
 
 static ssize_t mvm_log_level_store(struct file *filp, const char __user *ubuf, size_t count, loff_t *ppos)
@@ -618,6 +687,12 @@ static int mvm_debugfs_init(struct mvm_device *mvm_dev)
 
 	file = debugfs_create_file("trigger_ssr", 0644, mvm_dev->dir, mvm_dev,
 						&debugfs_mvm_trigger_ssr_ops);
+	if (!file)
+
+		debugfs_remove(mvm_dev->dir);
+
+	file = debugfs_create_file("mvm_crash_dump", 0644, mvm_dev->dir, mvm_dev,
+						&debugfs_mvm_crash_dump_ops);
 	if (!file)
 		debugfs_remove(mvm_dev->dir);
 
@@ -856,6 +931,7 @@ static int mvm_open(struct inode *inode, struct file *filp)
 	i = find_first_zero_bit(mvm_dev->client_id_bitmap, MAX_CLIENT_COUNT);
 	set_bit(i, mvm_dev->client_id_bitmap);
 	mvm_cli->client_id = i+1;
+        mvm_cli->task = get_current();
 	list_add_tail(&mvm_cli->list, &mvm_dev->client_list);
 	mutex_unlock(&mvm_dev->mvm_cli_lock);
 	mvm_cli->out_buff = kzalloc(sizeof(struct output_buffer), GFP_KERNEL);
@@ -886,9 +962,7 @@ static int mvm_release(struct inode *inode, struct file *filp)
 static long mvm_ioctl(struct file *filp, unsigned int cmd, unsigned long arg)
 {
 	int ret = 0;
-	struct mvm_client *mvm_cli;
-
-	mvm_cli = filp->private_data;
+	struct mvm_client *mvm_cli = filp->private_data;
 
 	switch (cmd) {
 	case GET_CLIENT_ID:
@@ -1246,6 +1320,7 @@ static int mvm_load_fw(struct mvm_device *mvm_dev)
 	dev_info(mvm_dev->dev, "MVM subsystem brought out of reset\n");
 
 	mvm_dev->state = MVM_ONLINE;
+	send_mvm_state_to_user(mvm_dev);
 
 	/* Write crash dump DDR location to SCRATCH_PAD0 register so that E21 can store the crash
 	 * dump information here.
@@ -1290,12 +1365,15 @@ static void trigger_ssr_work_hdlr(struct work_struct *work)
 	if (ret == 0) {
 		dev_err(mvm_dev->dev, "Timed out as mvm dump collection is not complete\n");
 	}
+	mvm_dev->pending_dump_read = true;
+	wake_up_interruptible_poll(&mvm_dev->ssr_poll_wait, POLLIN | POLLPRI);
 
 	dev_info(mvm_dev->dev, "MVM subsystem is restarting after SSR\n");
 	enable_gcc_clocks(mvm_dev);
 	enable_mvm_gdsc(mvm_dev, true);
 
 	mvm_dev->state = MVM_RESTARTING;
+	send_mvm_state_to_user(mvm_dev);
 
 	mvm_load_fw(mvm_dev);
 
@@ -1308,6 +1386,7 @@ static irqreturn_t mvm_wdog_irq_handler(int irq, void *dev_id)
 
 	dev_info(mvm_dev->dev, "Received watchdog bite from MVM\n");
 	mvm_dev->state = MVM_CRASHED;
+	send_mvm_state_to_user(mvm_dev);
 	dev_dbg(mvm_dev->dev, "The current state of MVM is CRASHED\n");
 	schedule_work(&mvm_dev->trigger_ssr_work);
 	return IRQ_HANDLED;
@@ -1397,7 +1476,7 @@ static int register_isrs(struct platform_device *pdev)
 
 static void mvm_dma_pool_release(struct mvm_device *mvm_dev)
 {
-	dma_pool_free(mvm_dev->mvm_dump_pool, mvm_dev->mvm_dump, mvm_dev->mvm_dump_dma);
+	dma_pool_free(mvm_dev->mvm_dump_pool, mvm_dev->dump_buff, mvm_dev->mvm_dump_dma);
 	dma_pool_destroy(mvm_dev->mvm_dump_pool);
 	dma_pool_free(mvm_dev->ring_buffers_pool, mvm_dev->ring_buff, mvm_dev->ring_buff_dma);
 	dma_pool_destroy(mvm_dev->ring_buffers_pool);
@@ -1423,15 +1502,15 @@ static int mvm_dma_pool_create(struct mvm_device *mvm_dev)
 
 	/*Allocate memory for mvm crash dump */
 	mvm_dev->mvm_dump_pool = dma_pool_create("mvm_dump", mvm_dev->dev,
-							0x10200, 512, 0);
+							sizeof(struct mvm_crashdump_buffer), 512, 0);
 	if (!mvm_dev->mvm_dump_pool) {
 		dev_err(mvm_dev->dev,
 			"can't create mvm dump buffer dma_pool, %d\n", -ENOMEM);
 		goto dump_dma_pool_create_fail;
 	}
 
-	mvm_dev->mvm_dump = dma_pool_zalloc(mvm_dev->mvm_dump_pool, GFP_KERNEL, &mvm_dev->mvm_dump_dma);
-	if (!mvm_dev->mvm_dump) {
+	mvm_dev->dump_buff = dma_pool_zalloc(mvm_dev->mvm_dump_pool, GFP_KERNEL, &mvm_dev->mvm_dump_dma);
+	if (!mvm_dev->dump_buff) {
 		dev_err(mvm_dev->dev,
 			"can't allocate memory for mvm dump dma_pool, %d\n", -ENOMEM);
 		goto dump_dma_pool_alloc_fail;
@@ -1563,6 +1642,7 @@ static int mvm_suspend(struct device *dev)
 	}
 	mutex_unlock(&mvm_dev->mvm_csr_lock);
 	mvm_dev->state = MVM_SLEEP;
+	send_mvm_state_to_user(mvm_dev);
 
 	return 0;
 }
@@ -1658,6 +1738,7 @@ static int mvm_probe(struct platform_device *pdev)
 	INIT_LIST_HEAD(&mvm_dev->client_list);
 	init_waitqueue_head(&mvm_dev->mvm_waitqueue);
 	init_waitqueue_head(&mvm_dev->log_poll_wait);
+	init_waitqueue_head(&mvm_dev->ssr_poll_wait);
 	bitmap_zero(mvm_dev->client_id_bitmap, MAX_CLIENT_COUNT);
 	INIT_WORK(&mvm_dev->drain_out_fifo_work, drain_out_fifo_work_hdlr);
 	INIT_WORK(&mvm_dev->trigger_ssr_work, trigger_ssr_work_hdlr);
@@ -1666,6 +1747,7 @@ static int mvm_probe(struct platform_device *pdev)
 	init_completion(&mvm_dev->mvm_core_collapse_done);
 	ret = mvm_debugfs_init(mvm_dev);
 	init_completion(&mvm_dev->mvm_dump_collection_done);
+	mvm_dev->pending_dump_read = false;
 
 	ret = mvm_sysfs_init(mvm_dev);
 	if (ret) {
@@ -1673,6 +1755,7 @@ static int mvm_probe(struct platform_device *pdev)
 		goto mutex_err;
 	}
 	mvm_dev->state = MVM_OFFLINE;
+	send_mvm_state_to_user(mvm_dev);
 	dev_dbg(mvm_dev->dev, "The current state of MVM is OFFLINE\n");
 
 	ret = enable_gcc_clocks(mvm_dev);
