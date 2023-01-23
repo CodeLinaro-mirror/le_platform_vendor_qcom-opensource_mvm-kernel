@@ -1042,8 +1042,8 @@ static ssize_t mvm_read(struct file *filp,
 
 	mutex_lock(&mvm_dev->out_fifo_lock);
 	if ((mvm_cli->out_buff->tail + mvm_cli->out_buff->count) <= OUT_BUFF_SIZE) {
-		if (count <= mvm_cli->out_buff->count) {
-			bytes_to_copy = count *  sizeof(struct output_msg);
+		if (count <= (mvm_cli->out_buff->count * sizeof(struct output_msg))) {
+			bytes_to_copy = count;
 		}
 		else {
 			bytes_to_copy = mvm_cli->out_buff->count * sizeof(struct output_msg);
@@ -1055,24 +1055,29 @@ static ssize_t mvm_read(struct file *filp,
 		goto update_tail;
 	} else {
 		size = (OUT_BUFF_SIZE - mvm_cli->out_buff->tail);
-		if (size > count)
-			size = count;
-		bytes_to_copy = size * sizeof(struct output_msg);
+		if (count <= (size * sizeof(struct output_msg))) {
+			bytes_to_copy = count;
+		}
+		else {
+			bytes_to_copy = size * sizeof(struct output_msg);
+		}
 		ret = copy_to_user(buf,
 				   &mvm_cli->out_buff->out_msg[mvm_cli->out_buff->tail],
 				   bytes_to_copy);
 		bytes_copied += bytes_to_copy - ret;
 
-		if (ret || (size == count))
+		if (ret || (bytes_copied == count))
 			goto update_tail;
 
-		count = count - size;
+		count = count - bytes_copied;
 		out_buff_rem_count = mvm_cli->out_buff->count - ((bytes_copied / sizeof(struct output_msg)));
 
-		if (count <= out_buff_rem_count)
-			bytes_to_copy = count *  sizeof(struct output_msg);
-		else
+		if (count <= (out_buff_rem_count * sizeof(struct output_msg))) {
+			bytes_to_copy = count;
+		}
+		else {
 			bytes_to_copy = out_buff_rem_count * sizeof(struct output_msg);
+		}
 
 		ret = copy_to_user(buf + bytes_copied,
 			     &mvm_cli->out_buff->out_msg[0],
