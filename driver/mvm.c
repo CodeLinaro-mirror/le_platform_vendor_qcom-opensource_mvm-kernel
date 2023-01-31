@@ -34,7 +34,7 @@
 #define MSG_PRIORITY_BIT		BIT(19)
 #define OUT_BUFF_SIZE			32
 #define TIMEOUT_MS			10000
-#define MAX_CLIENT_COUNT		16
+#define MAX_CLIENT_COUNT		15
 /*TODO Remove this once PIL validation is complete */
 #define KEEP_FW_IN_DDR			1
 
@@ -915,30 +915,43 @@ static irqreturn_t mvm_verif_done_irq_handler(int irq, void *dev_id)
 static int mvm_open(struct inode *inode, struct file *filp)
 {
 	unsigned long i;
+	int ret = 0;
 	struct mvm_device *mvm_dev = container_of(inode->i_cdev,
-	struct mvm_device, mvm_cdev);
+					struct mvm_device, mvm_cdev);
 	struct mvm_client *mvm_cli;
 
+	mutex_lock(&mvm_dev->mvm_cli_lock);
+	if (bitmap_full(mvm_dev->client_id_bitmap, MAX_CLIENT_COUNT)) {
+		dev_err(mvm_dev->dev, "Cannot accept new connections\n");
+		ret = -EUSERS;
+		goto mutex_unlock;
+	}
+
 	mvm_cli = kzalloc(sizeof(*mvm_cli), GFP_KERNEL);
-	if (!mvm_cli)
-		return -ENOMEM;
+	if (!mvm_cli) {
+		ret = -ENOMEM;
+		goto mutex_unlock;
+	}
 
 	INIT_LIST_HEAD(&mvm_cli->list);
 	mvm_cli->mvm_dev = mvm_dev;
-	mutex_lock(&mvm_dev->mvm_cli_lock);
-	if (bitmap_full(mvm_dev->client_id_bitmap, MAX_CLIENT_COUNT))
-		dev_err(mvm_dev->dev, "Cannot accept new connections\n");
 	i = find_first_zero_bit(mvm_dev->client_id_bitmap, MAX_CLIENT_COUNT);
 	set_bit(i, mvm_dev->client_id_bitmap);
 	mvm_cli->client_id = i+1;
-        mvm_cli->task = get_current();
+	mvm_cli->task = get_current();
 	list_add_tail(&mvm_cli->list, &mvm_dev->client_list);
 	mutex_unlock(&mvm_dev->mvm_cli_lock);
+
 	mvm_cli->out_buff = kzalloc(sizeof(struct output_buffer), GFP_KERNEL);
 	mvm_cli->out_buff->size = OUT_BUFF_SIZE;
 	filp->private_data = mvm_cli;
+	goto exit;
 
-	return 0;
+mutex_unlock:
+	mutex_unlock(&mvm_dev->mvm_cli_lock);
+
+exit:
+	return ret;
 }
 
 static int mvm_release(struct inode *inode, struct file *filp)
