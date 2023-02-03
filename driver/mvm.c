@@ -114,6 +114,7 @@
 #define MVM_DUMP_COLL_TIMEOUT_MS        3000
 #define MVM_PROC_ID                     0x2B
 #define MVM_CRASH_DUMP_SIZE		0x10200
+#define MVM_FW_SIZE			0x10000
 /**
  * enum mvm_state - state of mvm subsystem
  * @MVM_OFFLINE: MVM firmware is not loaded/authenticated yet.
@@ -247,8 +248,7 @@ struct mvm_device {
 };
 
 static int enable_gcc_clocks(struct mvm_device *mvm_dev);
-static int enable_mvm_gdsc(struct mvm_device *mvm_dev, bool powerup);
-static int mvm_suspend(struct device *dev);
+int qcom_pil_info_store(const char *image, phys_addr_t base, size_t size);
 
 static void send_mvm_state_to_user(struct mvm_device *mvm_dev)
 {
@@ -1296,7 +1296,7 @@ static int mvm_load_fw(struct mvm_device *mvm_dev)
 
 	/* Allocate dma pool for mvm firmware */
 	mvm_dev->mvm_fw_pool = dma_pool_create("mvm_fw_pool", mvm_dev->dev,
-							0x10000, 512, 0);
+							MVM_FW_SIZE, 512, 0);
 	if (!mvm_dev->mvm_fw_pool) {
 		dev_err(mvm_dev->dev,
 				"can't create firmware buffer dma_pool, %d\n", -ENOMEM);
@@ -1321,10 +1321,11 @@ static int mvm_load_fw(struct mvm_device *mvm_dev)
 	if (!virt) {
 		dev_err(mvm_dev->dev, "Failed to remap firmware memory\n");
 		goto out_release_firmware;
+
 	}
 
 	ret = qcom_mdt_load(mvm_dev->dev, fw, fw_name, MVM_PROC_ID,
-			    virt, mvm_dev->mvm_fw_dma, 0x10000, NULL);
+			    virt, mvm_dev->mvm_fw_dma, MVM_FW_SIZE, NULL);
 	if (ret) {
 		dev_err(mvm_dev->dev, "Failed to load mvm firmware\n");
 		goto out_release_firmware;
@@ -1336,6 +1337,16 @@ static int mvm_load_fw(struct mvm_device *mvm_dev)
 		goto out_release_firmware;
 	}
 	dev_info(mvm_dev->dev, "MVM subsystem brought out of reset\n");
+
+	/* qcom_pil_info_store writes the PIL info to the IMEM address so that
+	 * MVM SDI dump collection will be enabled. If this imem write returns
+	 * error, MVM SDI dump collection will fail.But MVM will still continue to
+	 * perform message verification.
+	 */
+
+	ret = qcom_pil_info_store("mvm", mvm_dev->mvm_fw_dma, MVM_FW_SIZE);
+	if (ret)
+		dev_err(mvm_dev->dev, "Couldnt store MVM PIL info in IMEM\n");
 
 	mvm_dev->state = MVM_ONLINE;
 	send_mvm_state_to_user(mvm_dev);
