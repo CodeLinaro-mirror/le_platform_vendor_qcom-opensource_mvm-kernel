@@ -763,9 +763,6 @@ static bool drain_out_fifo(struct mvm_device *mvm_dev, unsigned int fifo_index, 
 			case MVM_DEBUG:
 				mvm_dev->active_buffer_index = mvm_ctrl_recv->mvm_ctrl_msg.debug.transfer_msg.active_buffer_index;
 				process_control_message(mvm_ctrl_recv, mvm_dev);
-				mvm_dev->ring_buff->out_fifo[fifo_index].tail =
-						(mvm_dev->ring_buff->out_fifo[fifo_index].tail+1) %
-						mvm_dev->ring_buff->out_fifo[fifo_index].size;
 				control_message_written = true;
 				break;
 			case MVM_POLICY:
@@ -777,30 +774,38 @@ static bool drain_out_fifo(struct mvm_device *mvm_dev, unsigned int fifo_index, 
 			default:
 				break;
 			}
-			count--;
 			kfree(mvm_ctrl_recv);
 		}
-		list_for_each_entry(mvm_cli, &mvm_dev->client_list, list) {
-			if (mvm_cli->client_id == client_id) {
-				full = fifo_full(mvm_cli->out_buff->head, mvm_cli->out_buff->size,
-								mvm_cli->out_buff->tail);
-				if (!full) {
-					memcpy(&mvm_cli->out_buff->out_msg[mvm_cli->out_buff->head],
-					&mvm_dev->ring_buff->out_fifo[fifo_index].base[
-					mvm_dev->ring_buff->out_fifo[fifo_index].tail],
-					sizeof(struct output_msg));
-					mvm_cli->out_buff->head =
-						(mvm_cli->out_buff->head+1) % (mvm_cli->out_buff->size);
-					mvm_cli->out_buff->count++;
-					mvm_dev->ring_buff->out_fifo[fifo_index].tail =
-						(mvm_dev->ring_buff->out_fifo[fifo_index].tail+1) %
-						mvm_dev->ring_buff->out_fifo[fifo_index].size;
-					count--;
-					mvm_dev->outgoing_results++;
-					out_buff_written = true;
-					break;
+		else {
+			bool match = false;
+			list_for_each_entry(mvm_cli, &mvm_dev->client_list, list) {
+				if (mvm_cli->client_id == client_id) {
+					match = true;
+					full = fifo_full(mvm_cli->out_buff->head, mvm_cli->out_buff->size,
+									mvm_cli->out_buff->tail);
+					if (!full) {
+						memcpy(&mvm_cli->out_buff->out_msg[mvm_cli->out_buff->head],
+						&mvm_dev->ring_buff->out_fifo[fifo_index].base[
+						mvm_dev->ring_buff->out_fifo[fifo_index].tail],
+						sizeof(struct output_msg));
+						mvm_cli->out_buff->head =
+							(mvm_cli->out_buff->head+1) % (mvm_cli->out_buff->size);
+						mvm_cli->out_buff->count++;
+						mvm_dev->outgoing_results++;
+						out_buff_written = true;
+						break;
+					}
 				}
 			}
+			if(!match){
+				dev_err(mvm_dev->dev,"outring message client id did not match connected client list\n");
+			}
+		}
+		if(!full){
+			mvm_dev->ring_buff->out_fifo[fifo_index].tail =
+				(mvm_dev->ring_buff->out_fifo[fifo_index].tail+1) %
+				mvm_dev->ring_buff->out_fifo[fifo_index].size;
+			count--;
 		}
 	}
 	if (out_buff_written || control_message_written) {
