@@ -1196,7 +1196,6 @@ static irqreturn_t mvm_wfi_irq_handler(int irq, void *dev_id)
 {
 	struct mvm_device *mvm_dev = dev_id;
 
-	collapse_mvm_core(mvm_dev);
 	complete(&mvm_dev->mvm_core_collapse_done);
 	return IRQ_HANDLED;
 }
@@ -1620,6 +1619,13 @@ static const struct file_operations mvm_fileops = {
 	.owner = THIS_MODULE,
 };
 
+static void disable_gcc_clocks(struct mvm_device *mvm_dev)
+{
+	clk_disable_unprepare(mvm_dev->snoc_m_axi_clk);
+	clk_disable_unprepare(mvm_dev->cnoc_s_ahb_clk);
+	clk_disable_unprepare(mvm_dev->sysnoc_mvmss_clk);
+}
+
 static int enable_gcc_clocks(struct mvm_device *mvm_dev)
 {
 	int ret = 0;
@@ -1674,72 +1680,76 @@ unprepare_xo:
 static int mvm_suspend(struct device *dev)
 {
 	struct mvm_device *mvm_dev = dev_get_drvdata(dev);
-	int ret = 0;
+	int is_suspend = 0;
 
 	mutex_lock(&mvm_dev->mvm_csr_lock);
 
 	if (mvm_dev->incoming_msgs == mvm_dev->outgoing_results) {
 		/* prepare power collapse control message */
 		struct mvm_control *mvm_ctrl;
-
 		mvm_ctrl = kzalloc(sizeof(struct mvm_control), GFP_KERNEL);
 		mvm_ctrl->type = MVM_POWER;
 		mvm_ctrl->mvm_ctrl_msg.power.enter_pwr_collapse = 1;
-		ret = send_ctrl_msg_to_mvm(mvm_ctrl, mvm_dev);
+		is_suspend= send_ctrl_msg_to_mvm(mvm_ctrl, mvm_dev);
 		kfree(mvm_ctrl);
-		if (ret) {
-			mutex_unlock(&mvm_dev->mvm_csr_lock);
-			return ret;
-		}
-		mvm_dev->resume_frm_pwr_collapse = false;
-		enable_wfi_int(mvm_dev, true);  /* Enable WFI interrupt */
-		enable_irq(mvm_dev->wfi_irq);
-		ret = wait_for_completion_interruptible_timeout(
+		if (is_suspend) {
+			is_suspend = -EBUSY;
+		} else {
+			mvm_dev->resume_frm_pwr_collapse = false;
+			enable_wfi_int(mvm_dev, true);  /* Enable WFI interrupt */
+			enable_irq(mvm_dev->wfi_irq);
+			is_suspend = wait_for_completion_interruptible_timeout(
 				&mvm_dev->mvm_core_collapse_done,
 				msecs_to_jiffies(TIMEOUT_MS));
-		if (ret == 0) {
-			mvm_dev->resume_frm_pwr_collapse = true;
-			enable_wfi_int(mvm_dev, false);
-			disable_irq(mvm_dev->wfi_irq);
-			mutex_unlock(&mvm_dev->mvm_csr_lock);
-			dev_err(mvm_dev->dev, "Timed out waiting for mvm core collapse\n");
-			return ret;
+			if (is_suspend == 0) {
+				mvm_dev->resume_frm_pwr_collapse = true;
+				enable_wfi_int(mvm_dev, false);
+				disable_irq(mvm_dev->wfi_irq);
+				dev_err(mvm_dev->dev, "Timed out waiting for mvm core collapse\n");
+				is_suspend = -EBUSY;
+			} else {
+				collapse_mvm_core(mvm_dev);
+				disable_gcc_clocks(mvm_dev);
+				is_suspend = 0;
+				dev_dbg(mvm_dev->dev, "MVM subsystem in power collapse mode\n");
+			}
 		}
 		/*TODO
-		 * 1. Turn off MVM_CC clocks
-		 * 2. turn off gcc clocks
-		 * 3. Switch all RCGs to XO
-		 * 4. Vote for power collapse to aop
+		 * 1. Vote for power collapse to aop
 		 */
+	} else {
+		is_suspend = -EBUSY;
 	}
 	mutex_unlock(&mvm_dev->mvm_csr_lock);
 	mvm_dev->state = MVM_SLEEP;
 	send_mvm_state_to_user(mvm_dev);
-
-	return 0;
+	return is_suspend;
 }
 
 static int mvm_resume(struct device *dev)
 {
 	struct mvm_device *mvm_dev = dev_get_drvdata(dev);
 	struct mvm_control *mvm_ctrl;
-	int ret = 0;
+	int is_resume = 0;
 
 	mvm_dev->resume_frm_pwr_collapse = true;
 	/*TODO
 	 * 1.vote for aop
-	 * 2.Turn on gcc clocks
-	 * 3.Turn on MVM_CC clocks
 	 */
-
-	restore_mvm_core(mvm_dev);
-	mvm_ctrl = kzalloc(sizeof(struct mvm_control), GFP_KERNEL);
-	mvm_ctrl->type = MVM_POWER;
-	mvm_ctrl->mvm_ctrl_msg.power.enter_pwr_collapse = 0;
-	ret = send_ctrl_msg_to_mvm(mvm_ctrl, mvm_dev);
-	kfree(mvm_ctrl);
-
-	return ret;
+	is_resume = enable_gcc_clocks(mvm_dev);
+	if (is_resume) {
+		dev_err(mvm_dev->dev, "Failed to turn on gcc clocks\n");
+		is_resume = -EHOSTDOWN;
+	} else {
+		restore_mvm_core(mvm_dev);
+		mvm_ctrl = kzalloc(sizeof(struct mvm_control), GFP_KERNEL);
+		mvm_ctrl->type = MVM_POWER;
+		mvm_ctrl->mvm_ctrl_msg.power.enter_pwr_collapse = 0;
+		is_resume = send_ctrl_msg_to_mvm(mvm_ctrl, mvm_dev);
+		kfree(mvm_ctrl);
+	}
+	dev_dbg(mvm_dev->dev, "MVM subsystem in Restored\n");
+	return is_resume;
 }
 
 static int mvm_probe(struct platform_device *pdev)
