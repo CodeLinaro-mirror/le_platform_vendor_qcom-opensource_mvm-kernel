@@ -224,7 +224,7 @@ struct mvm_device {
 	struct work_struct trigger_ssr_work;
 	struct completion p0_fifo_slot_available;
 	struct completion p1_fifo_slot_available;
-	struct completion mvm_core_collapse_done;
+	struct completion mvm_suspend_wfi_irq_done;
 	struct completion mvm_dump_collection_done;
 	struct kobject *kobj;
 	struct kobj_attribute attr;
@@ -331,9 +331,10 @@ static void collapse_mvm_core(struct mvm_device *mvm_dev)
 
 static void restore_mvm_core(struct mvm_device *mvm_dev)
 {
+	uint32_t reg_val;
+	reg_val = readl_relaxed(mvm_dev->mvm_base + MVM_CC_E21CPU_CC_CBCR_OFFSET);
+	writel_relaxed((reg_val & SW_COLLAPSE_MASK)| 1 ,  mvm_dev->mvm_base + MVM_CC_E21CPU_CC_CBCR_OFFSET);
 	enable_mvm_gdsc(mvm_dev, true);
-	enable_wfi_int(mvm_dev, false);
-	disable_irq(mvm_dev->wfi_irq);
 }
 
 static ssize_t mvm_state_show(struct kobject *kobj,
@@ -1198,7 +1199,8 @@ static irqreturn_t mvm_wfi_irq_handler(int irq, void *dev_id)
 {
 	struct mvm_device *mvm_dev = dev_id;
 
-	complete(&mvm_dev->mvm_core_collapse_done);
+	complete(&mvm_dev->mvm_suspend_wfi_irq_done);
+	enable_wfi_int(mvm_dev, false);
 	return IRQ_HANDLED;
 }
 
@@ -1698,10 +1700,8 @@ static int mvm_suspend(struct device *dev)
 			is_suspend = -EBUSY;
 		} else {
 			mvm_dev->resume_frm_pwr_collapse = false;
-			enable_wfi_int(mvm_dev, true);  /* Enable WFI interrupt */
-			enable_irq(mvm_dev->wfi_irq);
 			is_suspend = wait_for_completion_interruptible_timeout(
-				&mvm_dev->mvm_core_collapse_done,
+				&mvm_dev->mvm_suspend_wfi_irq_done,
 				msecs_to_jiffies(TIMEOUT_MS));
 			if (is_suspend == 0) {
 				mvm_dev->resume_frm_pwr_collapse = true;
@@ -1721,6 +1721,7 @@ static int mvm_suspend(struct device *dev)
 		 */
 	} else {
 		is_suspend = -EBUSY;
+		dev_err(mvm_dev->dev, "E21 has pending message for verification,can't suspend now\n");
 	}
 	mutex_unlock(&mvm_dev->mvm_csr_lock);
 	mvm_dev->state = MVM_SLEEP;
@@ -1832,7 +1833,7 @@ static int mvm_probe(struct platform_device *pdev)
 	INIT_WORK(&mvm_dev->trigger_ssr_work, trigger_ssr_work_hdlr);
 	init_completion(&mvm_dev->p0_fifo_slot_available);
 	init_completion(&mvm_dev->p1_fifo_slot_available);
-	init_completion(&mvm_dev->mvm_core_collapse_done);
+	init_completion(&mvm_dev->mvm_suspend_wfi_irq_done);
 	ret = mvm_debugfs_init(mvm_dev);
 	init_completion(&mvm_dev->mvm_dump_collection_done);
 	mvm_dev->pending_dump_read = false;
