@@ -114,11 +114,13 @@
 #define MVM_ULOG_BUFFER_SIZE            2048
 #define MVM_DUMP_COLL_TIMEOUT_MS        3000
 #define MVM_PROC_ID                     0x2B
-#define MVM_CRASH_DUMP_SIZE		0x10200
+#define MVM_CRASH_DUMP_SIZE		0x100F0
 #define MVM_FW_SIZE			0x10000
 #define RING_BUFF_IOVA			0x40000000
 #define MVM_DUMP_BUFF_IOVA		0x50000000
 #define LOG_BUFF_IOVA			0x60000000
+/* The offset in the ring buffer structures from where
+each of the actual P0 and P1 buffer starts */
 #define BASE_ADDR_OFFSET		0x10
 
 /**
@@ -1296,7 +1298,7 @@ static int mvm_load_fw(struct mvm_device *mvm_dev)
 	void *virt;
 	int ret = 0;
 
-	mvm_dev->mvm_fw = dma_alloc_coherent(mvm_dev->dev, MVM_FW_SIZE, 
+	mvm_dev->mvm_fw = dma_alloc_coherent(mvm_dev->dev, MVM_FW_SIZE,
 						&mvm_dev->mvm_fw_dma, GFP_KERNEL);
 	if (!mvm_dev->mvm_fw) {
 		dev_err(mvm_dev->dev,
@@ -1504,7 +1506,7 @@ static void mvm_iommu_release(struct mvm_device *mvm_dev)
 	iommu_unmap(mvm_dev->domain, MVM_DUMP_BUFF_IOVA, round_up(sizeof(struct mvm_crashdump_buffer), PAGE_SIZE));
 	iommu_unmap(mvm_dev->domain, LOG_BUFF_IOVA, round_up(sizeof(struct mvmlog_buffers), PAGE_SIZE));
 	iommu_detach_device(mvm_dev->domain, mvm_dev->dev);
-	iommu_domain_free(mvm_dev->domain);	
+	iommu_domain_free(mvm_dev->domain);
 }
 
 static int mvm_iommu_init(struct mvm_device *mvm_dev)
@@ -1515,7 +1517,7 @@ static int mvm_iommu_init(struct mvm_device *mvm_dev)
 	if (!mvm_dev->domain) {
 		dev_err(mvm_dev->dev, "failed to allocate iommu domain\n");
 		ret = -ENODEV;
-		goto fail; 
+		goto fail;
 	}
 
 	ret = iommu_attach_device(mvm_dev->domain, mvm_dev->dev);
@@ -1524,21 +1526,21 @@ static int mvm_iommu_init(struct mvm_device *mvm_dev)
 		goto attach_device_fail;
 	}
 
-	ret = iommu_map(mvm_dev->domain, RING_BUFF_IOVA, mvm_dev->ring_buff_dma, 
+	ret = iommu_map(mvm_dev->domain, RING_BUFF_IOVA, mvm_dev->ring_buff_dma,
 			round_up(sizeof(struct ring_buffers), PAGE_SIZE), IOMMU_READ | IOMMU_WRITE);
 	if (ret) {
 		dev_err(mvm_dev->dev, "iommu_map for ring_buffers failed\n");
 		goto ring_buff_iommu_map_fail;
 	}
 
-	ret = iommu_map(mvm_dev->domain, MVM_DUMP_BUFF_IOVA, mvm_dev->mvm_dump_dma, 
+	ret = iommu_map(mvm_dev->domain, MVM_DUMP_BUFF_IOVA, mvm_dev->mvm_dump_dma,
 			round_up(sizeof(struct mvm_crashdump_buffer), PAGE_SIZE), IOMMU_READ | IOMMU_WRITE);
 	if (ret) {
 		dev_err(mvm_dev->dev, "iommu_map for dump_buffers failed\n");
 		goto dump_buff_iommu_map_fail;
 	}
 
-	ret = iommu_map(mvm_dev->domain, LOG_BUFF_IOVA, mvm_dev->mvmlog_buff_dma, 
+	ret = iommu_map(mvm_dev->domain, LOG_BUFF_IOVA, mvm_dev->mvmlog_buff_dma,
 			round_up(sizeof(struct mvmlog_buffers), PAGE_SIZE), IOMMU_READ | IOMMU_WRITE);
 	if (ret) {
 		dev_err(mvm_dev->dev, "iommu_map for log buffers failed\n");
@@ -1554,18 +1556,18 @@ dump_buff_iommu_map_fail:
 ring_buff_iommu_map_fail:
 	iommu_detach_device(mvm_dev->domain, mvm_dev->dev);
 attach_device_fail:
-	iommu_domain_free(mvm_dev->domain);	
+	iommu_domain_free(mvm_dev->domain);
 fail:
 	return ret;
 }
 
 static void mvm_dma_mem_free(struct mvm_device *mvm_dev)
 {
-	dma_free_coherent(mvm_dev->dev, round_up(sizeof(struct mvmlog_buffers), PAGE_SIZE), 
+	dma_free_coherent(mvm_dev->dev, round_up(sizeof(struct mvmlog_buffers), PAGE_SIZE),
 					mvm_dev->log_buff, mvm_dev->mvmlog_buff_dma);
-	dma_free_coherent(mvm_dev->dev, round_up(sizeof(struct mvm_crashdump_buffer), PAGE_SIZE), 
+	dma_free_coherent(mvm_dev->dev, round_up(sizeof(struct mvm_crashdump_buffer), PAGE_SIZE),
 					mvm_dev->dump_buff, mvm_dev->mvm_dump_dma);
-	dma_free_coherent(mvm_dev->dev, round_up(sizeof(struct ring_buffers), PAGE_SIZE), 
+	dma_free_coherent(mvm_dev->dev, round_up(sizeof(struct ring_buffers), PAGE_SIZE),
 					mvm_dev->ring_buff, mvm_dev->ring_buff_dma);
 }
 
@@ -1573,15 +1575,15 @@ static int mvm_dma_mem_alloc(struct mvm_device *mvm_dev)
 {
 	int ret = 0;
 
-        mvm_dev->ring_buff = dma_alloc_coherent(mvm_dev->dev, round_up(sizeof(struct ring_buffers), PAGE_SIZE), 
+        mvm_dev->ring_buff = dma_alloc_coherent(mvm_dev->dev, round_up(sizeof(struct ring_buffers), PAGE_SIZE),
 								&mvm_dev->ring_buff_dma, GFP_KERNEL);
         if (!mvm_dev->ring_buff) {
 		dev_err(mvm_dev->dev, "dma_alloc_coherent of ring buffers failed\n");
 		ret = -ENOMEM;
 		goto ring_buff_dma_mem_alloc_fail;
-	} 
+	}
 
-        mvm_dev->dump_buff = dma_alloc_coherent(mvm_dev->dev, round_up(sizeof(struct mvm_crashdump_buffer), PAGE_SIZE), 
+        mvm_dev->dump_buff = dma_alloc_coherent(mvm_dev->dev, round_up(sizeof(struct mvm_crashdump_buffer), PAGE_SIZE),
 								&mvm_dev->mvm_dump_dma, GFP_KERNEL);
 	if (!mvm_dev->dump_buff) {
 		dev_err(mvm_dev->dev, "dma_alloc_coherent of dump buffers failed\n");
@@ -1589,21 +1591,21 @@ static int mvm_dma_mem_alloc(struct mvm_device *mvm_dev)
 		goto dump_dma_mem_alloc_fail;
 	}
 
-	mvm_dev->log_buff = dma_alloc_coherent(mvm_dev->dev, round_up(sizeof(struct mvmlog_buffers), PAGE_SIZE), 	
+	mvm_dev->log_buff = dma_alloc_coherent(mvm_dev->dev, round_up(sizeof(struct mvmlog_buffers), PAGE_SIZE),
 								&mvm_dev->mvmlog_buff_dma, GFP_KERNEL);
 	if (!mvm_dev->log_buff) {
 		dev_err(mvm_dev->dev, "dma_alloc_coherent of log buffers failed\n");
 		ret = -ENOMEM;
 		goto log_buff_dma_mem_alloc_fail;
 	}
-	
+
 	return 0;
 
 log_buff_dma_mem_alloc_fail:
-	dma_free_coherent(mvm_dev->dev, round_up(sizeof(struct mvm_crashdump_buffer), PAGE_SIZE), 
+	dma_free_coherent(mvm_dev->dev, round_up(sizeof(struct mvm_crashdump_buffer), PAGE_SIZE),
 					mvm_dev->dump_buff, mvm_dev->mvm_dump_dma);
 dump_dma_mem_alloc_fail:
-	dma_free_coherent(mvm_dev->dev, round_up(sizeof(struct ring_buffers), PAGE_SIZE), 
+	dma_free_coherent(mvm_dev->dev, round_up(sizeof(struct ring_buffers), PAGE_SIZE),
 					mvm_dev->ring_buff, mvm_dev->ring_buff_dma);
 ring_buff_dma_mem_alloc_fail:
 	return ret;
@@ -1803,7 +1805,7 @@ static int mvm_probe(struct platform_device *pdev)
 
 	ret = mvm_iommu_init(mvm_dev);
 	if (ret)
-		goto iommu_init_fail;		
+		goto iommu_init_fail;
 
 	ret = ioremap_resources(pdev);
 	if (ret) {
