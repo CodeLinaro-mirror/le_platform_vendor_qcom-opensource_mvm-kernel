@@ -122,6 +122,7 @@
 /* The offset in the ring buffer structures from where
 each of the actual P0 and P1 buffer starts */
 #define BASE_ADDR_OFFSET		0x10
+#define MAX_LOG_BUFFER_SIZE		0x1800
 
 /**
  * enum mvm_state - state of mvm subsystem
@@ -224,7 +225,7 @@ struct mvm_device {
 	struct work_struct trigger_ssr_work;
 	struct completion p0_fifo_slot_available;
 	struct completion p1_fifo_slot_available;
-	struct completion mvm_suspend_wfi_irq_done;
+	struct completion mvm_wfi_irq_recvd;
 	struct completion mvm_dump_collection_done;
 	struct kobject *kobj;
 	struct kobj_attribute attr;
@@ -538,15 +539,18 @@ static ssize_t mvm_log_transfer_store(struct file *filp, const char __user *ubuf
 	mvm_ctrl = kzalloc(sizeof(struct mvm_control), GFP_KERNEL);
 	mvm_ctrl->type = MVM_DEBUG;
 	mvm_dev->filled_dma_bytes = mvm_dev->filled_dma_bytes + (mvm_dev->ddr_buf_len * 0x4);
+	if (mvm_dev->filled_dma_bytes > MAX_LOG_BUFFER_SIZE) { //for on-demand check if 2kb memory left in ddr
+		mvm_dev->filled_dma_bytes = 0;//Reset filled ddr bytes to zero
+		mvm_dev->ddr_head_pos = &mvm_dev->log_buff->mvmlog_buffer[0];
+	}
 	mvm_ctrl->mvm_ctrl_msg.debug.transfer_msg.ddr_log_buf_addr = LOG_BUFF_IOVA + mvm_dev->filled_dma_bytes;
 	if (copy_from_user(&mvm_ctrl->mvm_ctrl_msg.debug.msg_type, ubuf, count)) {
-		kfree(mvm_ctrl);
 		ret = -EFAULT;
-		return ret;
+	} else {
+		mvm_ctrl->mvm_ctrl_msg.debug.msg_type = MVM_DEBUG_LOG_TRANSFER_REQUEST;
+		ret = send_ctrl_msg_to_mvm(mvm_ctrl, mvm_dev);
 	}
 
-	mvm_ctrl->mvm_ctrl_msg.debug.msg_type = MVM_DEBUG_LOG_TRANSFER_REQUEST;
-	ret = send_ctrl_msg_to_mvm(mvm_ctrl, mvm_dev);
 	kfree(mvm_ctrl);
 	return ret;
 }
@@ -730,16 +734,16 @@ static void process_control_message(struct mvm_control *mvm_ctrl_recv, struct mv
 			mvm_ctrl_send->mvm_ctrl_msg.debug.transfer_msg.active_buffer_index = mvm_dev->active_buffer_index;
 			ret = send_ctrl_msg_to_mvm(mvm_ctrl_send, mvm_dev);
 		}
-	}
-	if ( mvm_ctrl_recv->mvm_ctrl_msg.debug.msg_type == MVM_DEBUG_LOG_TRANSFER_COMPLETE) {
-		wake_up_interruptible_poll(&mvm_dev->log_poll_wait, POLLIN | POLLPRI);
+	} else if ( mvm_ctrl_recv->mvm_ctrl_msg.debug.msg_type == MVM_DEBUG_LOG_TRANSFER_COMPLETE) {
 		mvm_dev->ddr_buf_len = mvm_ctrl_recv->mvm_ctrl_msg.debug.num_bytes_transferred /4;
 		mvm_dev->ddr_head_pos = &mvm_dev->ddr_head_pos[mvm_dev->ddr_buf_len];
-		if( mvm_dev->ddr_head_pos >= &mvm_dev->log_buff->mvmlog_buffer[MVM_ULOG_BUFFER_SIZE]) {
+		if( (mvm_dev->ddr_head_pos >= &mvm_dev->log_buff->mvmlog_buffer[MVM_ULOG_BUFFER_SIZE]) || ((mvm_dev->filled_dma_bytes + mvm_ctrl_recv->mvm_ctrl_msg.debug.num_bytes_transferred) > MAX_LOG_BUFFER_SIZE)) {
+			//if will check filled_dma_bytes(total byte logs collected) not greater than 6kb.make sure 2k memory always available for e21 to write logs.
 			mvm_dev->filled_dma_bytes = 0;//Reset filled ddr bytes to zero
-				mvm_dev->ddr_head_pos = &mvm_dev->log_buff->mvmlog_buffer[0];
+			mvm_dev->ddr_head_pos = &mvm_dev->log_buff->mvmlog_buffer[0];//reset head position to start reading ddr from log base address.
 		}
 		mvm_dev->ddr_current_addr = mvm_dev->ddr_head_pos;
+		wake_up_interruptible_poll(&mvm_dev->log_poll_wait, POLLIN | POLLPRI);
 	}
 	kfree(mvm_ctrl_send);
 }
@@ -1199,8 +1203,8 @@ static irqreturn_t mvm_wfi_irq_handler(int irq, void *dev_id)
 {
 	struct mvm_device *mvm_dev = dev_id;
 
-	complete(&mvm_dev->mvm_suspend_wfi_irq_done);
 	enable_wfi_int(mvm_dev, false);
+	complete(&mvm_dev->mvm_wfi_irq_recvd);
 	return IRQ_HANDLED;
 }
 
@@ -1701,7 +1705,7 @@ static int mvm_suspend(struct device *dev)
 		} else {
 			mvm_dev->resume_frm_pwr_collapse = false;
 			is_suspend = wait_for_completion_interruptible_timeout(
-				&mvm_dev->mvm_suspend_wfi_irq_done,
+				&mvm_dev->mvm_wfi_irq_recvd,
 				msecs_to_jiffies(TIMEOUT_MS));
 			if (is_suspend == 0) {
 				mvm_dev->resume_frm_pwr_collapse = true;
@@ -1833,7 +1837,7 @@ static int mvm_probe(struct platform_device *pdev)
 	INIT_WORK(&mvm_dev->trigger_ssr_work, trigger_ssr_work_hdlr);
 	init_completion(&mvm_dev->p0_fifo_slot_available);
 	init_completion(&mvm_dev->p1_fifo_slot_available);
-	init_completion(&mvm_dev->mvm_suspend_wfi_irq_done);
+	init_completion(&mvm_dev->mvm_wfi_irq_recvd);
 	ret = mvm_debugfs_init(mvm_dev);
 	init_completion(&mvm_dev->mvm_dump_collection_done);
 	mvm_dev->pending_dump_read = false;
