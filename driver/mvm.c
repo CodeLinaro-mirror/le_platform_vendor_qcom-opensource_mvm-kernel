@@ -28,6 +28,7 @@
 #include <linux/dma-mapping.h>
 #include <linux/clk.h>
 #include <linux/iommu.h>
+#include <soc/qcom/boot_stats.h>
 
 #define SIG_MVM_STATE			0x11
 #define DDR_FIFO_COUNT			2
@@ -1327,6 +1328,8 @@ static int mvm_load_fw(struct mvm_device *mvm_dev)
 
 	}
 
+	update_marker("M - Loading MVM firmware");
+
 	ret = qcom_mdt_load(mvm_dev->dev, fw, fw_name, MVM_PROC_ID,
 			    virt, mvm_dev->mvm_fw_dma, MVM_FW_SIZE, NULL);
 	if (ret) {
@@ -1340,6 +1343,7 @@ static int mvm_load_fw(struct mvm_device *mvm_dev)
 		goto out_release_firmware;
 	}
 	dev_info(mvm_dev->dev, "MVM subsystem brought out of reset\n");
+	update_marker("M - MVM subsystem brought out of reset");
 
 	/* qcom_pil_info_store writes the PIL info to the IMEM address so that
 	 * MVM SDI dump collection will be enabled. If this imem write returns
