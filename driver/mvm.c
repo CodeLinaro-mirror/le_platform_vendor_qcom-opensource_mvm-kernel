@@ -30,7 +30,7 @@
 #include <linux/iommu.h>
 #include <soc/qcom/boot_stats.h>
 
-#define SIG_MVM_STATE			0x11
+#define SIG_MVM_STATE           SIGRTMAX
 #define DDR_FIFO_COUNT			2
 #define DDR_FIFO_SIZE			128
 #define MSG_PRIORITY_BIT		BIT(19)
@@ -192,6 +192,7 @@ struct mvm_client {
 	unsigned int timeout_ms;
 	struct mvm_device *mvm_dev;
 	struct list_head list;
+	bool client_ready;
 	struct output_buffer *out_buff;
 	enum mvm_log_policy log_policy;
 	struct task_struct *task;
@@ -266,6 +267,7 @@ static void send_mvm_state_to_user(struct mvm_device *mvm_dev)
 	info.si_signo = SIG_MVM_STATE;
 	info.si_int = mvm_dev->state;
 
+	mutex_lock(&mvm_dev->mvm_cli_lock);
 	list_for_each_entry(mvm_cli, &mvm_dev->client_list, list) {
 		if (mvm_cli->task != NULL) {
 			if(send_sig_info(SIG_MVM_STATE, &info, mvm_cli->task) < 0)
@@ -273,6 +275,7 @@ static void send_mvm_state_to_user(struct mvm_device *mvm_dev)
 			dev_dbg(mvm_dev->dev, "Sent state change signal to client %d\n",mvm_cli->client_id);
 		}
 	}
+	mutex_unlock(&mvm_dev->mvm_cli_lock);
 }
 
 static void enable_wfi_int(struct mvm_device *mvm_dev, bool enable)
@@ -955,6 +958,7 @@ static int mvm_open(struct inode *inode, struct file *filp)
 	set_bit(i, mvm_dev->client_id_bitmap);
 	mvm_cli->client_id = i+1;
 	mvm_cli->task = get_current();
+	mvm_cli->client_ready = true;
 	list_add_tail(&mvm_cli->list, &mvm_dev->client_list);
 	mutex_unlock(&mvm_dev->mvm_cli_lock);
 
@@ -1006,9 +1010,16 @@ static long mvm_ioctl(struct file *filp, unsigned int cmd, unsigned long arg)
 			ret = -EFAULT;
 		break;
 
+	case READY_AFTER_SSR:
+		mvm_cli->client_ready= true;
+		mvm_cli->out_buff->head = 0;
+		mvm_cli->out_buff->tail = 0;
+		break;
+
 	default:
 		break;
 	}
+
 	return ret;
 }
 
@@ -1023,6 +1034,9 @@ static ssize_t mvm_write(
 	int rc, ret;
 	unsigned int no_of_msgs_written = 0;
 	unsigned int count;
+
+	if (!mvm_cli->client_ready)
+		goto ret;
 
 	mutex_lock(&mvm_dev->in_fifo_lock);
 	inp_msg = kzalloc(sizeof(struct input_msg), GFP_KERNEL);
@@ -1355,9 +1369,6 @@ static int mvm_load_fw(struct mvm_device *mvm_dev)
 	if (ret)
 		dev_err(mvm_dev->dev, "Couldnt store MVM PIL info in IMEM\n");
 
-	mvm_dev->state = MVM_ONLINE;
-	send_mvm_state_to_user(mvm_dev);
-
 	/* Write crash dump DDR location to SCRATCH_PAD0 register so that E21 can store the crash
 	 * dump information here.
 	 */
@@ -1367,6 +1378,8 @@ static int mvm_load_fw(struct mvm_device *mvm_dev)
 	initialise_fifos(mvm_dev);
 	/*Send an interrupt to MVM to indicate MVM_Init done */
 	writel_relaxed(IRQ_APSS0, mvm_dev->apss_shared_base);
+	mvm_dev->state = MVM_ONLINE;
+	send_mvm_state_to_user(mvm_dev);
 #ifdef KEEP_FW_IN_DDR
 	goto success;
 #else
@@ -1388,12 +1401,27 @@ static void trigger_ssr_work_hdlr(struct work_struct *work)
 {
 	struct mvm_device *mvm_dev = container_of(work, struct mvm_device, trigger_ssr_work);
 	int ret = 0;
+	struct mvm_client *mvm_cli;
+	bool p0_fifo_has_results =0 ,p1_fifo_has_results =0;
 
 	ret = qcom_scm_pas_shutdown(MVM_PROC_ID);
 	if (ret) {
 		dev_err(mvm_dev->dev, "Error sending shutdown request to MVM\n");
 		return;
 	}
+
+	list_for_each_entry(mvm_cli, &mvm_dev->client_list, list) {
+		mvm_cli->client_ready= false;
+		printk("Set client flag %d \n",mvm_cli->client_id);
+	}
+	mutex_lock(&mvm_dev->out_fifo_lock);
+	p0_fifo_has_results = out_fifo_get_results(mvm_dev, 0);
+	p1_fifo_has_results = out_fifo_get_results(mvm_dev, 1);
+	mutex_unlock(&mvm_dev->out_fifo_lock);
+	if (p0_fifo_has_results || p1_fifo_has_results)
+		dev_info(mvm_dev->dev, "mvm outfifo has results and draining out fifo started\n");
+	wake_up_interruptible_poll(&mvm_dev->mvm_waitqueue, POLLIN | POLLPRI);
+	send_mvm_state_to_user(mvm_dev);//Send crash signal to clients
 
 	ret = wait_for_completion_interruptible_timeout(
 			&mvm_dev->mvm_dump_collection_done,
@@ -1422,9 +1450,9 @@ static irqreturn_t mvm_wdog_irq_handler(int irq, void *dev_id)
 
 	dev_info(mvm_dev->dev, "Received watchdog bite from MVM\n");
 	mvm_dev->state = MVM_CRASHED;
-	send_mvm_state_to_user(mvm_dev);
 	dev_dbg(mvm_dev->dev, "The current state of MVM is CRASHED\n");
 	schedule_work(&mvm_dev->trigger_ssr_work);
+
 	return IRQ_HANDLED;
 }
 
@@ -1733,7 +1761,6 @@ static int mvm_suspend(struct device *dev)
 	}
 	mutex_unlock(&mvm_dev->mvm_csr_lock);
 	mvm_dev->state = MVM_SLEEP;
-	send_mvm_state_to_user(mvm_dev);
 	return is_suspend;
 }
 
