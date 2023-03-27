@@ -1412,8 +1412,9 @@ static void trigger_ssr_work_hdlr(struct work_struct *work)
 
 	list_for_each_entry(mvm_cli, &mvm_dev->client_list, list) {
 		mvm_cli->client_ready= false;
-		printk("Set client flag %d \n",mvm_cli->client_id);
+		dev_dbg(mvm_dev->dev, "Set client flag %d\n",mvm_cli->client_id);
 	}
+	reinit_completion(&mvm_dev->mvm_dump_collection_done);
 	mutex_lock(&mvm_dev->out_fifo_lock);
 	p0_fifo_has_results = out_fifo_get_results(mvm_dev, 0);
 	p1_fifo_has_results = out_fifo_get_results(mvm_dev, 1);
@@ -1727,6 +1728,7 @@ static int mvm_suspend(struct device *dev)
 	if (mvm_dev->incoming_msgs == mvm_dev->outgoing_results) {
 		/* prepare power collapse control message */
 		struct mvm_control *mvm_ctrl;
+		reinit_completion(&mvm_dev->mvm_wfi_irq_recvd);
 		mvm_ctrl = kzalloc(sizeof(struct mvm_control), GFP_KERNEL);
 		mvm_ctrl->type = MVM_POWER;
 		mvm_ctrl->mvm_ctrl_msg.power.enter_pwr_collapse = 1;
