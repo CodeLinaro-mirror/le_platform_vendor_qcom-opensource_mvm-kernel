@@ -532,10 +532,11 @@ static ssize_t mvm_log_policy_store(struct file *filp, const char __user *ubuf, 
 	if (copy_from_user(&mvm_ctrl->mvm_ctrl_msg.debug.transfer_msg.log_policy, ubuf, count)) {
 		kfree(mvm_ctrl);
 		ret = -EFAULT;
-		return ret;
+	} else {
+		ret = send_ctrl_msg_to_mvm(mvm_ctrl, mvm_dev);
+		if (ret == 0)
+			ret = count;
 	}
-
-	ret = send_ctrl_msg_to_mvm(mvm_ctrl, mvm_dev);
 	kfree(mvm_ctrl);
 	return ret;
 }
@@ -758,12 +759,9 @@ static void process_control_message(struct mvm_control *mvm_ctrl_recv, struct mv
 	mvm_ctrl_send = kzalloc(sizeof(struct mvm_control), GFP_KERNEL);
 	mvm_ctrl_send->type = MVM_DEBUG;
 	if ( mvm_ctrl_recv->mvm_ctrl_msg.debug.msg_type == MVM_DEBUG_LOG_TRANSFER_REQUEST) {
-		if ( mvm_ctrl_recv->mvm_ctrl_msg.debug.msg_type == MVM_FLUSH_DDR_OVERFLOW) {
-			wake_up_interruptible_poll(&mvm_dev->log_poll_wait, POLLIN | POLLPRI);//wake up poll for logging if transfer complete
-			mvm_ctrl_send->mvm_ctrl_msg.debug.transfer_msg.ddr_log_buf_addr = LOG_BUFF_IOVA + mvm_dev->filled_dma_bytes;
-			mvm_ctrl_send->mvm_ctrl_msg.debug.transfer_msg.active_buffer_index = mvm_dev->active_buffer_index;
-			ret = send_ctrl_msg_to_mvm(mvm_ctrl_send, mvm_dev);
-		}
+		mvm_ctrl_send->mvm_ctrl_msg.debug.transfer_msg.ddr_log_buf_addr = LOG_BUFF_IOVA + mvm_dev->filled_dma_bytes;
+		mvm_ctrl_send->mvm_ctrl_msg.debug.msg_type = MVM_DEBUG_LOG_TRANSFER_REQUEST;
+		ret = send_ctrl_msg_to_mvm(mvm_ctrl_send, mvm_dev);
 	} else if ( mvm_ctrl_recv->mvm_ctrl_msg.debug.msg_type == MVM_DEBUG_LOG_TRANSFER_COMPLETE) {
 		mvm_dev->ddr_buf_len = mvm_ctrl_recv->mvm_ctrl_msg.debug.num_bytes_transferred /4;
 		mvm_dev->ddr_head_pos = &mvm_dev->ddr_head_pos[mvm_dev->ddr_buf_len];
