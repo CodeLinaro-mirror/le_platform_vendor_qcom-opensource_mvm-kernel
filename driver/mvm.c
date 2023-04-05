@@ -1218,7 +1218,6 @@ static irqreturn_t mvm_wfi_irq_handler(int irq, void *dev_id)
 {
 	struct mvm_device *mvm_dev = dev_id;
 
-	enable_wfi_int(mvm_dev, false);
 	complete(&mvm_dev->mvm_wfi_irq_recvd);
 	return IRQ_HANDLED;
 }
@@ -1787,6 +1786,7 @@ static int mvm_resume(struct device *dev)
 		mvm_ctrl->mvm_ctrl_msg.power.enter_pwr_collapse = 0;
 		is_resume = send_ctrl_msg_to_mvm(mvm_ctrl, mvm_dev);
 		kfree(mvm_ctrl);
+		enable_wfi_int(mvm_dev, false);
 	}
 	dev_dbg(mvm_dev->dev, "MVM subsystem in Restored\n");
 	return is_resume;
