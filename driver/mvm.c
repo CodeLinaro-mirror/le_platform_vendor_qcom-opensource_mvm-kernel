@@ -31,6 +31,7 @@
 #include <soc/qcom/secure_buffer.h>
 #include <linux/gunyah/gh_rm_drv.h>
 #include <linux/qcom-iommu-util.h>
+#include <linux/gunyah/gh_dbl.h>
 
 #define SIG_MVM_STATE           SIGRTMAX
 #define DDR_FIFO_COUNT			2
@@ -134,6 +135,12 @@ each of the actual P0 and P1 buffer starts */
 #define AC_VM_HLOS                      3
 #define AC_VM_GUEST_OS                  45
 #define APSS_SHARED_IPC_INTERRUPT_OFFSET	0xC
+#define DBL_MASK			0x1
+#define MVM_SHUTDOWN_DBL_MASK		0x1
+#define MVM_LOAD_FW_DBL_MASK		0x2
+#define MVM_INIT_FIFOS_DBL_MASK		0x3
+#define GH_DBL_MVM_TELEVM_TX_LABEL	0x7
+#define GH_DBL_MVM_TELEVM_RX_LABEL	0x8
 
 /**
  * enum mvm_state - state of mvm subsystem
@@ -279,6 +286,10 @@ struct mvm_device {
 	gh_memparcel_handle_t ring_buff_mem_handle;
 	gh_memparcel_handle_t dump_buff_mem_handle;
 	gh_memparcel_handle_t log_buff_mem_handle;
+	void *televm_tx_dbl;
+	void *televm_rx_dbl;
+	void *hostvm_tx_dbl;
+	void *hostvm_rx_dbl;
 };
 
 static int enable_gcc_clocks(struct mvm_device *mvm_dev);
@@ -1634,12 +1645,26 @@ static int mvm_load_fw(struct mvm_device *mvm_dev)
 	void *virt;
 	int ret = 0;
 
+	ret = enable_gcc_clocks(mvm_dev);
+	if (ret) {
+		dev_err(mvm_dev->dev, "Failed to turn on gcc clocks\n");
+		goto ret;
+	}
+
+	ret = enable_mvm_gdsc(mvm_dev, true);
+	if (ret) {
+		dev_err(mvm_dev->dev, "Failed to turn on mvm gdsc\n");
+		goto gdsc_err;
+	}
+
+	mvm_dev->resume_frm_pwr_collapse = true;
+
 	mvm_dev->mvm_fw = dma_alloc_coherent(mvm_dev->dev, MVM_FW_SIZE,
 						&mvm_dev->mvm_fw_dma, GFP_KERNEL);
 	if (!mvm_dev->mvm_fw) {
 		dev_err(mvm_dev->dev,
 			"dma_alloc_coherent of the firmware memory failed %d\n");
-		ret = -ENOMEM;
+			ret = -ENOMEM;
 		goto fw_dma_mem_fail;
 	}
 
@@ -1684,6 +1709,23 @@ static int mvm_load_fw(struct mvm_device *mvm_dev)
 	if (ret)
 		dev_err(mvm_dev->dev, "Couldnt store MVM PIL info in IMEM\n");
 
+	if (mvm_dev->vm_variant == HOSTVM) {
+		if (mvm_dev->state == MVM_OFFLINE)
+			mvm_dev->state = MVM_ONLINE;
+		else if (mvm_dev->state == MVM_RESTARTING) {
+			gh_dbl_flags_t dbl_mask = MVM_INIT_FIFOS_DBL_MASK;
+			ret = gh_dbl_send(mvm_dev->hostvm_tx_dbl, &dbl_mask, 0);
+			if (ret) {
+				dev_err(mvm_dev->dev, "Failed to send MVM_INIT_FIFOS_DBL to televm %d\n", ret);
+				goto ret;
+			}
+			dev_dbg(mvm_dev->dev, "Sent MVM_INIT_FIFOS_DBL to televm\n");
+			mvm_dev->state = MVM_ONLINE;
+		}
+	}
+
+	goto ret;
+
 #ifdef KEEP_FW_IN_DDR
 	goto success;
 #else
@@ -1695,8 +1737,102 @@ out_release_firmware:
 
 release_fw_dma_mem:
 	dma_free_coherent(mvm_dev->dev, MVM_FW_SIZE, mvm_dev->mvm_fw, mvm_dev->mvm_fw_dma);
+gdsc_err:
+	clk_disable_unprepare(mvm_dev->cnoc_s_ahb_clk);
+	clk_disable_unprepare(mvm_dev->xo);
+	clk_disable_unprepare(mvm_dev->snoc_m_axi_clk);
+	clk_disable_unprepare(mvm_dev->sysnoc_mvmss_clk);
 fw_dma_mem_fail:
 success:
+ret:
+	return ret;
+}
+
+static void mvm_hostvm_rx_dbl_cb(int irq, void *data)
+{
+	gh_dbl_flags_t dbl_mask = DBL_MASK;
+	struct mvm_device *mvm_dev;
+	int ret;
+
+	mvm_dev = data;
+	ret = gh_dbl_read_and_clean(mvm_dev->hostvm_rx_dbl, &dbl_mask, GH_DBL_NONBLOCK);
+	if(ret){
+		dev_err(mvm_dev->dev, "Error reading from doorbell\n");
+	}
+	dev_dbg(mvm_dev->dev, "Received mvm_hostvm_rx_dbl_cb with mask %x\n", dbl_mask);
+
+	if (dbl_mask == MVM_SHUTDOWN_DBL_MASK) {
+		mvm_dev->state = MVM_CRASHED;
+		ret = qcom_scm_pas_shutdown(MVM_PROC_ID);
+		if (ret) {
+			dev_err(mvm_dev->dev, "Error sending shutdown request to MVM\n");
+			return;
+		}
+	} else if (dbl_mask == MVM_LOAD_FW_DBL_MASK) {
+		mvm_dev->state = MVM_RESTARTING;
+		mvm_load_fw(mvm_dev);
+	}
+	ret = gh_dbl_reset(mvm_dev->hostvm_rx_dbl, GH_DBL_NONBLOCK);
+	if(ret){
+		dev_err(mvm_dev->dev, "Error resetting rx doorbell\n");
+	}
+}
+
+static void mvm_televm_rx_dbl_cb(int irq, void *data)
+{
+	gh_dbl_flags_t dbl_mask = DBL_MASK;
+	struct mvm_device *mvm_dev;
+	int ret;
+
+	mvm_dev = data;
+	ret = gh_dbl_read_and_clean(mvm_dev->televm_rx_dbl, &dbl_mask, GH_DBL_NONBLOCK);
+	if(ret){
+		dev_err(mvm_dev->dev, "Error reading from doorbell\n");
+	}
+	dev_dbg(mvm_dev->dev, "Received mvm_televm_rx_dbl_cb with mask %x\n", dbl_mask);
+
+	if (dbl_mask == MVM_INIT_FIFOS_DBL_MASK) {
+		initialise_fifos(mvm_dev);
+	}
+
+	ret = gh_dbl_reset(mvm_dev->televm_rx_dbl, GH_DBL_NONBLOCK);
+	if(ret){
+		dev_err(mvm_dev->dev, "Error resetting rx doorbell\n");
+	}
+}
+
+static int mvm_doorbell_register(struct mvm_device *mvm_dev)
+{
+	int ret = 0;
+
+	if (mvm_dev->vm_variant == TELEVM) {
+		mvm_dev->televm_tx_dbl = gh_dbl_tx_register(GH_DBL_MVM_TELEVM_TX_LABEL);
+		if (IS_ERR_OR_NULL(mvm_dev->televm_tx_dbl)) {
+			ret = PTR_ERR(mvm_dev->televm_tx_dbl);
+			dev_err(mvm_dev->dev, "Failed to register televm_tx_dbl %d\n", ret);
+		}
+
+		mvm_dev->televm_rx_dbl = gh_dbl_rx_register(GH_DBL_MVM_TELEVM_RX_LABEL, mvm_televm_rx_dbl_cb, mvm_dev);
+		if (IS_ERR_OR_NULL(mvm_dev->televm_rx_dbl)) {
+			ret = PTR_ERR(mvm_dev->televm_rx_dbl);
+			gh_dbl_tx_unregister(mvm_dev->televm_tx_dbl);
+			dev_err(mvm_dev->dev, "Failed to register televm_rx_dbl %d\n", ret);
+		}
+	} else {
+		mvm_dev->hostvm_tx_dbl = gh_dbl_tx_register(GH_DBL_MVM_TELEVM_RX_LABEL);
+		if (IS_ERR_OR_NULL(mvm_dev->hostvm_tx_dbl)) {
+			ret = PTR_ERR(mvm_dev->hostvm_tx_dbl);
+			dev_err(mvm_dev->dev, "Failed to register hostvm_tx_dbl %d\n", ret);
+		}
+
+		mvm_dev->hostvm_rx_dbl = gh_dbl_rx_register(GH_DBL_MVM_TELEVM_TX_LABEL, mvm_hostvm_rx_dbl_cb, mvm_dev);
+		if (IS_ERR_OR_NULL(mvm_dev->hostvm_rx_dbl)) {
+			ret = PTR_ERR(mvm_dev->hostvm_rx_dbl);
+			gh_dbl_tx_unregister(mvm_dev->hostvm_tx_dbl);
+			dev_err(mvm_dev->dev, "Failed to register hostvm_rx_dbl %d\n",ret);
+		}
+	}
+
 	return ret;
 }
 
@@ -1706,11 +1842,26 @@ static void trigger_ssr_work_hdlr(struct work_struct *work)
 	int ret = 0;
 	struct mvm_client *mvm_cli;
 	bool p0_fifo_has_results =0 ,p1_fifo_has_results =0;
+	gh_dbl_flags_t dbl_mask;
 
-	ret = qcom_scm_pas_shutdown(MVM_PROC_ID);
-	if (ret) {
-		dev_err(mvm_dev->dev, "Error sending shutdown request to MVM\n");
-		return;
+	if (mvm_dev->vm_variant == TELEVM) {
+		dbl_mask = MVM_SHUTDOWN_DBL_MASK;
+		ret = gh_dbl_reset(mvm_dev->televm_tx_dbl, GH_DBL_NONBLOCK);
+		if(ret){
+			dev_err(mvm_dev->dev, "Error resetting tx doorbell\n");
+		}
+		ret = gh_dbl_send(mvm_dev->televm_tx_dbl, &dbl_mask, 0);
+		if (ret) {
+			dev_err(mvm_dev->dev, "failed to send MVM_SHUTDOWN_DBL to hostvm %d\n", ret);
+			return;
+		}
+		dev_dbg(mvm_dev->dev, "Sent MVM_SHUTDOWN_DBL to hostvm\n");
+	} else if (mvm_dev->vm_variant == PVM_ONLY) {
+		ret = qcom_scm_pas_shutdown(MVM_PROC_ID);
+		if (ret) {
+			dev_err(mvm_dev->dev, "Error sending shutdown request to MVM\n");
+			return;
+		}
 	}
 
 	list_for_each_entry(mvm_cli, &mvm_dev->client_list, list) {
@@ -1723,7 +1874,7 @@ static void trigger_ssr_work_hdlr(struct work_struct *work)
 	p1_fifo_has_results = out_fifo_get_results(mvm_dev, 1);
 	mutex_unlock(&mvm_dev->out_fifo_lock);
 	if (p0_fifo_has_results || p1_fifo_has_results)
-		dev_info(mvm_dev->dev, "mvm outfifo has results and draining out fifo started\n");
+		dev_dbg(mvm_dev->dev, "mvm outfifo has results and draining out fifo started\n");
 	wake_up_interruptible_poll(&mvm_dev->mvm_waitqueue, POLLIN | POLLPRI);
 	send_mvm_state_to_user(mvm_dev);//Send crash signal to clients
 
@@ -1737,13 +1888,24 @@ static void trigger_ssr_work_hdlr(struct work_struct *work)
 	wake_up_interruptible_poll(&mvm_dev->ssr_poll_wait, POLLIN | POLLPRI);
 
 	dev_info(mvm_dev->dev, "MVM subsystem is restarting after SSR\n");
-	enable_gcc_clocks(mvm_dev);
-	enable_mvm_gdsc(mvm_dev, true);
 
 	mvm_dev->state = MVM_RESTARTING;
 	send_mvm_state_to_user(mvm_dev);
 
-	mvm_load_fw(mvm_dev);
+	if (mvm_dev->vm_variant == TELEVM) {
+		dbl_mask = MVM_LOAD_FW_DBL_MASK;
+		ret = gh_dbl_reset(mvm_dev->televm_tx_dbl, GH_DBL_NONBLOCK);
+		if(ret){
+			dev_err(mvm_dev->dev, "Error resetting tx doorbell\n");
+		}
+		ret = gh_dbl_send(mvm_dev->televm_tx_dbl, &dbl_mask, 0);
+		if (ret) {
+			dev_err(mvm_dev->dev, "failed to send MVM_LOAD_FW_DBL to hostvm %d\n", ret);
+			return;
+		}
+		dev_dbg(mvm_dev->dev, "Sent MVM_LOAD_FW_DBL to hostvm\n");
+	} else if (mvm_dev->vm_variant == PVM_ONLY)
+		mvm_load_fw(mvm_dev);
 
 	if (mvm_dev->vm_variant == PVM_ONLY)
 		initialise_fifos(mvm_dev);
@@ -2285,23 +2447,18 @@ static int mvm_probe(struct platform_device *pdev)
 		mvm_dev->pending_dump_read = false;
 	}
 
+	if (mvm_dev->vm_variant == HOSTVM || mvm_dev->vm_variant == TELEVM) {
+		ret = mvm_doorbell_register(mvm_dev);
+		if (ret) {
+			dev_err(mvm_dev->dev, "mvm_doorbell_register failed\n");
+			goto hostvm_mem_share_fail;
+		}
+	}
+
 	if (mvm_dev->vm_variant == PVM_ONLY || mvm_dev->vm_variant == HOSTVM) {
-		ret = enable_gcc_clocks(mvm_dev);
-		if (ret) {
-			dev_err(mvm_dev->dev, "Failed to turn on gcc clocks\n");
-			goto gcc_err;
-		}
-
-		ret = enable_mvm_gdsc(mvm_dev, true);
-		if (ret) {
-			dev_err(mvm_dev->dev, "Failed to turn on mvm gdsc\n");
-			goto gdsc_err;
-		}
-
-		mvm_dev->resume_frm_pwr_collapse = true;
 		ret = mvm_load_fw(mvm_dev);
 		if (ret)
-			goto gdsc_err;
+			goto load_fw_err;
 	}
 
 	if (mvm_dev->vm_variant == PVM_ONLY || mvm_dev->vm_variant == TELEVM)
@@ -2309,14 +2466,13 @@ static int mvm_probe(struct platform_device *pdev)
 
 	return 0;
 
-gdsc_err:
+load_fw_err:
 	if (mvm_dev->vm_variant == HOSTVM || mvm_dev->vm_variant == PVM_ONLY) {
 		clk_disable_unprepare(mvm_dev->cnoc_s_ahb_clk);
 		clk_disable_unprepare(mvm_dev->xo);
 		clk_disable_unprepare(mvm_dev->snoc_m_axi_clk);
 		clk_disable_unprepare(mvm_dev->sysnoc_mvmss_clk);
 	}
-gcc_err:
 	if (mvm_dev->vm_variant == HOSTVM) {
 		hyp_unassign_mem_reclaim(mvm_dev, mvm_dev->ring_buff_dma, mvm_dev->mvm_ring_buff_shm_label,
 				round_up(sizeof(struct ring_buffers), PAGE_SIZE), mvm_dev->ring_buff_mem_handle);
