@@ -1547,8 +1547,8 @@ static int register_isrs(struct platform_device *pdev)
 
 	ret = devm_request_threaded_irq(mvm_dev->dev, mvm_dev->mvm_ssr_done_irq,
 					NULL, mvm_ssr_done_irq_handler,
-					IRQF_TRIGGER_HIGH | IRQF_ONESHOT |
-					IRQF_NO_SUSPEND, "mvm_ssr_done", mvm_dev);
+					IRQF_TRIGGER_HIGH | IRQF_ONESHOT,
+					"mvm_ssr_done", mvm_dev);
 	if (ret < 0) {
 		dev_err(mvm_dev->dev,
 			"devm_request_threaded_irq of mvm_ssr_done failed %d\n", ret);
@@ -1566,8 +1566,8 @@ static int register_isrs(struct platform_device *pdev)
 	}
 	ret = devm_request_threaded_irq(mvm_dev->dev, mvm_dev->mvm_verif_done_irq,
 					NULL, mvm_verif_done_irq_handler,
-					IRQF_TRIGGER_HIGH | IRQF_ONESHOT |
-					IRQF_NO_SUSPEND, "mvm_verif_done", mvm_dev);
+					IRQF_TRIGGER_HIGH | IRQF_ONESHOT,
+					"mvm_verif_done", mvm_dev);
 	if (ret < 0) {
 		dev_err(mvm_dev->dev,
 			"devm_request_threaded_irq of mvm_verif_done_irq failed %d\n", ret);
@@ -1585,8 +1585,8 @@ static int register_isrs(struct platform_device *pdev)
 
 	ret = devm_request_threaded_irq(mvm_dev->dev, mvm_dev->wfi_irq,
 					NULL, mvm_wfi_irq_handler,
-					IRQF_TRIGGER_RISING | IRQF_ONESHOT |
-					IRQF_NO_SUSPEND, "mvm_wfi", mvm_dev);
+					IRQF_TRIGGER_RISING | IRQF_ONESHOT,
+					"mvm_wfi", mvm_dev);
 	if (ret < 0) {
 		dev_err(mvm_dev->dev,
 			"devm_request_threaded_irq of wfi_irq failed %d\n", ret);
