@@ -1332,7 +1332,6 @@ static int mvm_televm_map_shared_mem(struct mvm_device *mvm_dev, char *compat, u
 			continue;
 		}
 		if (label == shm_label) {
-			printk("found label %x compat is %s\n",label, compat);
 			break;
 		}
 		of_node_put(np);
@@ -1369,16 +1368,14 @@ static int mvm_televm_map_shared_mem(struct mvm_device *mvm_dev, char *compat, u
 			ret = -ENOMEM;
 			dev_err(mvm_dev->dev, "ioremap of dump buffers failed\n");
 			goto ioremap_dump_buff_fail;
-		} else
-                	printk("ioremap success\n");
+		}
 	} else if (label == mvm_dev->mvm_log_buff_shm_label) {
 		mvm_dev->log_buff = devm_ioremap_wc(mvm_dev->dev, res.start, resource_size(&res));
 		if (IS_ERR(mvm_dev->log_buff)) {
 			ret = -ENOMEM;
 			dev_err(mvm_dev->dev, "ioremap of log buffers failed\n");
 			goto ioremap_log_buff_fail;
-		} else
-			printk("ioremap success\n");
+		}
 	}
 
 	goto put_shm_np;
