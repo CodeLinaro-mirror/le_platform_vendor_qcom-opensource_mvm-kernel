@@ -1252,6 +1252,7 @@ static irqreturn_t mvm_wfi_irq_handler(int irq, void *dev_id)
 	complete(&mvm_dev->mvm_wfi_irq_recvd);
 	return IRQ_HANDLED;
 }
+
 static void initialise_fifos(struct mvm_device *mvm_dev)
 {
 	uint32_t infifo_size, outfifo_size;
@@ -1316,6 +1317,13 @@ static void initialise_fifos(struct mvm_device *mvm_dev)
 
 	writel_relaxed(MVM_INIT_DONE_COOKIE,
 				mvm_dev->mvm_base + MVMSS_CSR_APSS_MVM_SCRATCH_PAD1);
+	writel_relaxed(MVM_DUMP_BUFF_IOVA,
+				mvm_dev->mvm_base + MVMSS_CSR_APSS_MVM_SCRATCH_PAD0);
+	/*Send an interrupt to MVM to indicate MVM_Init done */
+	writel_relaxed(IRQ_APSS0, mvm_dev->apss_shared_base + APSS_SHARED_IPC_INTERRUPT_OFFSET);
+	mvm_dev->state = MVM_ONLINE;
+	dev_info(mvm_dev->dev, "The current state of MVM is ONLINE\n");
+	send_mvm_state_to_user(mvm_dev);
 }
 
 static int mvm_televm_map_shared_mem(struct mvm_device *mvm_dev, char *compat, uint32_t shm_label)
@@ -1736,6 +1744,9 @@ static void trigger_ssr_work_hdlr(struct work_struct *work)
 	send_mvm_state_to_user(mvm_dev);
 
 	mvm_load_fw(mvm_dev);
+
+	if (mvm_dev->vm_variant == PVM_ONLY)
+		initialise_fifos(mvm_dev);
 
 	return;
 }
@@ -2293,16 +2304,8 @@ static int mvm_probe(struct platform_device *pdev)
 			goto gdsc_err;
 	}
 
-	if (mvm_dev->vm_variant == PVM_ONLY || mvm_dev->vm_variant == TELEVM) {
-		writel_relaxed(MVM_DUMP_BUFF_IOVA,
-			mvm_dev->mvm_base + MVMSS_CSR_APSS_MVM_SCRATCH_PAD0);
+	if (mvm_dev->vm_variant == PVM_ONLY || mvm_dev->vm_variant == TELEVM)
 		initialise_fifos(mvm_dev);
-		/*Send an interrupt to MVM to indicate MVM_Init done */
-		writel_relaxed(IRQ_APSS0, mvm_dev->apss_shared_base + APSS_SHARED_IPC_INTERRUPT_OFFSET);
-		mvm_dev->state = MVM_ONLINE;
-		dev_info(mvm_dev->dev, "The current state of MVM is ONLINE\n");
-		send_mvm_state_to_user(mvm_dev);
-	}
 
 	return 0;
 
