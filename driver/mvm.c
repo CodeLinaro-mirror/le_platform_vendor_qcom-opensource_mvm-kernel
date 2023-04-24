@@ -290,6 +290,7 @@ struct mvm_device {
 	void *televm_rx_dbl;
 	void *hostvm_tx_dbl;
 	void *hostvm_rx_dbl;
+	const struct firmware *fw;
 };
 
 static int enable_gcc_clocks(struct mvm_device *mvm_dev);
@@ -1640,9 +1641,6 @@ err:
 
 static int mvm_load_fw(struct mvm_device *mvm_dev)
 {
-	const struct firmware *fw;
-	char fw_name[32];
-	void *virt;
 	int ret = 0;
 
 	ret = enable_gcc_clocks(mvm_dev);
@@ -1659,33 +1657,10 @@ static int mvm_load_fw(struct mvm_device *mvm_dev)
 
 	mvm_dev->resume_frm_pwr_collapse = true;
 
-	mvm_dev->mvm_fw = dma_alloc_coherent(mvm_dev->dev, MVM_FW_SIZE,
-						&mvm_dev->mvm_fw_dma, GFP_KERNEL);
-	if (!mvm_dev->mvm_fw) {
-		dev_err(mvm_dev->dev,
-			"dma_alloc_coherent of the firmware memory failed %d\n");
-			ret = -ENOMEM;
-		goto fw_dma_mem_fail;
-	}
-
-	scnprintf(fw_name, ARRAY_SIZE(fw_name), "mvm_ecc.mdt");
-	ret = request_firmware(&fw, fw_name, mvm_dev->dev);
-	if (ret) {
-		dev_err(mvm_dev->dev, "request_firmware for mvm failed\n");
-		goto release_fw_dma_mem;
-	}
-
-	virt = mvm_dev->mvm_fw;
-	if (!virt) {
-		dev_err(mvm_dev->dev, "Failed to remap firmware memory\n");
-		goto out_release_firmware;
-
-	}
-
 	update_marker("M - Loading MVM firmware");
 
-	ret = qcom_mdt_load(mvm_dev->dev, fw, fw_name, MVM_PROC_ID,
-			    virt, mvm_dev->mvm_fw_dma, MVM_FW_SIZE, NULL);
+	ret = qcom_mdt_load(mvm_dev->dev, mvm_dev->fw, "mvm_ecc.mdt", MVM_PROC_ID,
+			    mvm_dev->mvm_fw, mvm_dev->mvm_fw_dma, MVM_FW_SIZE, NULL);
 	if (ret) {
 		dev_err(mvm_dev->dev, "Failed to load mvm firmware\n");
 		goto out_release_firmware;
@@ -1706,8 +1681,10 @@ static int mvm_load_fw(struct mvm_device *mvm_dev)
 	 */
 
 	ret = qcom_pil_info_store("mvm", mvm_dev->mvm_fw_dma, MVM_FW_SIZE);
-	if (ret)
+	if (ret) {
 		dev_err(mvm_dev->dev, "Couldnt store MVM PIL info in IMEM\n");
+		goto out_release_firmware;
+	}
 
 	if (mvm_dev->vm_variant == HOSTVM) {
 		if (mvm_dev->state == MVM_OFFLINE)
@@ -1726,24 +1703,13 @@ static int mvm_load_fw(struct mvm_device *mvm_dev)
 
 	goto ret;
 
-#ifdef KEEP_FW_IN_DDR
-	goto success;
-#else
-	goto release_fw_dma_mem;
-#endif
-
 out_release_firmware:
-	release_firmware(fw);
-
-release_fw_dma_mem:
-	dma_free_coherent(mvm_dev->dev, MVM_FW_SIZE, mvm_dev->mvm_fw, mvm_dev->mvm_fw_dma);
+	release_firmware(mvm_dev->fw);
 gdsc_err:
 	clk_disable_unprepare(mvm_dev->cnoc_s_ahb_clk);
 	clk_disable_unprepare(mvm_dev->xo);
 	clk_disable_unprepare(mvm_dev->snoc_m_axi_clk);
 	clk_disable_unprepare(mvm_dev->sysnoc_mvmss_clk);
-fw_dma_mem_fail:
-success:
 ret:
 	return ret;
 }
@@ -2107,8 +2073,21 @@ static int mvm_dma_mem_alloc(struct mvm_device *mvm_dev)
 		goto log_buff_dma_mem_alloc_fail;
 	}
 
+	mvm_dev->mvm_fw = dma_alloc_coherent(mvm_dev->dev, MVM_FW_SIZE,
+						&mvm_dev->mvm_fw_dma, GFP_KERNEL);
+	if (!mvm_dev->mvm_fw) {
+		dev_err(mvm_dev->dev,
+				"dma_alloc_coherent of the firmware memory failed %d\n");
+		ret = -ENOMEM;
+		goto fw_mem_alloc_fail;
+	} else
+		printk("Allocated memmory during probe\n");
+
 	return 0;
 
+fw_mem_alloc_fail:
+	dma_free_coherent(mvm_dev->dev, round_up(sizeof(struct mvmlog_buffers), PAGE_SIZE),
+					mvm_dev->log_buff, mvm_dev->mvmlog_buff_dma);
 log_buff_dma_mem_alloc_fail:
 	dma_free_coherent(mvm_dev->dev, round_up(sizeof(struct mvm_crashdump_buffer), PAGE_SIZE),
 					mvm_dev->dump_buff, mvm_dev->mvm_dump_dma);
@@ -2451,11 +2430,19 @@ static int mvm_probe(struct platform_device *pdev)
 		ret = mvm_doorbell_register(mvm_dev);
 		if (ret) {
 			dev_err(mvm_dev->dev, "mvm_doorbell_register failed\n");
-			goto hostvm_mem_share_fail;
+			goto doorbell_fail;
 		}
 	}
 
 	if (mvm_dev->vm_variant == PVM_ONLY || mvm_dev->vm_variant == HOSTVM) {
+		mvm_dev->resume_frm_pwr_collapse = true;
+
+		ret = request_firmware(&mvm_dev->fw, "mvm_ecc.mdt", mvm_dev->dev);
+		if (ret) {
+			dev_err(mvm_dev->dev, "request_firmware for mvm failed\n");
+			goto doorbell_fail;
+		}
+
 		ret = mvm_load_fw(mvm_dev);
 		if (ret)
 			goto load_fw_err;
@@ -2473,6 +2460,7 @@ load_fw_err:
 		clk_disable_unprepare(mvm_dev->snoc_m_axi_clk);
 		clk_disable_unprepare(mvm_dev->sysnoc_mvmss_clk);
 	}
+doorbell_fail:
 	if (mvm_dev->vm_variant == HOSTVM) {
 		hyp_unassign_mem_reclaim(mvm_dev, mvm_dev->ring_buff_dma, mvm_dev->mvm_ring_buff_shm_label,
 				round_up(sizeof(struct ring_buffers), PAGE_SIZE), mvm_dev->ring_buff_mem_handle);
@@ -2543,7 +2531,14 @@ static int mvm_remove(struct platform_device *pdev)
                         round_up(sizeof(struct mvm_crashdump_buffer), PAGE_SIZE), mvm_dev->dump_buff_mem_handle);
                 hyp_unassign_mem_reclaim(mvm_dev, mvm_dev->mvmlog_buff_dma, mvm_dev->mvm_log_buff_shm_label,
                         round_up(sizeof(struct mvmlog_buffers), PAGE_SIZE), mvm_dev->log_buff_mem_handle);
+		gh_dbl_tx_unregister(mvm_dev->hostvm_tx_dbl);
+		gh_dbl_rx_unregister(mvm_dev->hostvm_rx_dbl);
         }
+
+	if (mvm_dev->vm_variant == TELEVM) {
+		gh_dbl_tx_unregister(mvm_dev->televm_tx_dbl);
+		gh_dbl_rx_unregister(mvm_dev->televm_rx_dbl);
+	}
 
 	if (mvm_dev->vm_variant == PVM_ONLY || mvm_dev->vm_variant == HOSTVM) {
 		mvm_iommu_release(mvm_dev);
