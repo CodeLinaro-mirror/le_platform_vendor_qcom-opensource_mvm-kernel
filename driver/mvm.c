@@ -165,6 +165,12 @@ enum vm_variant {
 	TELEVM,
 };
 
+enum client_state {
+	CLIENT_READY,
+	CLIENT_SSR,
+	CLIENT_DISCONNECTING
+};
+
 static const char * const mvm_states[] = {
 	[MVM_OFFLINE] = "OFFLINE",
 	[MVM_ONLINE] = "ONLINE",
@@ -215,10 +221,12 @@ struct mvm_client {
 	unsigned int timeout_ms;
 	struct mvm_device *mvm_dev;
 	struct list_head list;
-	bool client_ready;
+	enum client_state state;
 	struct output_buffer *out_buff;
 	enum mvm_log_policy log_policy;
 	struct task_struct *task;
+	unsigned int msgs_sent;
+	unsigned int results_recvd;
 };
 
 struct mvm_device {
@@ -795,6 +803,17 @@ static void process_control_message(struct mvm_control *mvm_ctrl_recv, struct mv
 	kfree(mvm_ctrl_send);
 }
 
+static void mvm_client_remove(struct mvm_device *mvm_dev,struct mvm_client *mvm_cli)
+{
+	mutex_lock(&mvm_dev->mvm_cli_lock);
+	clear_bit(mvm_cli->client_id - 1, mvm_dev->client_id_bitmap);
+	list_del(&mvm_cli->list);
+	mutex_unlock(&mvm_dev->mvm_cli_lock);
+	mvm_cli->mvm_dev = NULL;
+	kfree(mvm_cli->out_buff);
+	kfree(mvm_cli);
+}
+
 static bool drain_out_fifo(struct mvm_device *mvm_dev, unsigned int fifo_index, unsigned int count)
 {
 	struct mvm_client *mvm_cli;
@@ -838,19 +857,32 @@ static bool drain_out_fifo(struct mvm_device *mvm_dev, unsigned int fifo_index, 
 			list_for_each_entry(mvm_cli, &mvm_dev->client_list, list) {
 				if (mvm_cli->client_id == client_id) {
 					match = true;
-					full = fifo_full(mvm_cli->out_buff->head, mvm_cli->out_buff->size,
-									mvm_cli->out_buff->tail);
-					if (!full) {
-						memcpy(&mvm_cli->out_buff->out_msg[mvm_cli->out_buff->head],
-						&mvm_dev->ring_buff->out_fifo[fifo_index].base[
-						mvm_dev->ring_buff->out_fifo[fifo_index].tail],
-						sizeof(struct output_msg));
-						mvm_cli->out_buff->head =
-							(mvm_cli->out_buff->head+1) % (mvm_cli->out_buff->size);
-						mvm_cli->out_buff->count++;
+					if(mvm_cli->state == CLIENT_DISCONNECTING){
+						mvm_cli->results_recvd++;
+						if(mvm_cli->results_recvd == mvm_cli->msgs_sent){
+							dev_dbg(mvm_dev->dev,"received last pending message for disconnected client, removing client\n");
+							mvm_client_remove(mvm_dev,mvm_cli);
+						}
 						mvm_dev->outgoing_results++;
 						out_buff_written = true;
 						break;
+					}
+					else{
+						full = fifo_full(mvm_cli->out_buff->head, mvm_cli->out_buff->size,
+										mvm_cli->out_buff->tail);
+						if (!full) {
+							memcpy(&mvm_cli->out_buff->out_msg[mvm_cli->out_buff->head],
+							&mvm_dev->ring_buff->out_fifo[fifo_index].base[
+							mvm_dev->ring_buff->out_fifo[fifo_index].tail],
+							sizeof(struct output_msg));
+							mvm_cli->out_buff->head =
+								(mvm_cli->out_buff->head+1) % (mvm_cli->out_buff->size);
+							mvm_cli->out_buff->count++;
+							mvm_cli->results_recvd++;
+							mvm_dev->outgoing_results++;
+							out_buff_written = true;
+							break;
+						}
 					}
 				}
 			}
@@ -1001,7 +1033,7 @@ static int mvm_open(struct inode *inode, struct file *filp)
 	set_bit(i, mvm_dev->client_id_bitmap);
 	mvm_cli->client_id = i+1;
 	mvm_cli->task = get_current();
-	mvm_cli->client_ready = true;
+	mvm_cli->state = CLIENT_READY;
 	list_add_tail(&mvm_cli->list, &mvm_dev->client_list);
 	mutex_unlock(&mvm_dev->mvm_cli_lock);
 
@@ -1023,15 +1055,12 @@ static int mvm_release(struct inode *inode, struct file *filp)
 	struct mvm_device, mvm_cdev);
 	struct mvm_client *mvm_cli = filp->private_data;
 
-	mutex_lock(&mvm_dev->mvm_cli_lock);
-	clear_bit(mvm_cli->client_id - 1, mvm_dev->client_id_bitmap);
-	list_del(&mvm_cli->list);
-	mutex_unlock(&mvm_dev->mvm_cli_lock);
-	mvm_cli->mvm_dev = NULL;
-	kfree(mvm_cli->out_buff);
-	kfree(mvm_cli);
-	complete_all(&mvm_dev->p0_fifo_slot_available);
-	complete_all(&mvm_dev->p1_fifo_slot_available);
+	mvm_cli->state = CLIENT_DISCONNECTING;
+	if(mvm_cli->msgs_sent == mvm_cli->results_recvd)
+	{
+		dev_dbg(mvm_dev->dev, "client disconnected with no pending messages, removing immediately\n");
+		mvm_client_remove(mvm_dev,mvm_cli);
+	}
 	return 0;
 }
 
@@ -1054,7 +1083,7 @@ static long mvm_ioctl(struct file *filp, unsigned int cmd, unsigned long arg)
 		break;
 
 	case READY_AFTER_SSR:
-		mvm_cli->client_ready= true;
+		mvm_cli->state = CLIENT_READY;
 		mvm_cli->out_buff->head = 0;
 		mvm_cli->out_buff->tail = 0;
 		break;
@@ -1078,7 +1107,7 @@ static ssize_t mvm_write(
 	unsigned int no_of_msgs_written = 0;
 	unsigned int count;
 
-	if (!mvm_cli->client_ready)
+	if (!(mvm_cli->state == CLIENT_READY))
 		goto ret;
 
 	mutex_lock(&mvm_dev->in_fifo_lock);
@@ -1150,6 +1179,7 @@ push_to_input_ring:
 					% mvm_dev->ring_buff->in_fifo[fifo_index].size;
 				no_of_msgs_written++;
 				mvm_dev->incoming_msgs++;
+				mvm_cli->msgs_sent++;
 				if (fifo_index == 0)
 					writel_relaxed(mvm_dev->ring_buff->in_fifo[0].head,
 					mvm_dev->mvm_base + MVMSS_CSR_INPUT_RING0_HEAD_PTR_OFFSET);
@@ -1831,7 +1861,7 @@ static void trigger_ssr_work_hdlr(struct work_struct *work)
 	}
 
 	list_for_each_entry(mvm_cli, &mvm_dev->client_list, list) {
-		mvm_cli->client_ready= false;
+		mvm_cli->state = CLIENT_SSR;
 		dev_dbg(mvm_dev->dev, "Set client flag %d\n",mvm_cli->client_id);
 	}
 	reinit_completion(&mvm_dev->mvm_dump_collection_done);
