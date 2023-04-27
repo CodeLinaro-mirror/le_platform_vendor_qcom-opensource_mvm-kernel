@@ -133,6 +133,7 @@ each of the actual P0 and P1 buffer starts */
 #define MAX_LOG_BUFFER_SIZE		0x1800
 #define AC_VM_HLOS                      3
 #define AC_VM_GUEST_OS                  45
+#define APSS_SHARED_IPC_INTERRUPT_OFFSET	0xC
 
 /**
  * enum mvm_state - state of mvm subsystem
@@ -446,7 +447,7 @@ static int send_ctrl_msg_to_mvm(struct mvm_control *mvm_ctrl, struct mvm_device 
 	memcpy(in_fifo_addr + 1, mvm_ctrl, sizeof(struct mvm_control));
 	mvm_dev->ring_buff->in_fifo[0].head = (mvm_dev->ring_buff->in_fifo[0].head + 1) % mvm_dev->ring_buff->in_fifo[0].size;
 	writel_relaxed(mvm_dev->ring_buff->in_fifo[0].head, mvm_dev->mvm_base + MVMSS_CSR_INPUT_RING0_HEAD_PTR_OFFSET);
-	writel_relaxed(IRQ_APSS1, mvm_dev->apss_shared_base);
+	writel_relaxed(IRQ_APSS1, mvm_dev->apss_shared_base + APSS_SHARED_IPC_INTERRUPT_OFFSET);
 	return 0;
 }
 
@@ -1155,7 +1156,7 @@ ret:
 	mutex_unlock(&mvm_dev->in_fifo_lock);
 
 	if (no_of_msgs_written > 0)
-		writel_relaxed(IRQ_APSS1, mvm_dev->apss_shared_base);
+		writel_relaxed(IRQ_APSS1, mvm_dev->apss_shared_base + APSS_SHARED_IPC_INTERRUPT_OFFSET);
 	return (no_of_msgs_written * sizeof(struct input_msg));
 }
 
@@ -2300,7 +2301,7 @@ static int mvm_probe(struct platform_device *pdev)
 			mvm_dev->mvm_base + MVMSS_CSR_APSS_MVM_SCRATCH_PAD0);
 		initialise_fifos(mvm_dev);
 		/*Send an interrupt to MVM to indicate MVM_Init done */
-		writel_relaxed(IRQ_APSS0, mvm_dev->apss_shared_base);
+		writel_relaxed(IRQ_APSS0, mvm_dev->apss_shared_base + APSS_SHARED_IPC_INTERRUPT_OFFSET);
 		mvm_dev->state = MVM_ONLINE;
 		dev_info(mvm_dev->dev, "The current state of MVM is ONLINE\n");
 		send_mvm_state_to_user(mvm_dev);
