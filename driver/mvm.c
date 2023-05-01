@@ -139,8 +139,6 @@ each of the actual P0 and P1 buffer starts */
 #define MVM_SHUTDOWN_DBL_MASK		0x1
 #define MVM_LOAD_FW_DBL_MASK		0x2
 #define MVM_INIT_FIFOS_DBL_MASK		0x3
-#define GH_DBL_MVM_TELEVM_TX_LABEL	0x7
-#define GH_DBL_MVM_TELEVM_RX_LABEL	0x8
 
 /**
  * enum mvm_state - state of mvm subsystem
