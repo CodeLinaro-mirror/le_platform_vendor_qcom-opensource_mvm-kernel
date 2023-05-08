@@ -138,7 +138,7 @@ each of the actual P0 and P1 buffer starts */
 #define BASE_ADDR_OFFSET		0x10
 #define MAX_LOG_BUFFER_SIZE		0x1800
 #define AC_VM_HLOS                      3
-#define AC_VM_GUEST_OS                  45
+#define AC_VM_GVM1			52
 #define APSS_SHARED_IPC_INTERRUPT_OFFSET	0xC
 #define DBL_MASK			0x1
 #define MVM_SHUTDOWN_DBL_MASK		0x1
@@ -1736,7 +1736,7 @@ static void hyp_unassign_mem_reclaim(struct mvm_device *mvm_dev, dma_addr_t dma_
 				     uint32_t size, gh_memparcel_handle_t handle) {
 	int srcVMperm[1] = {PERM_READ | PERM_WRITE};
 	int srcVM[1] = {AC_VM_HLOS};
-	int destVM[2] = {AC_VM_HLOS, AC_VM_GUEST_OS};
+	int destVM[2] = {AC_VM_HLOS, AC_VM_GVM1};
 
 	gh_rm_mem_reclaim(handle, 0);
 	hyp_assign_phys(dma_addr, size, destVM, 2, srcVM, srcVMperm, 1);
@@ -1749,7 +1749,7 @@ static int hyp_assign_mem_share(struct mvm_device *mvm_dev, struct gh_acl_desc *
 	int srcVMperm[1] = {PERM_READ | PERM_WRITE};
 	int destVMperm[2] = {PERM_READ | PERM_WRITE, PERM_READ | PERM_WRITE};
 	int srcVM[1] = {AC_VM_HLOS};
-	int destVM[2] = {AC_VM_HLOS, AC_VM_GUEST_OS};
+	int destVM[2] = {AC_VM_HLOS, AC_VM_GVM1};
 	int ret = 0;
 
         mvm_sgl_desc->n_sgl_entries = 1;
@@ -1785,7 +1785,7 @@ static int mvm_hostvm_mem_share(struct mvm_device *mvm_dev)
 	struct gh_sgl_desc *mvm_sgl_desc;
 	int srcVMperm[1] = {PERM_READ | PERM_WRITE};
 	int srcVM[1] = {AC_VM_HLOS};
-	int destVM[2] = {AC_VM_HLOS, AC_VM_GUEST_OS};
+	int destVM[2] = {AC_VM_HLOS, AC_VM_GVM1};
 	int ret = 0;
 
 	mvm_dev->ring_buff_mem_handle = 0;
@@ -1807,7 +1807,7 @@ static int mvm_hostvm_mem_share(struct mvm_device *mvm_dev)
         mvm_acl_desc->n_acl_entries = 2;
         mvm_acl_desc->acl_entries[0].vmid = AC_VM_HLOS;
         mvm_acl_desc->acl_entries[0].perms = GH_RM_ACL_R | GH_RM_ACL_W;
-        mvm_acl_desc->acl_entries[1].vmid = AC_VM_GUEST_OS;
+        mvm_acl_desc->acl_entries[1].vmid = AC_VM_GVM1;
         mvm_acl_desc->acl_entries[1].perms = GH_RM_ACL_R | GH_RM_ACL_W;
 
         /* Share ring buffers from hostvm to televm */
@@ -1887,7 +1887,7 @@ static int mvm_hostvm_io_lend(struct mvm_device *mvm_dev)
 	}
 
 	mvm_acl_desc->n_acl_entries = 1;
-	mvm_acl_desc->acl_entries[0].vmid = AC_VM_GUEST_OS;
+	mvm_acl_desc->acl_entries[0].vmid = AC_VM_GVM1;
 	mvm_acl_desc->acl_entries[0].perms = GH_RM_ACL_R | GH_RM_ACL_W;
 
 	mvm_sgl_desc->n_sgl_entries = 1;
@@ -1905,7 +1905,7 @@ static int mvm_hostvm_io_lend(struct mvm_device *mvm_dev)
 	mvm_acl_desc->n_acl_entries = 2;
 	mvm_acl_desc->acl_entries[0].vmid = AC_VM_HLOS;
 	mvm_acl_desc->acl_entries[0].perms = GH_RM_ACL_R | GH_RM_ACL_W;
-	mvm_acl_desc->acl_entries[1].vmid = AC_VM_GUEST_OS;
+	mvm_acl_desc->acl_entries[1].vmid = AC_VM_GVM1;
 	mvm_acl_desc->acl_entries[1].perms = GH_RM_ACL_R | GH_RM_ACL_W;
 
 	mvm_sgl_desc->n_sgl_entries = 1;
