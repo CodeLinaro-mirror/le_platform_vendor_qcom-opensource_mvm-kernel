@@ -1840,10 +1840,6 @@ static void trigger_ssr_work_hdlr(struct work_struct *work)
 
 	if (mvm_dev->vm_variant == TELEVM) {
 		dbl_mask = MVM_SHUTDOWN_DBL_MASK;
-		ret = gh_dbl_reset(mvm_dev->televm_tx_dbl, GH_DBL_NONBLOCK);
-		if(ret){
-			dev_err(mvm_dev->dev, "Error resetting tx doorbell\n");
-		}
 		ret = gh_dbl_send(mvm_dev->televm_tx_dbl, &dbl_mask, 0);
 		if (ret) {
 			dev_err(mvm_dev->dev, "failed to send MVM_SHUTDOWN_DBL to hostvm %d\n", ret);
@@ -1888,10 +1884,6 @@ static void trigger_ssr_work_hdlr(struct work_struct *work)
 
 	if (mvm_dev->vm_variant == TELEVM) {
 		dbl_mask = MVM_LOAD_FW_DBL_MASK;
-		ret = gh_dbl_reset(mvm_dev->televm_tx_dbl, GH_DBL_NONBLOCK);
-		if(ret){
-			dev_err(mvm_dev->dev, "Error resetting tx doorbell\n");
-		}
 		ret = gh_dbl_send(mvm_dev->televm_tx_dbl, &dbl_mask, 0);
 		if (ret) {
 			dev_err(mvm_dev->dev, "failed to send MVM_LOAD_FW_DBL to hostvm %d\n", ret);
