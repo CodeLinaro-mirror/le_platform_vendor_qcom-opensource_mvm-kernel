@@ -11,6 +11,8 @@ enum mvm_ctrl_msg_type {
 	MVM_CPU_FREQ,		           /* Control message for DSVC */
 	MVM_POWER,		               /* Control message for power collapse */
 	MVM_TRIGGER_SSR,	           /* Control message to trigger SSR of MVM */
+	MVM_MAX_RATE,		   /* Control message to send max allowed rate */
+	MVM_CHANGE_CLK_FREQ,
 	MVM_MAX,
 };
 
@@ -41,6 +43,11 @@ typedef enum {
 	MVM_DEBUG_SET_LOG_LEVEL
 } mvm_debug_msg_type;
 
+typedef enum {
+	NOMINAL,
+	SVS,
+	LOW_SVS,
+} mvm_clk_freq;
 
 /*
  * struct mvm_debug
@@ -83,6 +90,14 @@ struct mvm_trigger_ssr {
 	bool trigger_ssr;
 };
 
+struct mvm_max_rate {
+        uint32_t max_rate;
+};
+
+struct mvm_clk_freq {
+	mvm_clk_freq clk_freq;
+};		
+
 /*
  * struct mvm_control
  * Max Size possible = 240 bytes
@@ -96,6 +111,8 @@ struct mvm_control {
 		struct mvm_cpu_freq cpu;
 		struct mvm_power power;
 		struct mvm_trigger_ssr ssr;
+		struct mvm_max_rate max_rate;
+		struct mvm_clk_freq mvm_clk_freq;
 	} mvm_ctrl_msg;
 } __attribute__((packed));
 
