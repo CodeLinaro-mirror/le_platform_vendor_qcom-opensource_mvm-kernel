@@ -1114,7 +1114,7 @@ static ssize_t mvm_write(
 	unsigned int count;
 
 	if (!(mvm_cli->state == CLIENT_READY))
-		goto ret;
+		return 0;
 
 	mutex_lock(&mvm_dev->in_fifo_lock);
 	inp_msg = kzalloc(sizeof(struct input_msg), GFP_KERNEL);
