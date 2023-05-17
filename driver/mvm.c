@@ -40,6 +40,7 @@
 #define MSG_PRIORITY_BIT		BIT(19)
 #define OUT_BUFF_SIZE			32
 #define TIMEOUT_MS			10000
+#define WFI_TIMEOUT_MS    5000
 #define MAX_CLIENT_COUNT		15
 /*TODO Remove this once PIL validation is complete */
 #define KEEP_FW_IN_DDR			1
@@ -151,7 +152,7 @@ each of the actual P0 and P1 buffer starts */
  * @MVM_ONLINE: The MVM firmware has been loaded, authenticate and MVMSS is up and running.
  * @MVM_CRASHED: Watchdog bite is received from MVM to APSS.
  * @MVM_RESTARTING: The mvm dump has been collected and ssr_done_irq is received from MVM to APSS.
- * @MVM_SLEEP: The gdsc core collapse sequence has been completed from APSS.
+ * @MVM_SUSPEND:send suspend notification to client so client will halt the task.
 **/
 
 enum mvm_state {
@@ -159,7 +160,7 @@ enum mvm_state {
 	MVM_ONLINE,
 	MVM_CRASHED,
 	MVM_RESTARTING,
-	MVM_SLEEP,
+	MVM_SUSPEND,
 };
 
 enum vm_variant {
@@ -171,7 +172,8 @@ enum vm_variant {
 enum client_state {
 	CLIENT_READY,
 	CLIENT_SSR,
-	CLIENT_DISCONNECTING
+	CLIENT_DISCONNECTING,
+	CLIENT_SUSPEND
 };
 
 static const char * const mvm_states[] = {
@@ -179,7 +181,7 @@ static const char * const mvm_states[] = {
 	[MVM_ONLINE] = "ONLINE",
 	[MVM_CRASHED] = "CRASHED",
 	[MVM_RESTARTING] = "RESTARTING",
-	[MVM_SLEEP] = "SLEEP",
+	[MVM_SUSPEND] = "SUSPEND",
 };
 
 struct input_fifo {
@@ -2273,13 +2275,20 @@ static int mvm_pm_notify(struct notifier_block *notifier,
 			container_of(notifier, struct mvm_device,
 			pm_notifier);
 	int ret = 0;
+	struct mvm_client *mvm_cli;
 	switch (mode) {
 	case PM_SUSPEND_PREPARE:
 		if (mvm_dev->resume_frm_pwr_collapse ) {
-			if (mvm_dev->vm_variant == PVM_ONLY || mvm_dev->vm_variant == TELEVM) {//for PVM and TELEVM, send core collapse control message to mvm
+			if (mvm_dev->vm_variant == PVM_ONLY || mvm_dev->vm_variant == TELEVM) {
 				mvm_dev->resume_frm_pwr_collapse = false;
+				mvm_dev->state = MVM_SUSPEND;
+				send_mvm_state_to_user(mvm_dev);
 				reinit_completion(&mvm_dev->mvm_wfi_irq_recvd);
 				ret =  send_pwr_collpase_ctrl_msg(mvm_dev, 1);
+				list_for_each_entry(mvm_cli, &mvm_dev->client_list, list) {
+					mvm_cli->state = CLIENT_SUSPEND;
+					dev_dbg(mvm_dev->dev, "disable mvm write clients at suspend  %d\n",mvm_cli->client_id);
+				}
 			}
 		}
 		break;
@@ -2292,25 +2301,18 @@ static int mvm_pm_notify(struct notifier_block *notifier,
 static int wait_for_mvmss_wfi_interrupt(struct mvm_device *mvm_dev)
 {
 	int is_suspend = 0;
-	if (mvm_dev->incoming_msgs == mvm_dev->outgoing_results) {
-		is_suspend = wait_for_completion_interruptible_timeout(
-			&mvm_dev->mvm_wfi_irq_recvd,
-			msecs_to_jiffies(TIMEOUT_MS));
-		if (is_suspend == 0) {//if wfi interrupt not recieved,dont suspend
+	is_suspend = wait_for_completion_interruptible_timeout(
+		&mvm_dev->mvm_wfi_irq_recvd,
+		msecs_to_jiffies(WFI_TIMEOUT_MS));
+	if (is_suspend == 0) {//if wfi interrupt not recieved,dont suspend
 			mvm_dev->resume_frm_pwr_collapse = true;
 			enable_wfi_int(mvm_dev, false);
 			dev_err(mvm_dev->dev, "Timed out waiting for mvm core collapse\n");
 			is_suspend = -EBUSY;
-		}
-		else {
-			is_suspend = 0;
-		}
 	}
 	else {
-		is_suspend = -EBUSY;
-		dev_err(mvm_dev->dev, "E21 has pending message for verification,can't suspend now\n");
+		is_suspend = 0;
 	}
-
 	return is_suspend;
 }
 
@@ -2332,6 +2334,12 @@ static int mvm_suspend(struct device *dev)
 			collapse_mvm_core(mvm_dev);
 			disable_gcc_clocks(mvm_dev);
 			dev_dbg(mvm_dev->dev, "MVM subsystem in power collapse mode\n");
+		}
+		if (is_suspend)
+		{
+			reinit_completion(&mvm_dev->mvm_wfi_irq_recvd);
+			mvm_dev->resume_frm_pwr_collapse = true;
+			enable_wfi_int(mvm_dev, false);
 		}
 		break;
 	case TELEVM:
@@ -2359,13 +2367,18 @@ static int mvm_suspend(struct device *dev)
 				is_suspend = 0;
 			}
 		}
+		if (is_suspend)
+		{
+			reinit_completion(&mvm_dev->mvm_wfi_irq_recvd);
+			mvm_dev->resume_frm_pwr_collapse = true;
+			enable_wfi_int(mvm_dev, false);
+		}
 		break;
 	default:
 		break;
 	}
 
 	mutex_unlock(&mvm_dev->mvm_csr_lock);
-	mvm_dev->state = MVM_SLEEP;
 	return is_suspend;
 }
 
@@ -2374,6 +2387,7 @@ static int mvm_resume(struct device *dev)
 	struct mvm_device *mvm_dev = dev_get_drvdata(dev);
 	gh_dbl_flags_t dbl_mask = MVM_DO_RESUME_DBL_MASK;
 	int is_resume = 0, ret = 0;
+	struct mvm_client *mvm_cli;
 
 	mvm_dev->resume_frm_pwr_collapse = true;
 	switch (mvm_dev->vm_variant) {
@@ -2413,6 +2427,12 @@ static int mvm_resume(struct device *dev)
 		break;
 	}
 
+	list_for_each_entry(mvm_cli, &mvm_dev->client_list, list) {
+		mvm_cli->state = CLIENT_READY;
+		dev_dbg(mvm_dev->dev, "mvm is restoring and enable clients for mvm %d\n",mvm_cli->client_id);
+	}
+	mvm_dev->state = MVM_ONLINE;
+	send_mvm_state_to_user(mvm_dev);
 	return is_resume;
 }
 
