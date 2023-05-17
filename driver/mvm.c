@@ -2615,7 +2615,7 @@ static int mvm_probe(struct platform_device *pdev)
 
 		ret = mvm_load_fw(mvm_dev);
 		if (ret)
-			goto load_fw_err;
+			goto doorbell_fail;
 	}
 
 	if (mvm_dev->vm_variant == PVM_ONLY || mvm_dev->vm_variant == TELEVM)
@@ -2623,13 +2623,6 @@ static int mvm_probe(struct platform_device *pdev)
 
 	return 0;
 
-load_fw_err:
-	if (mvm_dev->vm_variant == HOSTVM || mvm_dev->vm_variant == PVM_ONLY) {
-		clk_disable_unprepare(mvm_dev->cnoc_s_ahb_clk);
-		clk_disable_unprepare(mvm_dev->xo);
-		clk_disable_unprepare(mvm_dev->snoc_m_axi_clk);
-		clk_disable_unprepare(mvm_dev->sysnoc_mvmss_clk);
-	}
 doorbell_fail:
 	if (mvm_dev->vm_variant == HOSTVM) {
 		hyp_unassign_mem_reclaim(mvm_dev, mvm_dev->ring_buff_dma, mvm_dev->mvm_ring_buff_shm_label,
