@@ -31,6 +31,8 @@
 #include <soc/qcom/secure_buffer.h>
 #include <linux/gunyah/gh_rm_drv.h>
 #include <linux/qcom-iommu-util.h>
+#include <linux/gunyah/gh_dbl.h>
+#include <linux/suspend.h>
 
 #define SIG_MVM_STATE           SIGRTMAX
 #define DDR_FIFO_COUNT			2
@@ -133,7 +135,16 @@ each of the actual P0 and P1 buffer starts */
 #define MAX_LOG_BUFFER_SIZE		0x1800
 #define AC_VM_HLOS                      3
 #define AC_VM_GUEST_OS                  45
-#define MVM_IO_LABEL			0x33
+#define APSS_SHARED_IPC_INTERRUPT_OFFSET	0xC
+#define DBL_MASK			0x1
+#define MVM_SHUTDOWN_DBL_MASK		0x1
+#define MVM_LOAD_FW_DBL_MASK		0x2
+#define MVM_INIT_FIFOS_DBL_MASK		0x3
+#define MVM_DO_SUSPEND_DBL_MASK		0x4
+#define MVM_DO_RESUME_DBL_MASK		0x5
+#define MVM_SUSPEND_DONE_DBL_MASK	0x6
+#define MVM_RESUME_DONE_DBL_MASK	0x7
+
 /**
  * enum mvm_state - state of mvm subsystem
  * @MVM_OFFLINE: MVM firmware is not loaded/authenticated yet.
@@ -155,6 +166,12 @@ enum vm_variant {
 	PVM_ONLY = 1,
 	HOSTVM,
 	TELEVM,
+};
+
+enum client_state {
+	CLIENT_READY,
+	CLIENT_SSR,
+	CLIENT_DISCONNECTING
 };
 
 static const char * const mvm_states[] = {
@@ -207,10 +224,12 @@ struct mvm_client {
 	unsigned int timeout_ms;
 	struct mvm_device *mvm_dev;
 	struct list_head list;
-	bool client_ready;
+	enum client_state state;
 	struct output_buffer *out_buff;
 	enum mvm_log_policy log_policy;
 	struct task_struct *task;
+	unsigned int msgs_sent;
+	unsigned int results_recvd;
 };
 
 struct mvm_device {
@@ -244,6 +263,8 @@ struct mvm_device {
 	struct completion p1_fifo_slot_available;
 	struct completion mvm_wfi_irq_recvd;
 	struct completion mvm_dump_collection_done;
+	struct completion mvm_suspend_done;
+	struct completion mvm_resume_done;
 	struct kobject *kobj;
 	struct kobj_attribute attr;
 	struct dentry *dir;
@@ -270,8 +291,20 @@ struct mvm_device {
 	struct iommu_domain *domain;
 	enum vm_variant vm_variant;
 	uint32_t iomem_gunyah_label;
+	uint32_t mvm_ring_buff_shm_label;
+	uint32_t mvm_dump_buff_shm_label;
+	uint32_t mvm_log_buff_shm_label;
 	gh_memparcel_handle_t mvmss_mem_handle;
 	gh_memparcel_handle_t apss_mem_handle;
+	gh_memparcel_handle_t ring_buff_mem_handle;
+	gh_memparcel_handle_t dump_buff_mem_handle;
+	gh_memparcel_handle_t log_buff_mem_handle;
+	void *televm_tx_dbl;
+	void *televm_rx_dbl;
+	void *hostvm_tx_dbl;
+	void *hostvm_rx_dbl;
+	const struct firmware *fw;
+	struct notifier_block pm_notifier;
 };
 
 static int enable_gcc_clocks(struct mvm_device *mvm_dev);
@@ -440,7 +473,7 @@ static int send_ctrl_msg_to_mvm(struct mvm_control *mvm_ctrl, struct mvm_device 
 	memcpy(in_fifo_addr + 1, mvm_ctrl, sizeof(struct mvm_control));
 	mvm_dev->ring_buff->in_fifo[0].head = (mvm_dev->ring_buff->in_fifo[0].head + 1) % mvm_dev->ring_buff->in_fifo[0].size;
 	writel_relaxed(mvm_dev->ring_buff->in_fifo[0].head, mvm_dev->mvm_base + MVMSS_CSR_INPUT_RING0_HEAD_PTR_OFFSET);
-	writel_relaxed(IRQ_APSS1, mvm_dev->apss_shared_base);
+	writel_relaxed(IRQ_APSS1, mvm_dev->apss_shared_base + APSS_SHARED_IPC_INTERRUPT_OFFSET);
 	return 0;
 }
 
@@ -776,6 +809,17 @@ static void process_control_message(struct mvm_control *mvm_ctrl_recv, struct mv
 	kfree(mvm_ctrl_send);
 }
 
+static void mvm_client_remove(struct mvm_device *mvm_dev,struct mvm_client *mvm_cli)
+{
+	mutex_lock(&mvm_dev->mvm_cli_lock);
+	clear_bit(mvm_cli->client_id - 1, mvm_dev->client_id_bitmap);
+	list_del(&mvm_cli->list);
+	mutex_unlock(&mvm_dev->mvm_cli_lock);
+	mvm_cli->mvm_dev = NULL;
+	kfree(mvm_cli->out_buff);
+	kfree(mvm_cli);
+}
+
 static bool drain_out_fifo(struct mvm_device *mvm_dev, unsigned int fifo_index, unsigned int count)
 {
 	struct mvm_client *mvm_cli;
@@ -819,19 +863,32 @@ static bool drain_out_fifo(struct mvm_device *mvm_dev, unsigned int fifo_index, 
 			list_for_each_entry(mvm_cli, &mvm_dev->client_list, list) {
 				if (mvm_cli->client_id == client_id) {
 					match = true;
-					full = fifo_full(mvm_cli->out_buff->head, mvm_cli->out_buff->size,
-									mvm_cli->out_buff->tail);
-					if (!full) {
-						memcpy(&mvm_cli->out_buff->out_msg[mvm_cli->out_buff->head],
-						&mvm_dev->ring_buff->out_fifo[fifo_index].base[
-						mvm_dev->ring_buff->out_fifo[fifo_index].tail],
-						sizeof(struct output_msg));
-						mvm_cli->out_buff->head =
-							(mvm_cli->out_buff->head+1) % (mvm_cli->out_buff->size);
-						mvm_cli->out_buff->count++;
+					if(mvm_cli->state == CLIENT_DISCONNECTING){
+						mvm_cli->results_recvd++;
+						if(mvm_cli->results_recvd == mvm_cli->msgs_sent){
+							dev_dbg(mvm_dev->dev,"received last pending message for disconnected client, removing client\n");
+							mvm_client_remove(mvm_dev,mvm_cli);
+						}
 						mvm_dev->outgoing_results++;
 						out_buff_written = true;
 						break;
+					}
+					else{
+						full = fifo_full(mvm_cli->out_buff->head, mvm_cli->out_buff->size,
+										mvm_cli->out_buff->tail);
+						if (!full) {
+							memcpy(&mvm_cli->out_buff->out_msg[mvm_cli->out_buff->head],
+							&mvm_dev->ring_buff->out_fifo[fifo_index].base[
+							mvm_dev->ring_buff->out_fifo[fifo_index].tail],
+							sizeof(struct output_msg));
+							mvm_cli->out_buff->head =
+								(mvm_cli->out_buff->head+1) % (mvm_cli->out_buff->size);
+							mvm_cli->out_buff->count++;
+							mvm_cli->results_recvd++;
+							mvm_dev->outgoing_results++;
+							out_buff_written = true;
+							break;
+						}
 					}
 				}
 			}
@@ -982,7 +1039,7 @@ static int mvm_open(struct inode *inode, struct file *filp)
 	set_bit(i, mvm_dev->client_id_bitmap);
 	mvm_cli->client_id = i+1;
 	mvm_cli->task = get_current();
-	mvm_cli->client_ready = true;
+	mvm_cli->state = CLIENT_READY;
 	list_add_tail(&mvm_cli->list, &mvm_dev->client_list);
 	mutex_unlock(&mvm_dev->mvm_cli_lock);
 
@@ -1004,15 +1061,12 @@ static int mvm_release(struct inode *inode, struct file *filp)
 	struct mvm_device, mvm_cdev);
 	struct mvm_client *mvm_cli = filp->private_data;
 
-	mutex_lock(&mvm_dev->mvm_cli_lock);
-	clear_bit(mvm_cli->client_id - 1, mvm_dev->client_id_bitmap);
-	list_del(&mvm_cli->list);
-	mutex_unlock(&mvm_dev->mvm_cli_lock);
-	mvm_cli->mvm_dev = NULL;
-	kfree(mvm_cli->out_buff);
-	kfree(mvm_cli);
-	complete_all(&mvm_dev->p0_fifo_slot_available);
-	complete_all(&mvm_dev->p1_fifo_slot_available);
+	mvm_cli->state = CLIENT_DISCONNECTING;
+	if(mvm_cli->msgs_sent == mvm_cli->results_recvd)
+	{
+		dev_dbg(mvm_dev->dev, "client disconnected with no pending messages, removing immediately\n");
+		mvm_client_remove(mvm_dev,mvm_cli);
+	}
 	return 0;
 }
 
@@ -1035,7 +1089,7 @@ static long mvm_ioctl(struct file *filp, unsigned int cmd, unsigned long arg)
 		break;
 
 	case READY_AFTER_SSR:
-		mvm_cli->client_ready= true;
+		mvm_cli->state = CLIENT_READY;
 		mvm_cli->out_buff->head = 0;
 		mvm_cli->out_buff->tail = 0;
 		break;
@@ -1059,7 +1113,7 @@ static ssize_t mvm_write(
 	unsigned int no_of_msgs_written = 0;
 	unsigned int count;
 
-	if (!mvm_cli->client_ready)
+	if (!(mvm_cli->state == CLIENT_READY))
 		goto ret;
 
 	mutex_lock(&mvm_dev->in_fifo_lock);
@@ -1131,6 +1185,7 @@ push_to_input_ring:
 					% mvm_dev->ring_buff->in_fifo[fifo_index].size;
 				no_of_msgs_written++;
 				mvm_dev->incoming_msgs++;
+				mvm_cli->msgs_sent++;
 				if (fifo_index == 0)
 					writel_relaxed(mvm_dev->ring_buff->in_fifo[0].head,
 					mvm_dev->mvm_base + MVMSS_CSR_INPUT_RING0_HEAD_PTR_OFFSET);
@@ -1149,7 +1204,7 @@ ret:
 	mutex_unlock(&mvm_dev->in_fifo_lock);
 
 	if (no_of_msgs_written > 0)
-		writel_relaxed(IRQ_APSS1, mvm_dev->apss_shared_base);
+		writel_relaxed(IRQ_APSS1, mvm_dev->apss_shared_base + APSS_SHARED_IPC_INTERRUPT_OFFSET);
 	return (no_of_msgs_written * sizeof(struct input_msg));
 }
 
@@ -1245,6 +1300,7 @@ static irqreturn_t mvm_wfi_irq_handler(int irq, void *dev_id)
 	complete(&mvm_dev->mvm_wfi_irq_recvd);
 	return IRQ_HANDLED;
 }
+
 static void initialise_fifos(struct mvm_device *mvm_dev)
 {
 	uint32_t infifo_size, outfifo_size;
@@ -1309,18 +1365,242 @@ static void initialise_fifos(struct mvm_device *mvm_dev)
 
 	writel_relaxed(MVM_INIT_DONE_COOKIE,
 				mvm_dev->mvm_base + MVMSS_CSR_APSS_MVM_SCRATCH_PAD1);
+	writel_relaxed(MVM_DUMP_BUFF_IOVA,
+				mvm_dev->mvm_base + MVMSS_CSR_APSS_MVM_SCRATCH_PAD0);
+	/*Send an interrupt to MVM to indicate MVM_Init done */
+	writel_relaxed(IRQ_APSS0, mvm_dev->apss_shared_base + APSS_SHARED_IPC_INTERRUPT_OFFSET);
+	mvm_dev->state = MVM_ONLINE;
+	dev_info(mvm_dev->dev, "The current state of MVM is ONLINE\n");
+	send_mvm_state_to_user(mvm_dev);
 }
 
-static int mvm_io_assign_mem_gunyah(struct mvm_device *mvm_dev)
+static int mvm_televm_map_shared_mem(struct mvm_device *mvm_dev, char *compat, uint32_t shm_label)
+{
+	struct device_node *np = NULL, *shm_np;
+	struct resource res;
+	uint32_t label;
+	int ret = 0;
+
+	while ((np = of_find_compatible_node(np, NULL, compat))) {
+		ret = of_property_read_u32(np, "qcom,label", &label);
+		if (ret) {
+			of_node_put(np);
+			continue;
+		}
+		if (label == shm_label) {
+			break;
+		}
+		of_node_put(np);
+	}
+
+	if (!np) {
+		ret = -EINVAL;
+		goto err;
+	}
+
+	shm_np = of_parse_phandle(np, "memory-region", 0);
+	if (!shm_np) {
+		dev_err(mvm_dev->dev, "can't parse mvm-shm node for ring buffers\n");
+		ret = -EINVAL;
+		goto put_np;
+	}
+
+	ret = of_address_to_resource(shm_np, 0, &res);
+	if (ret) {
+		dev_err(mvm_dev->dev, "of_address_to_resource of ring buffers failed\n");
+		ret = -EINVAL;
+		goto put_shm_np;
+	}
+
+	if (label == mvm_dev->mvm_ring_buff_shm_label) {
+		mvm_dev->ring_buff = devm_ioremap_wc(mvm_dev->dev, res.start, resource_size(&res));
+		if (IS_ERR(mvm_dev->ring_buff)) {
+			ret = -ENOMEM;
+			dev_err(mvm_dev->dev, "ioremap of ring buffers failed\n");
+		}
+	} else if (label == mvm_dev->mvm_dump_buff_shm_label) {
+		mvm_dev->dump_buff = devm_ioremap_wc(mvm_dev->dev, res.start, resource_size(&res));
+		if (IS_ERR(mvm_dev->dump_buff)) {
+			ret = -ENOMEM;
+			dev_err(mvm_dev->dev, "ioremap of dump buffers failed\n");
+			goto ioremap_dump_buff_fail;
+		}
+	} else if (label == mvm_dev->mvm_log_buff_shm_label) {
+		mvm_dev->log_buff = devm_ioremap_wc(mvm_dev->dev, res.start, resource_size(&res));
+		if (IS_ERR(mvm_dev->log_buff)) {
+			ret = -ENOMEM;
+			dev_err(mvm_dev->dev, "ioremap of log buffers failed\n");
+			goto ioremap_log_buff_fail;
+		}
+	}
+
+	goto put_shm_np;
+
+ioremap_log_buff_fail:
+	devm_iounmap(mvm_dev->dev, mvm_dev->dump_buff);
+ioremap_dump_buff_fail:
+	devm_iounmap(mvm_dev->dev, mvm_dev->ring_buff);
+put_shm_np:
+	of_node_put(shm_np);
+put_np:
+	of_node_put(np);
+err:
+	return ret;
+}
+
+static void hyp_unassign_mem_reclaim(struct mvm_device *mvm_dev, dma_addr_t dma_addr, uint32_t label,
+				     uint32_t size, gh_memparcel_handle_t handle) {
+	int srcVMperm[1] = {PERM_READ | PERM_WRITE};
+	int srcVM[1] = {AC_VM_HLOS};
+	int destVM[2] = {AC_VM_HLOS, AC_VM_GUEST_OS};
+
+	gh_rm_mem_reclaim(handle, 0);
+	hyp_assign_phys(dma_addr, size, destVM, 2, srcVM, srcVMperm, 1);
+}
+
+static int hyp_assign_mem_share(struct mvm_device *mvm_dev, struct gh_acl_desc *mvm_acl_desc,
+ 				struct gh_sgl_desc *mvm_sgl_desc, dma_addr_t dma_addr,
+				uint32_t size, uint32_t label, gh_memparcel_handle_t handle)
+{
+	int srcVMperm[1] = {PERM_READ | PERM_WRITE};
+	int destVMperm[2] = {PERM_READ | PERM_WRITE, PERM_READ | PERM_WRITE};
+	int srcVM[1] = {AC_VM_HLOS};
+	int destVM[2] = {AC_VM_HLOS, AC_VM_GUEST_OS};
+	int ret = 0;
+
+        mvm_sgl_desc->n_sgl_entries = 1;
+        mvm_sgl_desc->sgl_entries[0].ipa_base = dma_addr;
+        mvm_sgl_desc->sgl_entries[0].size = size;
+
+        ret = hyp_assign_phys(dma_addr, size, srcVM, 1, destVM, destVMperm, 2);
+        if (ret) {
+                dev_err(mvm_dev->dev, "Couldnt hyp_assign ring buffers from hostvm to televm\n");
+                goto ret;
+        }
+
+        ret = gh_rm_mem_share(GH_RM_MEM_TYPE_NORMAL, 0, label, mvm_acl_desc, mvm_sgl_desc,
+				NULL, &handle);
+
+        if (ret) {
+                dev_err(mvm_dev->dev, "mem_share of ring buffers from hostvm to televm failed\n");
+                goto mem_share_fail;
+        }
+
+	goto ret;
+
+mem_share_fail:
+	hyp_assign_phys(dma_addr, size, destVM, 2, srcVM, srcVMperm, 1);
+ret:
+	return ret;
+
+}
+
+static int mvm_hostvm_mem_share(struct mvm_device *mvm_dev)
+{
+	struct gh_acl_desc *mvm_acl_desc;
+	struct gh_sgl_desc *mvm_sgl_desc;
+	int srcVMperm[1] = {PERM_READ | PERM_WRITE};
+	int srcVM[1] = {AC_VM_HLOS};
+	int destVM[2] = {AC_VM_HLOS, AC_VM_GUEST_OS};
+	int ret = 0;
+
+	mvm_dev->ring_buff_mem_handle = 0;
+	mvm_dev->dump_buff_mem_handle = 0;
+	mvm_dev->log_buff_mem_handle = 0;
+
+	mvm_acl_desc = kzalloc(offsetof(struct gh_acl_desc, acl_entries[2]), GFP_KERNEL);
+	if (!mvm_acl_desc) {
+		ret = -ENOMEM;
+		goto acl_alloc_fail;
+	}
+
+	mvm_sgl_desc = kzalloc(offsetof(struct gh_sgl_desc, sgl_entries[1]), GFP_KERNEL);
+	if (!mvm_sgl_desc) {
+		ret = -ENOMEM;
+		goto sgl_alloc_fail;
+	}
+
+        mvm_acl_desc->n_acl_entries = 2;
+        mvm_acl_desc->acl_entries[0].vmid = AC_VM_HLOS;
+        mvm_acl_desc->acl_entries[0].perms = GH_RM_ACL_R | GH_RM_ACL_W;
+        mvm_acl_desc->acl_entries[1].vmid = AC_VM_GUEST_OS;
+        mvm_acl_desc->acl_entries[1].perms = GH_RM_ACL_R | GH_RM_ACL_W;
+
+        /* Share ring buffers from hostvm to televm */
+	ret = hyp_assign_mem_share(mvm_dev, mvm_acl_desc, mvm_sgl_desc,
+				   mvm_dev->ring_buff_dma,
+				   round_up(sizeof(struct ring_buffers), PAGE_SIZE),
+				   mvm_dev->mvm_ring_buff_shm_label,
+				   mvm_dev->ring_buff_mem_handle);
+	if (ret)
+		goto free_mem;
+
+	/* Share dump buffers from hostvm to televm */
+	ret = hyp_assign_mem_share(mvm_dev, mvm_acl_desc, mvm_sgl_desc,
+				   mvm_dev->mvm_dump_dma,
+				   round_up(sizeof(struct mvm_crashdump_buffer), PAGE_SIZE),
+				   mvm_dev->mvm_dump_buff_shm_label,
+				   mvm_dev->dump_buff_mem_handle);
+	if (ret)
+		goto mem_share_dump_buff_fail;
+
+	/* Share log buffer from hostvm to televm */
+	ret = hyp_assign_mem_share(mvm_dev, mvm_acl_desc, mvm_sgl_desc,
+				   mvm_dev->mvmlog_buff_dma,
+				   round_up(sizeof(struct mvmlog_buffers), PAGE_SIZE),
+				   mvm_dev->mvm_log_buff_shm_label,
+				   mvm_dev->log_buff_mem_handle);
+	if (ret)
+		goto mem_share_log_buff_fail;
+	else
+		goto free_mem;
+
+
+mem_share_log_buff_fail:
+	gh_rm_mem_reclaim(mvm_dev->dump_buff_mem_handle,0);
+	hyp_assign_phys(mvm_dev->mvm_dump_dma, round_up(sizeof(struct mvm_crashdump_buffer), PAGE_SIZE),
+				destVM, 2, srcVM, srcVMperm, 1);
+mem_share_dump_buff_fail:
+	gh_rm_mem_reclaim(mvm_dev->ring_buff_mem_handle, 0);
+	hyp_assign_phys(mvm_dev->ring_buff_dma, round_up(sizeof(struct ring_buffers), PAGE_SIZE),
+					destVM, 2, srcVM, srcVMperm, 1);
+free_mem:
+	kfree(mvm_sgl_desc);
+sgl_alloc_fail:
+	kfree(mvm_acl_desc);
+acl_alloc_fail:
+	return ret;
+}
+
+static int mvm_hostvm_io_lend(struct mvm_device *mvm_dev)
 {
 	int ret = 0;
 	struct gh_acl_desc *mvm_acl_desc;
 	struct gh_sgl_desc *mvm_sgl_desc;
+	struct device_node *node;
+
 	mvm_dev->mvmss_mem_handle = 0;
 	mvm_dev->apss_mem_handle = 0;
+        node = mvm_dev->dev->of_node;
+
+	ret = of_property_read_u32(node, "qcom,iomem-gunyah-label", &mvm_dev->iomem_gunyah_label);
+	if (ret) {
+		dev_err(mvm_dev->dev, "qcom,iomem-gunyah-label not defined\n");
+		ret = -EINVAL;
+		goto ret;
+	}
 
 	mvm_acl_desc = kzalloc(offsetof(struct gh_acl_desc, acl_entries[2]), GFP_KERNEL);
+	if (!mvm_acl_desc) {
+		ret = -ENOMEM;
+		goto ret;
+	}
+
 	mvm_sgl_desc = kzalloc(offsetof(struct gh_sgl_desc, sgl_entries[1]), GFP_KERNEL);
+	if (!mvm_sgl_desc) {
+		ret = -ENOMEM;
+		goto sgl_alloc_fail;
+	}
 
 	mvm_acl_desc->n_acl_entries = 1;
 	mvm_acl_desc->acl_entries[0].vmid = AC_VM_GUEST_OS;
@@ -1330,11 +1610,12 @@ static int mvm_io_assign_mem_gunyah(struct mvm_device *mvm_dev)
 	mvm_sgl_desc->sgl_entries[0].ipa_base = MVMSS_REG_BASE;
 	mvm_sgl_desc->sgl_entries[0].size = MVMSS_LEND_SIZE;
 
+	/*Lend mvm address space from hostvm to televm */
 	ret = gh_rm_mem_lend(GH_RM_MEM_TYPE_IO, 0, mvm_dev->iomem_gunyah_label,
 			mvm_acl_desc, mvm_sgl_desc, NULL, &mvm_dev->mvmss_mem_handle);
 	if (ret) {
 		dev_err(mvm_dev->dev, "gh_rm_mem_lend for mvm address space failed\n");
-		goto error;
+		goto free_mem;
 	}
 
 	mvm_acl_desc->n_acl_entries = 2;
@@ -1346,15 +1627,23 @@ static int mvm_io_assign_mem_gunyah(struct mvm_device *mvm_dev)
 	mvm_sgl_desc->n_sgl_entries = 1;
 	mvm_sgl_desc->sgl_entries[0].ipa_base = APSS_SHARED_BASE_START;
 	mvm_sgl_desc->sgl_entries[0].size = APSS_SHARED_BASE_END;
+
+	/*Share apss shared base address space between hostvm and televm */
 	ret = gh_rm_mem_share(GH_RM_MEM_TYPE_IO, 0, mvm_dev->iomem_gunyah_label,
-			mvm_acl_desc, mvm_sgl_desc, NULL, &mvm_dev->apss_mem_handle);
+		mvm_acl_desc, mvm_sgl_desc, NULL, &mvm_dev->apss_mem_handle);
 	if (ret) {
 		dev_err(mvm_dev->dev, "gh_rm_mem_share for apps shared base failed\n");
-        }
+		goto mem_share_err;
+	}
+	goto free_mem;
 
-error:
+mem_share_err:
+	gh_rm_mem_reclaim(mvm_dev->mvmss_mem_handle, 0);
+free_mem:
 	kfree(mvm_sgl_desc);
+sgl_alloc_fail:
 	kfree(mvm_acl_desc);
+ret:
 	return ret;
 }
 
@@ -1378,20 +1667,9 @@ static int ioremap_resources(struct platform_device *pdev)
 							APSS_SHARED_BASE_END);
 	if (IS_ERR(mvm_dev->apss_shared_base)) {
 		dev_err(mvm_dev->dev, "ioremap of apss_shared_basefailed\n");
+		devm_iounmap(mvm_dev->dev, mvm_dev->mvm_base);
 		ret = -ENOMEM;
-		goto err;
 	}
-
-	if(mvm_dev->vm_variant == HOSTVM) {
-		ret = of_property_read_u32(node, "qcom,iomem-gunyah-label", &mvm_dev->iomem_gunyah_label);
-		if (ret) {
-			dev_err(mvm_dev->dev, "qcom,iomem-gunyah-label not defined\n");
-			ret = -EINVAL;
-			goto err;
-		}
-		ret = mvm_io_assign_mem_gunyah(mvm_dev);
-	}
-
 
 err:
 	return ret;
@@ -1399,38 +1677,26 @@ err:
 
 static int mvm_load_fw(struct mvm_device *mvm_dev)
 {
-	const struct firmware *fw;
-	char fw_name[32];
-	void *virt;
 	int ret = 0;
 
-	mvm_dev->mvm_fw = dma_alloc_coherent(mvm_dev->dev, MVM_FW_SIZE,
-						&mvm_dev->mvm_fw_dma, GFP_KERNEL);
-	if (!mvm_dev->mvm_fw) {
-		dev_err(mvm_dev->dev,
-			"dma_alloc_coherent of the firmware memory failed %d\n");
-		ret = -ENOMEM;
-		goto fw_dma_mem_fail;
-	}
-
-	scnprintf(fw_name, ARRAY_SIZE(fw_name), "mvm_ecc.mdt");
-	ret = request_firmware(&fw, fw_name, mvm_dev->dev);
+	ret = enable_gcc_clocks(mvm_dev);
 	if (ret) {
-		dev_err(mvm_dev->dev, "request_firmware for mvm failed\n");
-		goto release_fw_dma_mem;
+		dev_err(mvm_dev->dev, "Failed to turn on gcc clocks\n");
+		goto ret;
 	}
 
-	virt = mvm_dev->mvm_fw;
-	if (!virt) {
-		dev_err(mvm_dev->dev, "Failed to remap firmware memory\n");
-		goto out_release_firmware;
-
+	ret = enable_mvm_gdsc(mvm_dev, true);
+	if (ret) {
+		dev_err(mvm_dev->dev, "Failed to turn on mvm gdsc\n");
+		goto gdsc_err;
 	}
+
+	mvm_dev->resume_frm_pwr_collapse = true;
 
 	update_marker("M - Loading MVM firmware");
 
-	ret = qcom_mdt_load(mvm_dev->dev, fw, fw_name, MVM_PROC_ID,
-			    virt, mvm_dev->mvm_fw_dma, MVM_FW_SIZE, NULL);
+	ret = qcom_mdt_load(mvm_dev->dev, mvm_dev->fw, "mvm_ecc.mdt", MVM_PROC_ID,
+			    mvm_dev->mvm_fw, mvm_dev->mvm_fw_dma, MVM_FW_SIZE, NULL);
 	if (ret) {
 		dev_err(mvm_dev->dev, "Failed to load mvm firmware\n");
 		goto out_release_firmware;
@@ -1451,23 +1717,170 @@ static int mvm_load_fw(struct mvm_device *mvm_dev)
 	 */
 
 	ret = qcom_pil_info_store("mvm", mvm_dev->mvm_fw_dma, MVM_FW_SIZE);
-	if (ret)
+	if (ret) {
 		dev_err(mvm_dev->dev, "Couldnt store MVM PIL info in IMEM\n");
+		goto out_release_firmware;
+	}
 
-#ifdef KEEP_FW_IN_DDR
-	goto success;
-#else
-	goto release_fw_dma_mem;
-#endif
+	if (mvm_dev->vm_variant == HOSTVM) {
+		if (mvm_dev->state == MVM_OFFLINE)
+			mvm_dev->state = MVM_ONLINE;
+		else if (mvm_dev->state == MVM_RESTARTING) {
+			gh_dbl_flags_t dbl_mask = MVM_INIT_FIFOS_DBL_MASK;
+			ret = gh_dbl_send(mvm_dev->hostvm_tx_dbl, &dbl_mask, 0);
+			if (ret) {
+				dev_err(mvm_dev->dev, "Failed to send MVM_INIT_FIFOS_DBL to televm %d\n", ret);
+				goto ret;
+			}
+			dev_dbg(mvm_dev->dev, "Sent MVM_INIT_FIFOS_DBL to televm\n");
+			mvm_dev->state = MVM_ONLINE;
+		}
+	}
+
+	goto ret;
 
 out_release_firmware:
-	release_firmware(fw);
+	release_firmware(mvm_dev->fw);
+gdsc_err:
+	clk_disable_unprepare(mvm_dev->cnoc_s_ahb_clk);
+	clk_disable_unprepare(mvm_dev->xo);
+	clk_disable_unprepare(mvm_dev->snoc_m_axi_clk);
+	clk_disable_unprepare(mvm_dev->sysnoc_mvmss_clk);
+ret:
+	return ret;
+}
 
-release_fw_dma_mem:
-	dma_free_coherent(mvm_dev->dev, MVM_FW_SIZE, mvm_dev->mvm_fw, mvm_dev->mvm_fw_dma);
+static void disable_gcc_clocks(struct mvm_device *mvm_dev)
+{
+	clk_disable_unprepare(mvm_dev->snoc_m_axi_clk);
+	clk_disable_unprepare(mvm_dev->cnoc_s_ahb_clk);
+	clk_disable_unprepare(mvm_dev->sysnoc_mvmss_clk);
+}
 
-fw_dma_mem_fail:
-success:
+static int send_pwr_collpase_ctrl_msg(struct mvm_device *mvm_dev, bool pwr_collapse) {
+	struct mvm_control *mvm_ctrl;
+	int ret = 0;
+	mvm_ctrl = kzalloc(sizeof(struct mvm_control), GFP_KERNEL);
+	mvm_ctrl->type = MVM_POWER;
+	mvm_ctrl->mvm_ctrl_msg.power.enter_pwr_collapse = pwr_collapse;
+	ret = send_ctrl_msg_to_mvm(mvm_ctrl, mvm_dev);
+	kfree(mvm_ctrl);
+
+	return ret;
+}
+
+static void mvm_hostvm_rx_dbl_cb(int irq, void *data)
+{
+	gh_dbl_flags_t dbl_mask = DBL_MASK;
+	struct mvm_device *mvm_dev;
+	int ret;
+
+	mvm_dev = data;
+	ret = gh_dbl_read_and_clean(mvm_dev->hostvm_rx_dbl, &dbl_mask, GH_DBL_NONBLOCK);
+	if(ret){
+		dev_err(mvm_dev->dev, "Error reading from doorbell\n");
+	}
+	dev_dbg(mvm_dev->dev, "Received mvm_hostvm_rx_dbl_cb with mask %x\n", dbl_mask);
+
+	if (dbl_mask == MVM_SHUTDOWN_DBL_MASK) {
+		mvm_dev->state = MVM_CRASHED;
+		ret = qcom_scm_pas_shutdown(MVM_PROC_ID);
+		if (ret) {
+			dev_err(mvm_dev->dev, "Error sending shutdown request to MVM\n");
+			return;
+		}
+	} else if (dbl_mask == MVM_LOAD_FW_DBL_MASK) {
+		mvm_dev->state = MVM_RESTARTING;
+		mvm_load_fw(mvm_dev);
+	} else if (dbl_mask == MVM_DO_SUSPEND_DBL_MASK) {
+		collapse_mvm_core(mvm_dev);
+		disable_gcc_clocks(mvm_dev);
+		dbl_mask = MVM_SUSPEND_DONE_DBL_MASK;
+		ret = gh_dbl_send(mvm_dev->hostvm_tx_dbl, &dbl_mask, 0);
+		if (ret)
+			dev_err(mvm_dev->dev, "Couldnt send MVM_SUSPEND_DONE_DBL to televm\n");
+	} else if (dbl_mask == MVM_DO_RESUME_DBL_MASK) {
+		int is_resume;
+		is_resume = enable_gcc_clocks(mvm_dev);
+	        if (is_resume)
+	                dev_err(mvm_dev->dev, "Failed to turn on gcc clocks\n");
+		else {
+			restore_mvm_core(mvm_dev);
+			dbl_mask = MVM_RESUME_DONE_DBL_MASK;
+			ret = gh_dbl_send(mvm_dev->hostvm_tx_dbl, &dbl_mask, 0);
+			if (ret)
+				dev_err(mvm_dev->dev, "Couldnt send MVM_RESUME_DONE_DBL to televm\n");
+		}
+	}
+	ret = gh_dbl_reset(mvm_dev->hostvm_rx_dbl, GH_DBL_NONBLOCK);
+	if(ret){
+		dev_err(mvm_dev->dev, "Error resetting rx doorbell\n");
+	}
+}
+
+static void mvm_televm_rx_dbl_cb(int irq, void *data)
+{
+	gh_dbl_flags_t dbl_mask = DBL_MASK;
+	struct mvm_device *mvm_dev =data;
+	int ret;
+
+	mvm_dev = data;
+	ret = gh_dbl_read_and_clean(mvm_dev->televm_rx_dbl, &dbl_mask, GH_DBL_NONBLOCK);
+	if(ret){
+		dev_err(mvm_dev->dev, "Error reading from doorbell\n");
+	}
+	dev_dbg(mvm_dev->dev, "Received mvm_televm_rx_dbl_cb with mask %x\n", dbl_mask);
+
+	if (dbl_mask == MVM_INIT_FIFOS_DBL_MASK) {
+		initialise_fifos(mvm_dev);
+	} else if (dbl_mask == MVM_SUSPEND_DONE_DBL_MASK) {
+		dev_info(mvm_dev->dev, "televm suspend completed\n");
+		complete(&mvm_dev->mvm_suspend_done);
+	} else if (dbl_mask == MVM_RESUME_DONE_DBL_MASK) {
+		dev_info(mvm_dev->dev, "televm resume completed\n");
+		complete(&mvm_dev->mvm_resume_done);
+		enable_wfi_int(mvm_dev, false);
+		ret =  send_pwr_collpase_ctrl_msg(mvm_dev, 0);
+	}
+
+	ret = gh_dbl_reset(mvm_dev->televm_rx_dbl, GH_DBL_NONBLOCK);
+	if(ret){
+		dev_err(mvm_dev->dev, "Error resetting rx doorbell\n");
+	}
+}
+
+static int mvm_doorbell_register(struct mvm_device *mvm_dev)
+{
+	int ret = 0;
+
+	if (mvm_dev->vm_variant == TELEVM) {
+		mvm_dev->televm_tx_dbl = gh_dbl_tx_register(GH_DBL_MVM_TELEVM_TX_LABEL);
+		if (IS_ERR_OR_NULL(mvm_dev->televm_tx_dbl)) {
+			ret = PTR_ERR(mvm_dev->televm_tx_dbl);
+			dev_err(mvm_dev->dev, "Failed to register televm_tx_dbl %d\n", ret);
+		}
+
+		mvm_dev->televm_rx_dbl = gh_dbl_rx_register(GH_DBL_MVM_TELEVM_RX_LABEL, mvm_televm_rx_dbl_cb, mvm_dev);
+		if (IS_ERR_OR_NULL(mvm_dev->televm_rx_dbl)) {
+			ret = PTR_ERR(mvm_dev->televm_rx_dbl);
+			gh_dbl_tx_unregister(mvm_dev->televm_tx_dbl);
+			dev_err(mvm_dev->dev, "Failed to register televm_rx_dbl %d\n", ret);
+		}
+	} else {
+		mvm_dev->hostvm_tx_dbl = gh_dbl_tx_register(GH_DBL_MVM_TELEVM_RX_LABEL);
+		if (IS_ERR_OR_NULL(mvm_dev->hostvm_tx_dbl)) {
+			ret = PTR_ERR(mvm_dev->hostvm_tx_dbl);
+			dev_err(mvm_dev->dev, "Failed to register hostvm_tx_dbl %d\n", ret);
+		}
+
+		mvm_dev->hostvm_rx_dbl = gh_dbl_rx_register(GH_DBL_MVM_TELEVM_TX_LABEL, mvm_hostvm_rx_dbl_cb, mvm_dev);
+		if (IS_ERR_OR_NULL(mvm_dev->hostvm_rx_dbl)) {
+			ret = PTR_ERR(mvm_dev->hostvm_rx_dbl);
+			gh_dbl_tx_unregister(mvm_dev->hostvm_tx_dbl);
+			dev_err(mvm_dev->dev, "Failed to register hostvm_rx_dbl %d\n",ret);
+		}
+	}
+
 	return ret;
 }
 
@@ -1477,15 +1890,26 @@ static void trigger_ssr_work_hdlr(struct work_struct *work)
 	int ret = 0;
 	struct mvm_client *mvm_cli;
 	bool p0_fifo_has_results =0 ,p1_fifo_has_results =0;
+	gh_dbl_flags_t dbl_mask;
 
-	ret = qcom_scm_pas_shutdown(MVM_PROC_ID);
-	if (ret) {
-		dev_err(mvm_dev->dev, "Error sending shutdown request to MVM\n");
-		return;
+	if (mvm_dev->vm_variant == TELEVM) {
+		dbl_mask = MVM_SHUTDOWN_DBL_MASK;
+		ret = gh_dbl_send(mvm_dev->televm_tx_dbl, &dbl_mask, 0);
+		if (ret) {
+			dev_err(mvm_dev->dev, "failed to send MVM_SHUTDOWN_DBL to hostvm %d\n", ret);
+			return;
+		}
+		dev_dbg(mvm_dev->dev, "Sent MVM_SHUTDOWN_DBL to hostvm\n");
+	} else if (mvm_dev->vm_variant == PVM_ONLY) {
+		ret = qcom_scm_pas_shutdown(MVM_PROC_ID);
+		if (ret) {
+			dev_err(mvm_dev->dev, "Error sending shutdown request to MVM\n");
+			return;
+		}
 	}
 
 	list_for_each_entry(mvm_cli, &mvm_dev->client_list, list) {
-		mvm_cli->client_ready= false;
+		mvm_cli->state = CLIENT_SSR;
 		dev_dbg(mvm_dev->dev, "Set client flag %d\n",mvm_cli->client_id);
 	}
 	reinit_completion(&mvm_dev->mvm_dump_collection_done);
@@ -1494,7 +1918,7 @@ static void trigger_ssr_work_hdlr(struct work_struct *work)
 	p1_fifo_has_results = out_fifo_get_results(mvm_dev, 1);
 	mutex_unlock(&mvm_dev->out_fifo_lock);
 	if (p0_fifo_has_results || p1_fifo_has_results)
-		dev_info(mvm_dev->dev, "mvm outfifo has results and draining out fifo started\n");
+		dev_dbg(mvm_dev->dev, "mvm outfifo has results and draining out fifo started\n");
 	wake_up_interruptible_poll(&mvm_dev->mvm_waitqueue, POLLIN | POLLPRI);
 	send_mvm_state_to_user(mvm_dev);//Send crash signal to clients
 
@@ -1508,13 +1932,23 @@ static void trigger_ssr_work_hdlr(struct work_struct *work)
 	wake_up_interruptible_poll(&mvm_dev->ssr_poll_wait, POLLIN | POLLPRI);
 
 	dev_info(mvm_dev->dev, "MVM subsystem is restarting after SSR\n");
-	enable_gcc_clocks(mvm_dev);
-	enable_mvm_gdsc(mvm_dev, true);
 
 	mvm_dev->state = MVM_RESTARTING;
 	send_mvm_state_to_user(mvm_dev);
 
-	mvm_load_fw(mvm_dev);
+	if (mvm_dev->vm_variant == TELEVM) {
+		dbl_mask = MVM_LOAD_FW_DBL_MASK;
+		ret = gh_dbl_send(mvm_dev->televm_tx_dbl, &dbl_mask, 0);
+		if (ret) {
+			dev_err(mvm_dev->dev, "failed to send MVM_LOAD_FW_DBL to hostvm %d\n", ret);
+			return;
+		}
+		dev_dbg(mvm_dev->dev, "Sent MVM_LOAD_FW_DBL to hostvm\n");
+	} else if (mvm_dev->vm_variant == PVM_ONLY)
+		mvm_load_fw(mvm_dev);
+
+	if (mvm_dev->vm_variant == PVM_ONLY)
+		initialise_fifos(mvm_dev);
 
 	return;
 }
@@ -1636,7 +2070,7 @@ static int mvm_iommu_init(struct mvm_device *mvm_dev)
 
 	ret = iommu_attach_device(mvm_dev->domain, mvm_dev->dev);
 	if (ret) {
-		dev_err(mvm_dev->dev, "failed to attach device ret = %d\n", ret);
+		dev_err(mvm_dev->dev, "failed to attach iommu device ret = %d\n", ret);
 		goto attach_device_fail;
 	}
 
@@ -1713,8 +2147,21 @@ static int mvm_dma_mem_alloc(struct mvm_device *mvm_dev)
 		goto log_buff_dma_mem_alloc_fail;
 	}
 
+	mvm_dev->mvm_fw = dma_alloc_coherent(mvm_dev->dev, MVM_FW_SIZE,
+						&mvm_dev->mvm_fw_dma, GFP_KERNEL);
+	if (!mvm_dev->mvm_fw) {
+		dev_err(mvm_dev->dev,
+				"dma_alloc_coherent of the firmware memory failed %d\n");
+		ret = -ENOMEM;
+		goto fw_mem_alloc_fail;
+	} else
+		printk("Allocated memmory during probe\n");
+
 	return 0;
 
+fw_mem_alloc_fail:
+	dma_free_coherent(mvm_dev->dev, round_up(sizeof(struct mvmlog_buffers), PAGE_SIZE),
+					mvm_dev->log_buff, mvm_dev->mvmlog_buff_dma);
 log_buff_dma_mem_alloc_fail:
 	dma_free_coherent(mvm_dev->dev, round_up(sizeof(struct mvm_crashdump_buffer), PAGE_SIZE),
 					mvm_dev->dump_buff, mvm_dev->mvm_dump_dma);
@@ -1722,6 +2169,38 @@ dump_dma_mem_alloc_fail:
 	dma_free_coherent(mvm_dev->dev, round_up(sizeof(struct ring_buffers), PAGE_SIZE),
 					mvm_dev->ring_buff, mvm_dev->ring_buff_dma);
 ring_buff_dma_mem_alloc_fail:
+	return ret;
+}
+
+static int read_shm_labels(struct mvm_device *mvm_dev)
+{
+	int ret = 0;
+	struct device_node *node;
+
+        node = mvm_dev->dev->of_node;
+
+	ret = of_property_read_u32(node, "qcom,mvm-ring-buff-shm-label", &mvm_dev->mvm_ring_buff_shm_label);
+	if (ret) {
+		dev_err(mvm_dev->dev, "qcom,mvm-ring-buff-shm-label not defined\n");
+		ret = -EINVAL;
+		goto ret;
+	}
+
+	ret = of_property_read_u32(node, "qcom,mvm-dump-buff-shm-label", &mvm_dev->mvm_dump_buff_shm_label);
+	if (ret) {
+		dev_err(mvm_dev->dev, "qcom,mvm-dump-buff-shm-label not defined\n");
+		ret = -EINVAL;
+		goto ret;
+	}
+
+	ret = of_property_read_u32(node, "qcom,mvm-log-buff-shm-label", &mvm_dev->mvm_log_buff_shm_label);
+	if (ret) {
+		dev_err(mvm_dev->dev, "qcom,mvm-log-buff-shm-label not defined\n");
+		ret = -EINVAL;
+		goto ret;
+	}
+
+ret:
 	return ret;
 }
 
@@ -1734,13 +2213,6 @@ static const struct file_operations mvm_fileops = {
 	.read = mvm_read,
 	.owner = THIS_MODULE,
 };
-
-static void disable_gcc_clocks(struct mvm_device *mvm_dev)
-{
-	clk_disable_unprepare(mvm_dev->snoc_m_axi_clk);
-	clk_disable_unprepare(mvm_dev->cnoc_s_ahb_clk);
-	clk_disable_unprepare(mvm_dev->sysnoc_mvmss_clk);
-}
 
 static int enable_gcc_clocks(struct mvm_device *mvm_dev)
 {
@@ -1793,49 +2265,105 @@ unprepare_xo:
 	return ret;
 }
 
-static int mvm_suspend(struct device *dev)
+
+static int mvm_pm_notify(struct notifier_block *notifier,
+			     unsigned long mode, void *_unused)
 {
-	struct mvm_device *mvm_dev = dev_get_drvdata(dev);
-	int is_suspend = 0;
-
-	mutex_lock(&mvm_dev->mvm_csr_lock);
-
-	if (mvm_dev->incoming_msgs == mvm_dev->outgoing_results) {
-		/* prepare power collapse control message */
-		struct mvm_control *mvm_ctrl;
-		reinit_completion(&mvm_dev->mvm_wfi_irq_recvd);
-		mvm_ctrl = kzalloc(sizeof(struct mvm_control), GFP_KERNEL);
-		mvm_ctrl->type = MVM_POWER;
-		mvm_ctrl->mvm_ctrl_msg.power.enter_pwr_collapse = 1;
-		is_suspend= send_ctrl_msg_to_mvm(mvm_ctrl, mvm_dev);
-		kfree(mvm_ctrl);
-		if (is_suspend) {
-			is_suspend = -EBUSY;
-		} else {
-			mvm_dev->resume_frm_pwr_collapse = false;
-			is_suspend = wait_for_completion_interruptible_timeout(
-				&mvm_dev->mvm_wfi_irq_recvd,
-				msecs_to_jiffies(TIMEOUT_MS));
-			if (is_suspend == 0) {
-				mvm_dev->resume_frm_pwr_collapse = true;
-				enable_wfi_int(mvm_dev, false);
-				disable_irq(mvm_dev->wfi_irq);
-				dev_err(mvm_dev->dev, "Timed out waiting for mvm core collapse\n");
-				is_suspend = -EBUSY;
-			} else {
-				collapse_mvm_core(mvm_dev);
-				disable_gcc_clocks(mvm_dev);
-				is_suspend = 0;
-				dev_dbg(mvm_dev->dev, "MVM subsystem in power collapse mode\n");
+	struct mvm_device *mvm_dev =
+			container_of(notifier, struct mvm_device,
+			pm_notifier);
+	int ret = 0;
+	switch (mode) {
+	case PM_SUSPEND_PREPARE:
+		if (mvm_dev->resume_frm_pwr_collapse ) {
+			if (mvm_dev->vm_variant == PVM_ONLY || mvm_dev->vm_variant == TELEVM) {//for PVM and TELEVM, send core collapse control message to mvm
+				mvm_dev->resume_frm_pwr_collapse = false;
+				reinit_completion(&mvm_dev->mvm_wfi_irq_recvd);
+				ret =  send_pwr_collpase_ctrl_msg(mvm_dev, 1);
 			}
 		}
-		/*TODO
-		 * 1. Vote for power collapse to aop
-		 */
-	} else {
+		break;
+	default:
+		break;
+	}
+	return 0;
+}
+
+static int wait_for_mvmss_wfi_interrupt(struct mvm_device *mvm_dev)
+{
+	int is_suspend = 0;
+	if (mvm_dev->incoming_msgs == mvm_dev->outgoing_results) {
+		is_suspend = wait_for_completion_interruptible_timeout(
+			&mvm_dev->mvm_wfi_irq_recvd,
+			msecs_to_jiffies(TIMEOUT_MS));
+		if (is_suspend == 0) {//if wfi interrupt not recieved,dont suspend
+			mvm_dev->resume_frm_pwr_collapse = true;
+			enable_wfi_int(mvm_dev, false);
+			dev_err(mvm_dev->dev, "Timed out waiting for mvm core collapse\n");
+			is_suspend = -EBUSY;
+		}
+		else {
+			is_suspend = 0;
+		}
+	}
+	else {
 		is_suspend = -EBUSY;
 		dev_err(mvm_dev->dev, "E21 has pending message for verification,can't suspend now\n");
 	}
+
+	return is_suspend;
+}
+
+static int mvm_suspend(struct device *dev)
+{
+	struct mvm_device *mvm_dev = dev_get_drvdata(dev);
+	int is_suspend = 0, ret = 0;
+
+	mutex_lock(&mvm_dev->mvm_csr_lock);
+
+	switch (mvm_dev->vm_variant) {
+	case HOSTVM:
+		is_suspend = 0;//return 0 since hostvm no need take any actions for suspend
+		break;
+	case PVM_ONLY:
+		dev_info(mvm_dev->dev, "pvm suspend recieved \n");
+		is_suspend = wait_for_mvmss_wfi_interrupt(mvm_dev);
+		if (is_suspend == 0) {
+			collapse_mvm_core(mvm_dev);
+			disable_gcc_clocks(mvm_dev);
+			dev_dbg(mvm_dev->dev, "MVM subsystem in power collapse mode\n");
+		}
+		break;
+	case TELEVM:
+		is_suspend = wait_for_mvmss_wfi_interrupt(mvm_dev);
+		if (is_suspend == 0) {
+			gh_dbl_flags_t dbl_mask = MVM_DO_SUSPEND_DBL_MASK;
+			dbl_mask = MVM_DO_SUSPEND_DBL_MASK;
+			dev_info(mvm_dev->dev, "televm suspend recieved \n");
+			reinit_completion(&mvm_dev->mvm_suspend_done);
+			ret = gh_dbl_send(mvm_dev->televm_tx_dbl, &dbl_mask, 0);
+			if (ret) {
+				dev_err(mvm_dev->dev,
+					"Failed to send MVM_SUSPEND_DBL to hostvm %d\n", ret);
+			}
+			else
+				dev_info(mvm_dev->dev, "televm sent MVM_SUSPEND_DBL to suspend \n");
+			is_suspend = wait_for_completion_interruptible_timeout(
+						&mvm_dev->mvm_suspend_done,
+						msecs_to_jiffies(TIMEOUT_MS));
+			if (is_suspend == 0) {
+				dev_err(mvm_dev->dev, "tele Timed out waiting for mvm core collapse\n");
+				is_suspend = -EBUSY;
+			} else {
+				dev_info(mvm_dev->dev, "MVM subsystem in power collapse mode\n");
+				is_suspend = 0;
+			}
+		}
+		break;
+	default:
+		break;
+	}
+
 	mutex_unlock(&mvm_dev->mvm_csr_lock);
 	mvm_dev->state = MVM_SLEEP;
 	return is_suspend;
@@ -1844,27 +2372,47 @@ static int mvm_suspend(struct device *dev)
 static int mvm_resume(struct device *dev)
 {
 	struct mvm_device *mvm_dev = dev_get_drvdata(dev);
-	struct mvm_control *mvm_ctrl;
-	int is_resume = 0;
+	gh_dbl_flags_t dbl_mask = MVM_DO_RESUME_DBL_MASK;
+	int is_resume = 0, ret = 0;
 
 	mvm_dev->resume_frm_pwr_collapse = true;
-	/*TODO
-	 * 1.vote for aop
-	 */
-	is_resume = enable_gcc_clocks(mvm_dev);
-	if (is_resume) {
-		dev_err(mvm_dev->dev, "Failed to turn on gcc clocks\n");
-		is_resume = -EHOSTDOWN;
-	} else {
-		restore_mvm_core(mvm_dev);
-		mvm_ctrl = kzalloc(sizeof(struct mvm_control), GFP_KERNEL);
-		mvm_ctrl->type = MVM_POWER;
-		mvm_ctrl->mvm_ctrl_msg.power.enter_pwr_collapse = 0;
-		is_resume = send_ctrl_msg_to_mvm(mvm_ctrl, mvm_dev);
-		kfree(mvm_ctrl);
+	switch (mvm_dev->vm_variant) {
+	case HOSTVM:
+		is_resume = 0;//return 0 since hostvm no need take any actions for resume
+		break;
+	case PVM_ONLY:
+		dev_info(mvm_dev->dev, "pvm resume recieved \n");
+		is_resume = enable_gcc_clocks(mvm_dev);
+		if (is_resume)
+			dev_err(mvm_dev->dev, "Failed to turn on gcc clocks\n");
+		else {
+			restore_mvm_core(mvm_dev);
+			is_resume = 0;
+		}
 		enable_wfi_int(mvm_dev, false);
+		ret =  send_pwr_collpase_ctrl_msg(mvm_dev, 0);
+		break;
+	case TELEVM:
+		reinit_completion(&mvm_dev->mvm_resume_done);
+		ret = gh_dbl_send(mvm_dev->televm_tx_dbl, &dbl_mask, 0);
+		if (ret) {
+			dev_err(mvm_dev->dev,
+				"Failed to send MVM_RESUME_DBL to hostvm %d\n", ret);
+		}
+		is_resume = wait_for_completion_interruptible_timeout(
+					&mvm_dev->mvm_resume_done,
+					msecs_to_jiffies(TIMEOUT_MS));
+		if (is_resume == 0)
+			dev_err(mvm_dev->dev, "Couldnt restore mvm subsystem resume done wait failed\n");
+		else {
+			dev_info(mvm_dev->dev, "MVM subsystem in Restored\n");
+			is_resume =0;
+		}
+		break;
+	default:
+		break;
 	}
-	dev_dbg(mvm_dev->dev, "MVM subsystem in Restored\n");
+
 	return is_resume;
 }
 
@@ -1930,10 +2478,11 @@ static int mvm_probe(struct platform_device *pdev)
 		dev_err(mvm_dev->dev, "mvm sysfs initialisation failed\n");
 		goto sysfs_fail;
 	}
+
 	mvm_dev->state = MVM_OFFLINE;
 	dev_info(mvm_dev->dev, "The current state of MVM is OFFLINE\n");
 
-	if (mvm_dev->vm_variant == PVM_ONLY || mvm_dev->vm_variant == TELEVM) {
+	if (mvm_dev->vm_variant == PVM_ONLY || mvm_dev->vm_variant == HOSTVM) {
 		ret = mvm_dma_mem_alloc(mvm_dev);
 		if (ret)
 			goto dma_mem_fail;
@@ -1941,7 +2490,53 @@ static int mvm_probe(struct platform_device *pdev)
 		ret = mvm_iommu_init(mvm_dev);
 		if (ret)
 			goto iommu_init_fail;
+	}
 
+	if (mvm_dev->vm_variant == HOSTVM || mvm_dev->vm_variant == TELEVM) {
+		ret = read_shm_labels(mvm_dev);
+		if (ret) {
+			dev_err(mvm_dev->dev, "read_shm_labels failed\n");
+			goto shm_label_fail;
+		}
+
+		if(mvm_dev->vm_variant == HOSTVM) {
+			ret = mvm_hostvm_io_lend(mvm_dev);
+			if (ret) {
+				dev_err(mvm_dev->dev, "mvm_hostvm_io_lend failed\n");
+				goto shm_label_fail;
+			}
+
+			ret = mvm_hostvm_mem_share(mvm_dev);
+			if (ret) {
+				dev_err(mvm_dev->dev, "mvm_hostvm_mem_share failed\n");
+				goto hostvm_mem_share_fail;
+			}
+		} else if (mvm_dev->vm_variant == TELEVM) {
+			ret = mvm_televm_map_shared_mem(mvm_dev, "mvm-ring-buff-shm",
+							mvm_dev->mvm_ring_buff_shm_label);
+			if (ret) {
+				dev_err(mvm_dev->dev, "Couldnt map ring buffers from hostvm to televm\n");
+				ret = -ENOMEM;
+				goto shm_label_fail;
+			}
+
+			ret = mvm_televm_map_shared_mem(mvm_dev, "mvm-dump-buff-shm", mvm_dev->mvm_dump_buff_shm_label);
+			if (ret) {
+				dev_err(mvm_dev->dev, "Couldnt map ring buffers from hostvm to televm\n");
+				ret = -ENOMEM;
+				goto shm_label_fail;
+			}
+
+			ret = mvm_televm_map_shared_mem(mvm_dev, "mvm-log-buff-shm", mvm_dev->mvm_log_buff_shm_label);
+			if (ret) {
+				dev_err(mvm_dev->dev, "Couldnt map ring buffers from hostvm to televm\n");
+				ret = -ENOMEM;
+				goto shm_label_fail;
+			}
+		}
+	}
+
+	if (mvm_dev->vm_variant == PVM_ONLY || mvm_dev->vm_variant == TELEVM) {
 		ret = register_isrs(pdev);
 		if (ret) {
 			dev_err(mvm_dev->dev,
@@ -1962,6 +2557,8 @@ static int mvm_probe(struct platform_device *pdev)
 		init_completion(&mvm_dev->p1_fifo_slot_available);
 		init_completion(&mvm_dev->mvm_dump_collection_done);
 		init_completion(&mvm_dev->mvm_wfi_irq_recvd);
+		init_completion(&mvm_dev->mvm_suspend_done);
+		init_completion(&mvm_dev->mvm_resume_done);
 
 		INIT_LIST_HEAD(&mvm_dev->client_list);
 		init_waitqueue_head(&mvm_dev->mvm_waitqueue);
@@ -1973,60 +2570,87 @@ static int mvm_probe(struct platform_device *pdev)
 		bitmap_zero(mvm_dev->client_id_bitmap, MAX_CLIENT_COUNT);
 		mvm_dev->pending_dump_read = false;
 	}
+	if (mvm_dev->vm_variant == PVM_ONLY || mvm_dev->vm_variant == TELEVM) {
+		mvm_dev->pm_notifier.notifier_call = mvm_pm_notify;
+		ret = register_pm_notifier(&mvm_dev->pm_notifier);
+		if (ret)
+			goto pm_err;
+	}
 
+	if (mvm_dev->vm_variant == HOSTVM || mvm_dev->vm_variant == TELEVM) {
+		ret = mvm_doorbell_register(mvm_dev);
+		if (ret) {
+			dev_err(mvm_dev->dev, "mvm_doorbell_register failed\n");
+			goto doorbell_fail;
+		}
+	}
+	mvm_dev->resume_frm_pwr_collapse = true;
 	if (mvm_dev->vm_variant == PVM_ONLY || mvm_dev->vm_variant == HOSTVM) {
-		ret = enable_gcc_clocks(mvm_dev);
+
+		ret = request_firmware(&mvm_dev->fw, "mvm_ecc.mdt", mvm_dev->dev);
 		if (ret) {
-			dev_err(mvm_dev->dev, "Failed to turn on gcc clocks\n");
-			goto mutex_err;
+			dev_err(mvm_dev->dev, "request_firmware for mvm failed\n");
+			goto doorbell_fail;
 		}
 
-		ret = enable_mvm_gdsc(mvm_dev, true);
-		if (ret) {
-			dev_err(mvm_dev->dev, "Failed to turn on mvm gdsc\n");
-			goto gdsc_err;
-		}
-
-		mvm_dev->resume_frm_pwr_collapse = true;
 		ret = mvm_load_fw(mvm_dev);
 		if (ret)
-			goto gdsc_err;
+			goto load_fw_err;
 	}
 
-	if (mvm_dev->vm_variant == PVM_ONLY || mvm_dev->vm_variant == TELEVM) {
-		writel_relaxed(MVM_DUMP_BUFF_IOVA,
-			mvm_dev->mvm_base + MVMSS_CSR_APSS_MVM_SCRATCH_PAD0);
+	if (mvm_dev->vm_variant == PVM_ONLY || mvm_dev->vm_variant == TELEVM)
 		initialise_fifos(mvm_dev);
-		/*Send an interrupt to MVM to indicate MVM_Init done */
-		writel_relaxed(IRQ_APSS0, mvm_dev->apss_shared_base);
-		mvm_dev->state = MVM_ONLINE;
-		dev_info(mvm_dev->dev, "The current state of MVM is ONLINE\n");
-		send_mvm_state_to_user(mvm_dev);
-	}
+
 	return 0;
 
-gdsc_err:
-	clk_disable_unprepare(mvm_dev->cnoc_s_ahb_clk);
-	clk_disable_unprepare(mvm_dev->xo);
-	clk_disable_unprepare(mvm_dev->snoc_m_axi_clk);
-	clk_disable_unprepare(mvm_dev->sysnoc_mvmss_clk);
-mutex_err:
-	mutex_destroy(&mvm_dev->in_fifo_lock);
-	mutex_destroy(&mvm_dev->out_fifo_lock);
-	mutex_destroy(&mvm_dev->mvm_csr_lock);
-	mutex_destroy(&mvm_dev->mvm_cli_lock);
+load_fw_err:
+	if (mvm_dev->vm_variant == HOSTVM || mvm_dev->vm_variant == PVM_ONLY) {
+		clk_disable_unprepare(mvm_dev->cnoc_s_ahb_clk);
+		clk_disable_unprepare(mvm_dev->xo);
+		clk_disable_unprepare(mvm_dev->snoc_m_axi_clk);
+		clk_disable_unprepare(mvm_dev->sysnoc_mvmss_clk);
+	}
+doorbell_fail:
+	if (mvm_dev->vm_variant == HOSTVM) {
+		hyp_unassign_mem_reclaim(mvm_dev, mvm_dev->ring_buff_dma, mvm_dev->mvm_ring_buff_shm_label,
+				round_up(sizeof(struct ring_buffers), PAGE_SIZE), mvm_dev->ring_buff_mem_handle);
+		hyp_unassign_mem_reclaim(mvm_dev, mvm_dev->mvm_dump_dma, mvm_dev->mvm_dump_buff_shm_label,
+				round_up(sizeof(struct mvm_crashdump_buffer), PAGE_SIZE), mvm_dev->dump_buff_mem_handle);
+		hyp_unassign_mem_reclaim(mvm_dev, mvm_dev->mvmlog_buff_dma, mvm_dev->mvm_log_buff_shm_label,
+                                   round_up(sizeof(struct mvmlog_buffers), PAGE_SIZE), mvm_dev->log_buff_mem_handle);
+	} else if (mvm_dev->vm_variant == PVM_ONLY) {
+		mutex_destroy(&mvm_dev->in_fifo_lock);
+		mutex_destroy(&mvm_dev->out_fifo_lock);
+		mutex_destroy(&mvm_dev->mvm_csr_lock);
+		mutex_destroy(&mvm_dev->mvm_cli_lock);
+	}
+pm_err:
+	if(mvm_dev->vm_variant == PVM_ONLY || mvm_dev->vm_variant == TELEVM) {
+		unregister_pm_notifier(&mvm_dev->pm_notifier);
+	}
+hostvm_mem_share_fail:
+	if(mvm_dev->vm_variant == HOSTVM) {
+		gh_rm_mem_reclaim(mvm_dev->mvmss_mem_handle, 0);
+		gh_rm_mem_reclaim(mvm_dev->apss_mem_handle, 0);
+	}
 isrs_fail:
-	mvm_iommu_release(mvm_dev);
+	if (mvm_dev->vm_variant == TELEVM) {
+		devm_iounmap(mvm_dev->dev, mvm_dev->ring_buff);
+		devm_iounmap(mvm_dev->dev, mvm_dev->dump_buff);
+		devm_iounmap(mvm_dev->dev, mvm_dev->log_buff);
+	}
+shm_label_fail:
+	if (mvm_dev->vm_variant == PVM_ONLY || mvm_dev->vm_variant == HOSTVM)
+		mvm_iommu_release(mvm_dev);
 iommu_init_fail:
-	mvm_dma_mem_free(mvm_dev);
+	if (mvm_dev->vm_variant == PVM_ONLY || mvm_dev->vm_variant == HOSTVM)
+		mvm_dma_mem_free(mvm_dev);
 dma_mem_fail:
 	sysfs_remove_file(mvm_dev->kobj, &mvm_dev->attr.attr);
 	kobject_put(mvm_dev->kobj);
 sysfs_fail:
-	if (mvm_dev->vm_variant == HOSTVM) {
-		gh_rm_mem_reclaim(mvm_dev->mvmss_mem_handle, 0);
-		gh_rm_mem_reclaim(mvm_dev->apss_mem_handle, 0);
-	}
+	devm_iounmap(mvm_dev->dev, mvm_dev->mvm_base);
+	devm_iounmap(mvm_dev->dev, mvm_dev->apss_shared_base);
 ioremap_fail:
 	device_destroy(mvm_dev->mvm_class, mvm_dev->mvm_cdev_devid);
 device_fail:
@@ -2050,22 +2674,37 @@ static int mvm_remove(struct platform_device *pdev)
 		mutex_destroy(&mvm_dev->out_fifo_lock);
 		mutex_destroy(&mvm_dev->mvm_csr_lock);
 		mutex_destroy(&mvm_dev->mvm_cli_lock);
-		mvm_iommu_release(mvm_dev);
-		mvm_dma_mem_free(mvm_dev);
+	}
+
+        if (mvm_dev->vm_variant == HOSTVM) {
+                gh_rm_mem_reclaim(mvm_dev->mvmss_mem_handle, 0);
+                gh_rm_mem_reclaim(mvm_dev->apss_mem_handle, 0);
+                hyp_unassign_mem_reclaim(mvm_dev, mvm_dev->ring_buff_dma, mvm_dev->mvm_ring_buff_shm_label,
+                        round_up(sizeof(struct ring_buffers), PAGE_SIZE), mvm_dev->ring_buff_mem_handle);
+                hyp_unassign_mem_reclaim(mvm_dev, mvm_dev->mvm_dump_dma, mvm_dev->mvm_dump_buff_shm_label,
+                        round_up(sizeof(struct mvm_crashdump_buffer), PAGE_SIZE), mvm_dev->dump_buff_mem_handle);
+                hyp_unassign_mem_reclaim(mvm_dev, mvm_dev->mvmlog_buff_dma, mvm_dev->mvm_log_buff_shm_label,
+                        round_up(sizeof(struct mvmlog_buffers), PAGE_SIZE), mvm_dev->log_buff_mem_handle);
+		gh_dbl_tx_unregister(mvm_dev->hostvm_tx_dbl);
+		gh_dbl_rx_unregister(mvm_dev->hostvm_rx_dbl);
+        }
+
+	if (mvm_dev->vm_variant == TELEVM) {
+		gh_dbl_tx_unregister(mvm_dev->televm_tx_dbl);
+		gh_dbl_rx_unregister(mvm_dev->televm_rx_dbl);
 	}
 
 	if (mvm_dev->vm_variant == PVM_ONLY || mvm_dev->vm_variant == HOSTVM) {
+		mvm_iommu_release(mvm_dev);
+                mvm_dma_mem_free(mvm_dev);
 		clk_disable_unprepare(mvm_dev->cnoc_s_ahb_clk);
 		clk_disable_unprepare(mvm_dev->xo);
 		clk_disable_unprepare(mvm_dev->snoc_m_axi_clk);
 		clk_disable_unprepare(mvm_dev->sysnoc_mvmss_clk);
 	}
-
-	if (mvm_dev->vm_variant == HOSTVM) {
-		gh_rm_mem_reclaim(mvm_dev->mvmss_mem_handle, 0);
-		gh_rm_mem_reclaim(mvm_dev->apss_mem_handle, 0);
+	if(mvm_dev->vm_variant == PVM_ONLY || mvm_dev->vm_variant == TELEVM) {
+		unregister_pm_notifier(&mvm_dev->pm_notifier);
 	}
-
 	sysfs_remove_file(mvm_dev->kobj, &mvm_dev->attr.attr);
 	kobject_put(mvm_dev->kobj);
 	device_destroy(mvm_dev->mvm_class, mvm_dev->mvm_cdev_devid);
