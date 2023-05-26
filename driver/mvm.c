@@ -253,7 +253,6 @@ struct mvm_device {
 	struct device *dev;
 	struct class *mvm_class;
 	struct mutex mvm_cli_lock;
-	struct mutex mvm_csr_lock;
 	struct mutex in_fifo_lock;
 	struct mutex out_fifo_lock;
 	wait_queue_head_t mvm_waitqueue;
@@ -2321,8 +2320,6 @@ static int mvm_suspend(struct device *dev)
 	struct mvm_device *mvm_dev = dev_get_drvdata(dev);
 	int is_suspend = 0, ret = 0;
 
-	mutex_lock(&mvm_dev->mvm_csr_lock);
-
 	switch (mvm_dev->vm_variant) {
 	case HOSTVM:
 		is_suspend = 0;//return 0 since hostvm no need take any actions for suspend
@@ -2378,7 +2375,6 @@ static int mvm_suspend(struct device *dev)
 		break;
 	}
 
-	mutex_unlock(&mvm_dev->mvm_csr_lock);
 	return is_suspend;
 }
 
@@ -2426,13 +2422,14 @@ static int mvm_resume(struct device *dev)
 	default:
 		break;
 	}
-
-	list_for_each_entry(mvm_cli, &mvm_dev->client_list, list) {
-		mvm_cli->state = CLIENT_READY;
-		dev_dbg(mvm_dev->dev, "mvm is restoring and enable clients for mvm %d\n",mvm_cli->client_id);
+	if(mvm_dev->vm_variant == PVM_ONLY || mvm_dev->vm_variant == TELEVM) {
+		list_for_each_entry(mvm_cli, &mvm_dev->client_list, list) {
+			mvm_cli->state = CLIENT_READY;
+			dev_dbg(mvm_dev->dev, "mvm is restoring and enable clients for mvm %d\n",mvm_cli->client_id);
+		}
+		mvm_dev->state = MVM_ONLINE;
+		send_mvm_state_to_user(mvm_dev);
 	}
-	mvm_dev->state = MVM_ONLINE;
-	send_mvm_state_to_user(mvm_dev);
 	return is_resume;
 }
 
@@ -2569,7 +2566,6 @@ static int mvm_probe(struct platform_device *pdev)
 			goto isrs_fail;
 
 		mutex_init(&mvm_dev->mvm_cli_lock);
-		mutex_init(&mvm_dev->mvm_csr_lock);
 		mutex_init(&mvm_dev->in_fifo_lock);
 		mutex_init(&mvm_dev->out_fifo_lock);
 
@@ -2634,7 +2630,6 @@ doorbell_fail:
 	} else if (mvm_dev->vm_variant == PVM_ONLY) {
 		mutex_destroy(&mvm_dev->in_fifo_lock);
 		mutex_destroy(&mvm_dev->out_fifo_lock);
-		mutex_destroy(&mvm_dev->mvm_csr_lock);
 		mutex_destroy(&mvm_dev->mvm_cli_lock);
 	}
 pm_err:
@@ -2685,7 +2680,6 @@ static int mvm_remove(struct platform_device *pdev)
 	if (mvm_dev->vm_variant == PVM_ONLY || mvm_dev->vm_variant == TELEVM) {
 		mutex_destroy(&mvm_dev->in_fifo_lock);
 		mutex_destroy(&mvm_dev->out_fifo_lock);
-		mutex_destroy(&mvm_dev->mvm_csr_lock);
 		mutex_destroy(&mvm_dev->mvm_cli_lock);
 	}
 
