@@ -35,6 +35,7 @@
 #include <linux/suspend.h>
 #include <linux/kthread.h>
 #include <linux/timekeeping.h>
+#include <linux/moduleparam.h>
 
 #define MVM_NOTIFY_SIGNO		SIGRTMAX
 #define MVM_NOTIFY_VALUE_STATE		10
@@ -152,8 +153,10 @@ each of the actual P0 and P1 buffer starts */
 #define MAX_FREQ_PLAN			3
 #define MVM_STATS_TIMEOUT_MS		100
 #define MVM_INITIAL_CAPACITY 		100
+
 #define PKE_UTIL_UPPER_THRESH 		75
 #define PKE_UTIL_LOWER_THRESH 		25
+#define MVM_STATS_TIMER_DEFAULT_INTERVAL_MS	100
 /**
  * enum mvm_state - state of mvm subsystem
  * @MVM_OFFLINE: MVM firmware is not loaded/authenticated yet.
@@ -363,6 +366,7 @@ static const uint32_t mvm_rate[MAX_FREQ_PLAN][MAX_CURVES] = {
 
 static int enable_gcc_clocks(struct mvm_device *mvm_dev);
 int qcom_pil_info_store(const char *image, phys_addr_t base, size_t size);
+static int mvm_stats_timer_interval_ms = MVM_STATS_TIMER_DEFAULT_INTERVAL_MS;//set 100ms as default value
 
 static void send_mvm_state_to_user(struct mvm_device *mvm_dev)
 {
@@ -2704,7 +2708,7 @@ static void change_clk_freq_work_hdlr(struct work_struct *work)
 			mvm_dev->clk_time_elapsed = ktime_get();
 		}
 	}
-	mod_timer(&mvm_dev->mvm_stats_timer,jiffies + msecs_to_jiffies(MVM_STATS_TIMEOUT_MS));
+	mod_timer(&mvm_dev->mvm_stats_timer,jiffies + msecs_to_jiffies(mvm_stats_timer_interval_ms));
 }
 
 static void mvm_stats_monitor_timeout_handler(struct timer_list *t)
@@ -2757,7 +2761,7 @@ static int mvm_stats_init(struct mvm_device *mvm_dev)
 	mvm_dev->max_clk = NOMINAL;
 
 	timer_setup(&mvm_dev->mvm_stats_timer, mvm_stats_monitor_timeout_handler, 0);
-	mvm_dev->mvm_stats_timer.expires = jiffies + msecs_to_jiffies(MVM_STATS_TIMEOUT_MS);
+	mvm_dev->mvm_stats_timer.expires = jiffies + msecs_to_jiffies(mvm_stats_timer_interval_ms);
 	add_timer(&mvm_dev->mvm_stats_timer);
 
 	return 0;
@@ -3113,5 +3117,6 @@ static void __exit mvm_unregister(void)
 {
 	platform_driver_unregister(&mvm_driver);
 }
+module_param(mvm_stats_timer_interval_ms, int, 0644);
 module_exit(mvm_unregister);
 MODULE_LICENSE("GPL v2");

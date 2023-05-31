@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: GPL-2.0-only
-# Copyright (c) 2022 Qualcomm Innovation Center, Inc. All rights reserved.
+# Copyright (c) 2022-2023 Qualcomm Innovation Center, Inc. All rights reserved.
 
 [Unit]
 Description= Load mvm dlkm service
@@ -8,7 +8,7 @@ AssertPathExists=/lib/modules/
 [Service]
 Restart=on-failure
 RemainAfterExit=yes
-ExecStart=/bin/sh -c '/sbin/insmod /lib/modules/$(uname -r)/extra/mvm.ko'
+ExecStart=/bin/sh -c '/sbin/insmod /lib/modules/$(uname -r)/extra/mvm.ko mvm_stats_timer_interval_ms=100'
 ExecStop=/bin/sh -c '/sbin/rmmod mvm'
 
 [Install]
