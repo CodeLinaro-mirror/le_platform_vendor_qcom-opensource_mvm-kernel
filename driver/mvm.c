@@ -948,7 +948,7 @@ static int mvm_debugfs_init(struct mvm_device *mvm_dev)
 
 file_err:
 	ret = -ENOENT;
-	debugfs_remove(mvm_dev->dir);
+	debugfs_remove_recursive(mvm_dev->dir);
 ret:
 	return ret;
 }
@@ -3075,6 +3075,7 @@ static int mvm_remove(struct platform_device *pdev)
 		sysfs_remove_file(mvm_dev->kobj, &mvm_dev->mvm_capacity_attr.attr);
 		sysfs_remove_file(mvm_dev->kobj, &mvm_dev->mvm_max_clk_attr.attr);
 		sysfs_remove_file(mvm_dev->kobj, &mvm_dev->mvm_curr_clk_attr.attr);
+		debugfs_remove_recursive(mvm_dev->dir);
 	}
 	sysfs_remove_file(mvm_dev->kobj, &mvm_dev->mvm_state_attr.attr);
 	kobject_put(mvm_dev->kobj);
