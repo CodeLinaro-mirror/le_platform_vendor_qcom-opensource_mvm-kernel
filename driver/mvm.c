@@ -3008,10 +3008,12 @@ doorbell_fail:
 		mutex_destroy(&mvm_dev->out_fifo_lock);
 		mutex_destroy(&mvm_dev->mvm_cli_lock);
 	}
-pm_err:
 	if(mvm_dev->vm_variant == PVM_ONLY || mvm_dev->vm_variant == TELEVM) {
 		unregister_pm_notifier(&mvm_dev->pm_notifier);
 	}
+pm_err:
+	if (mvm_dev->vm_variant == PVM_ONLY || mvm_dev->vm_variant == TELEVM)
+		debugfs_remove_recursive(mvm_dev->dir);
 hostvm_mem_share_fail:
 	if(mvm_dev->vm_variant == HOSTVM) {
 		gh_rm_mem_reclaim(mvm_dev->mvmss_mem_handle, 0);
