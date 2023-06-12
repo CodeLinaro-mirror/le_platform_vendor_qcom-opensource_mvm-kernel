@@ -379,7 +379,7 @@ static void send_mvm_state_to_user(struct mvm_device *mvm_dev)
 
 	mutex_lock(&mvm_dev->mvm_cli_lock);
 	list_for_each_entry(mvm_cli, &mvm_dev->client_list, list) {
-		if (mvm_cli->task != NULL) {
+		if ((mvm_cli->task != NULL) && (mvm_cli->state != CLIENT_DISCONNECTING )) {
 			if(send_sig_info(MVM_NOTIFY_SIGNO, &info, mvm_cli->task) < 0)
 				dev_err(mvm_dev->dev, "Unable to send mvm state change signal to userspace\n");
 			dev_dbg(mvm_dev->dev, "Sent state change signal to client %d\n",mvm_cli->client_id);
@@ -2080,6 +2080,7 @@ static void trigger_ssr_work_hdlr(struct work_struct *work)
 	struct mvm_device *mvm_dev = container_of(work, struct mvm_device, trigger_ssr_work);
 	int ret = 0;
 	struct mvm_client *mvm_cli;
+	struct mvm_client *mvm_cli_temp;
 	bool p0_fifo_has_results =0 ,p1_fifo_has_results =0;
 	gh_dbl_flags_t dbl_mask;
 
@@ -2099,10 +2100,6 @@ static void trigger_ssr_work_hdlr(struct work_struct *work)
 		}
 	}
 
-	list_for_each_entry(mvm_cli, &mvm_dev->client_list, list) {
-		mvm_cli->state = CLIENT_SSR;
-		dev_dbg(mvm_dev->dev, "Set client flag %d\n",mvm_cli->client_id);
-	}
 	reinit_completion(&mvm_dev->mvm_dump_collection_done);
 	mutex_lock(&mvm_dev->out_fifo_lock);
 	p0_fifo_has_results = out_fifo_get_results(mvm_dev, 0);
@@ -2111,8 +2108,19 @@ static void trigger_ssr_work_hdlr(struct work_struct *work)
 	if (p0_fifo_has_results || p1_fifo_has_results)
 		dev_dbg(mvm_dev->dev, "mvm outfifo has results and draining out fifo started\n");
 	wake_up_interruptible_poll(&mvm_dev->mvm_waitqueue, POLLIN | POLLPRI);
-	send_mvm_state_to_user(mvm_dev);//Send crash signal to clients
 
+
+	list_for_each_entry_safe(mvm_cli, mvm_cli_temp, &mvm_dev->client_list, list) {
+		if (mvm_cli->state == CLIENT_DISCONNECTING ) {
+			mvm_client_remove(mvm_dev,mvm_cli);
+		}
+		else {
+			mvm_cli->state = CLIENT_SSR;
+			dev_dbg(mvm_dev->dev, "Set client flag %d\n",mvm_cli->client_id);
+		}
+	}
+
+	send_mvm_state_to_user(mvm_dev);//Send crash signal to clients
 	ret = wait_for_completion_interruptible_timeout(
 			&mvm_dev->mvm_dump_collection_done,
 			msecs_to_jiffies(MVM_DUMP_COLL_TIMEOUT_MS));
@@ -2121,12 +2129,10 @@ static void trigger_ssr_work_hdlr(struct work_struct *work)
 	}
 	mvm_dev->pending_dump_read = true;
 	wake_up_interruptible_poll(&mvm_dev->ssr_poll_wait, POLLIN | POLLPRI);
-
 	dev_info(mvm_dev->dev, "MVM subsystem is restarting after SSR\n");
 
 	mvm_dev->state = MVM_RESTARTING;
 	send_mvm_state_to_user(mvm_dev);
-
 	if (mvm_dev->vm_variant == TELEVM) {
 		dbl_mask = MVM_LOAD_FW_DBL_MASK;
 		ret = gh_dbl_send(mvm_dev->televm_tx_dbl, &dbl_mask, 0);
