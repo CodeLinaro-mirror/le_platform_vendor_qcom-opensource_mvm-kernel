@@ -375,6 +375,13 @@ static const uint32_t mvm_rate[MAX_FREQ_PLAN][MAX_CURVES] = {
 		{9551, 4955, 10706, 3291, 1663},
 		{14285, 7434, 16064, 4938, 2493}};
 
+// Static copies for crashscope to access these variables
+static struct mvm_crashdump_buffer *crashdump_buffer = NULL;
+__attribute__((used))
+static dma_addr_t crashdump_dma_addr = 0;
+__attribute__((used))
+static size_t crashdump_size = MVM_CRASH_DUMP_SIZE;
+
 static int enable_gcc_clocks(struct mvm_device *mvm_dev);
 int qcom_pil_info_store(const char *image, phys_addr_t base, size_t size);
 static int mvm_stats_timer_interval_ms = MVM_STATS_TIMER_DEFAULT_INTERVAL_MS;//set 300ms as default value
@@ -2392,6 +2399,9 @@ static int mvm_dma_mem_alloc(struct mvm_device *mvm_dev)
 		ret = -ENOMEM;
 		goto dump_dma_mem_alloc_fail;
 	}
+	// Static copies for crashscope to access these variables
+	crashdump_buffer = mvm_dev->dump_buff;
+	crashdump_dma_addr = mvm_dev->mvm_dump_dma;
 
 	mvm_dev->log_buff = dma_alloc_coherent(mvm_dev->dev, round_up(sizeof(struct mvmlog_buffers), PAGE_SIZE),
 								&mvm_dev->mvmlog_buff_dma, GFP_KERNEL);
