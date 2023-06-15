@@ -2529,6 +2529,7 @@ static int mvm_pm_notify(struct notifier_block *notifier,
 				mvm_dev->state = MVM_SUSPEND;
 				send_mvm_state_to_user(mvm_dev);
 				reinit_completion(&mvm_dev->mvm_wfi_irq_recvd);
+				del_timer(&mvm_dev->mvm_stats_timer);
 				ret =  send_pwr_collpase_ctrl_msg(mvm_dev, 1);
 				list_for_each_entry(mvm_cli, &mvm_dev->client_list, list) {
 					mvm_cli->state = CLIENT_SUSPEND;
@@ -2565,13 +2566,14 @@ static int mvm_suspend(struct device *dev)
 {
 	struct mvm_device *mvm_dev = dev_get_drvdata(dev);
 	int is_suspend = 0, ret = 0;
+	struct mvm_client *mvm_cli;
 
 	switch (mvm_dev->vm_variant) {
 	case HOSTVM:
 		is_suspend = 0;//return 0 since hostvm no need take any actions for suspend
 		break;
 	case PVM_ONLY:
-		dev_info(mvm_dev->dev, "pvm suspend recieved \n");
+		dev_info(mvm_dev->dev, "mvm_info:pvm suspend recieved \n");
 		is_suspend = wait_for_mvmss_wfi_interrupt(mvm_dev);
 		if (is_suspend == 0) {
 			collapse_mvm_core(mvm_dev);
@@ -2583,6 +2585,12 @@ static int mvm_suspend(struct device *dev)
 			reinit_completion(&mvm_dev->mvm_wfi_irq_recvd);
 			mvm_dev->resume_frm_pwr_collapse = true;
 			enable_wfi_int(mvm_dev, false);
+			list_for_each_entry(mvm_cli, &mvm_dev->client_list, list) { //if suspend is failed ,then keep client enabled
+				mvm_cli->state = CLIENT_READY;
+				dev_dbg(mvm_dev->dev, "mvm suspend failed : enable clients for mvm %d\n",mvm_cli->client_id);
+			}
+			add_timer(&mvm_dev->mvm_stats_timer);
+			mod_timer(&mvm_dev->mvm_stats_timer,jiffies + msecs_to_jiffies(mvm_stats_timer_interval_ms));
 		}
 		break;
 	case TELEVM:
@@ -2590,7 +2598,7 @@ static int mvm_suspend(struct device *dev)
 		if (is_suspend == 0) {
 			gh_dbl_flags_t dbl_mask = MVM_DO_SUSPEND_DBL_MASK;
 			dbl_mask = MVM_DO_SUSPEND_DBL_MASK;
-			dev_info(mvm_dev->dev, "televm suspend recieved \n");
+			dev_info(mvm_dev->dev, "mvm_info:televm suspend recieved \n");
 			reinit_completion(&mvm_dev->mvm_suspend_done);
 			ret = gh_dbl_send(mvm_dev->televm_tx_dbl, &dbl_mask, 0);
 			if (ret) {
@@ -2615,6 +2623,12 @@ static int mvm_suspend(struct device *dev)
 			reinit_completion(&mvm_dev->mvm_wfi_irq_recvd);
 			mvm_dev->resume_frm_pwr_collapse = true;
 			enable_wfi_int(mvm_dev, false);
+			list_for_each_entry(mvm_cli, &mvm_dev->client_list, list) { //if suspend is failed ,then keep client enabled
+				mvm_cli->state = CLIENT_READY;
+				dev_dbg(mvm_dev->dev, "mvm suspend failed : enable clients for mvm %d\n",mvm_cli->client_id);
+			}
+			add_timer(&mvm_dev->mvm_stats_timer);
+			mod_timer(&mvm_dev->mvm_stats_timer,jiffies + msecs_to_jiffies(mvm_stats_timer_interval_ms));
 		}
 		break;
 	default:
@@ -2675,6 +2689,11 @@ static int mvm_resume(struct device *dev)
 		}
 		mvm_dev->state = MVM_ONLINE;
 		send_mvm_state_to_user(mvm_dev);
+		mvm_dev->curr_clk = LOW_SVS;
+		mvm_dev->req_clk = LOW_SVS;
+		mvm_dev->prev_pke_time = 0;
+		add_timer(&mvm_dev->mvm_stats_timer);
+		mod_timer(&mvm_dev->mvm_stats_timer,jiffies + msecs_to_jiffies(mvm_stats_timer_interval_ms));
 	}
 	return is_resume;
 }
