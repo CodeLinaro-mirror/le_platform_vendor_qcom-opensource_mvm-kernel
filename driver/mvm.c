@@ -62,7 +62,9 @@
 
 #define MVMSS_REG_BASE				0x12000000
 #define MVMSS_REG_SIZE				0x30000
-#define MVMSS_LEND_SIZE				0x9000
+#define MVMSS_CSR_LEND_SIZE			0x9000
+#define MVM_CC_REG_BASE				0x12028000
+#define MVM_CC_LEND_SIZE			0x1000
 #define APSS_SHARED_BASE_START			0x17400000
 #define APSS_SHARED_BASE_END			0x1000
 #define MVMSS_CSR_INPUT_RING0_BASE_ADDR		0x00001000
@@ -146,10 +148,6 @@ each of the actual P0 and P1 buffer starts */
 #define MVM_SHUTDOWN_DBL_MASK		0x1
 #define MVM_LOAD_FW_DBL_MASK		0x2
 #define MVM_INIT_FIFOS_DBL_MASK		0x3
-#define MVM_DO_SUSPEND_DBL_MASK		0x4
-#define MVM_DO_RESUME_DBL_MASK		0x5
-#define MVM_SUSPEND_DONE_DBL_MASK	0x6
-#define MVM_RESUME_DONE_DBL_MASK	0x7
 #define MAX_CURVES			5
 #define MAX_FREQ_PLAN			3
 #define MVM_STATS_TIMEOUT_MS		100
@@ -337,7 +335,6 @@ struct mvm_device {
 	struct mvmlog_buffers *log_buff;
 	dma_addr_t mvm_fw_dma;
 	dma_addr_t mvm_dump_dma;
-	struct clk *xo;
 	struct clk *cnoc_s_ahb_clk;
 	struct clk *snoc_m_axi_clk;
 	struct clk *sysnoc_mvmss_clk;
@@ -1965,7 +1962,7 @@ static int mvm_hostvm_io_lend(struct mvm_device *mvm_dev)
 		goto ret;
 	}
 
-	mvm_sgl_desc = kzalloc(offsetof(struct gh_sgl_desc, sgl_entries[1]), GFP_KERNEL);
+	mvm_sgl_desc = kzalloc(offsetof(struct gh_sgl_desc, sgl_entries[2]), GFP_KERNEL);
 	if (!mvm_sgl_desc) {
 		ret = -ENOMEM;
 		goto sgl_alloc_fail;
@@ -1975,9 +1972,11 @@ static int mvm_hostvm_io_lend(struct mvm_device *mvm_dev)
 	mvm_acl_desc->acl_entries[0].vmid = mvm_dev->televm_vmid;
 	mvm_acl_desc->acl_entries[0].perms = GH_RM_ACL_R | GH_RM_ACL_W;
 
-	mvm_sgl_desc->n_sgl_entries = 1;
+	mvm_sgl_desc->n_sgl_entries = 2;
 	mvm_sgl_desc->sgl_entries[0].ipa_base = MVMSS_REG_BASE;
-	mvm_sgl_desc->sgl_entries[0].size = MVMSS_LEND_SIZE;
+	mvm_sgl_desc->sgl_entries[0].size = MVMSS_CSR_LEND_SIZE;
+	mvm_sgl_desc->sgl_entries[1].ipa_base = MVM_CC_REG_BASE;
+	mvm_sgl_desc->sgl_entries[1].size = MVM_CC_LEND_SIZE;
 
 	/*Lend mvm address space from hostvm to televm */
 	ret = gh_rm_mem_lend(GH_RM_MEM_TYPE_IO, 0, mvm_dev->iomem_gunyah_label,
@@ -2127,71 +2126,79 @@ static int mvm_load_fw(struct mvm_device *mvm_dev)
 {
 	int ret = 0;
 
-	ret = enable_gcc_clocks(mvm_dev);
-	if (ret) {
-		dev_err(mvm_dev->dev, "Failed to turn on gcc clocks\n");
-		goto ret;
-	}
+	if (mvm_dev->vm_variant == PVM_ONLY || mvm_dev->vm_variant == TELEVM) {
+		ret = enable_gcc_clocks(mvm_dev);
+		if (ret) {
+			dev_err(mvm_dev->dev, "Failed to turn on gcc clocks\n");
+			goto ret;
+		}
 
-	ret = enable_mvm_gdsc(mvm_dev, true);
-	if (ret) {
-		dev_err(mvm_dev->dev, "Failed to turn on mvm gdsc\n");
-		goto gdsc_err;
-	}
-
-	mvm_dev->resume_frm_pwr_collapse = true;
-
-	update_marker("M - Loading MVM firmware");
-
-	ret = qcom_mdt_load(mvm_dev->dev, mvm_dev->fw, "mvm_ecc.mdt", MVM_PROC_ID,
-			    mvm_dev->mvm_fw, mvm_dev->mvm_fw_dma, MVM_FW_SIZE, NULL);
-	if (ret) {
-		dev_err(mvm_dev->dev, "Failed to load mvm firmware\n");
-		goto out_release_firmware;
-	}
-
-	ret = qcom_scm_pas_auth_and_reset(MVM_PROC_ID);
-	if (ret) {
-		dev_err(mvm_dev->dev, "Error authenticating mvm firmware\n");
-		goto out_release_firmware;
-	}
-	dev_info(mvm_dev->dev, "MVM subsystem brought out of reset\n");
-	update_marker("M - MVM subsystem brought out of reset");
-
-	/* qcom_pil_info_store writes the PIL info to the IMEM address so that
-	 * MVM SDI dump collection will be enabled. If this imem write returns
-	 * error, MVM SDI dump collection will fail.But MVM will still continue to
-	 * perform message verification.
-	 */
-
-	ret = qcom_pil_info_store("mvm", mvm_dev->mvm_fw_dma, MVM_FW_SIZE);
-	if (ret) {
-		dev_err(mvm_dev->dev, "Couldnt store MVM PIL info in IMEM\n");
-		goto out_release_firmware;
-	}
-
-	if (mvm_dev->vm_variant == HOSTVM) {
-		if (mvm_dev->state == MVM_OFFLINE)
-			mvm_dev->state = MVM_ONLINE;
-		else if (mvm_dev->state == MVM_RESTARTING) {
-			gh_dbl_flags_t dbl_mask = MVM_INIT_FIFOS_DBL_MASK;
-			ret = gh_dbl_send(mvm_dev->hostvm_tx_dbl, &dbl_mask, 0);
-			if (ret) {
-				dev_err(mvm_dev->dev, "Failed to send MVM_INIT_FIFOS_DBL to televm %d\n", ret);
-				goto ret;
-			}
-			dev_dbg(mvm_dev->dev, "Sent MVM_INIT_FIFOS_DBL to televm\n");
-			mvm_dev->state = MVM_ONLINE;
+		ret = enable_mvm_gdsc(mvm_dev, true);
+		if (ret) {
+			dev_err(mvm_dev->dev, "Failed to turn on mvm gdsc\n");
+			goto gdsc_err;
 		}
 	}
+        if (mvm_dev->vm_variant == TELEVM) {
+		gh_dbl_flags_t dbl_mask = MVM_LOAD_FW_DBL_MASK;
+		ret = gh_dbl_send(mvm_dev->televm_tx_dbl, &dbl_mask, 0);
+		if (ret) {
+			dev_err(mvm_dev->dev, "failed to send MVM_LOAD_FW_DBL to hostvm %d\n", ret);
+			goto doorbell_fail;
+		}
+		dev_dbg(mvm_dev->dev, "Sent MVM_LOAD_FW_DBL to hostvm\n");
+	}
+	if (mvm_dev->vm_variant == PVM_ONLY || mvm_dev->vm_variant == HOSTVM) {
+		update_marker("M - Loading MVM firmware");
+
+		ret = qcom_mdt_load(mvm_dev->dev, mvm_dev->fw, "mvm_ecc.mdt", MVM_PROC_ID,
+				    mvm_dev->mvm_fw, mvm_dev->mvm_fw_dma, MVM_FW_SIZE, NULL);
+		if (ret) {
+			dev_err(mvm_dev->dev, "Failed to load mvm firmware\n");
+			goto out_release_firmware;
+		}
+
+		ret = qcom_scm_pas_auth_and_reset(MVM_PROC_ID);
+		if (ret) {
+			dev_err(mvm_dev->dev, "Error authenticating mvm firmware\n");
+			goto out_release_firmware;
+		}
+		dev_info(mvm_dev->dev, "MVM subsystem brought out of reset\n");
+		update_marker("M - MVM subsystem brought out of reset");
+		mvm_dev->state = MVM_ONLINE;
+
+		/* qcom_pil_info_store writes the PIL info to the IMEM address so that
+		 * MVM SDI dump collection will be enabled. If this imem write returns
+		 * error, MVM SDI dump collection will fail.But MVM will still continue to
+		 * perform message verification.
+		 */
+
+		ret = qcom_pil_info_store("mvm", mvm_dev->mvm_fw_dma, MVM_FW_SIZE);
+		if (ret) {
+			dev_err(mvm_dev->dev, "Couldnt store MVM PIL info in IMEM\n");
+			goto out_release_firmware;
+		}
+	}
+	if (mvm_dev->vm_variant == HOSTVM) {
+		gh_dbl_flags_t dbl_mask = MVM_INIT_FIFOS_DBL_MASK;
+		ret = gh_dbl_send(mvm_dev->hostvm_tx_dbl, &dbl_mask, 0);
+		if (ret) {
+			dev_err(mvm_dev->dev, "Failed to send MVM_INIT_FIFOS_DBL to televm %d\n", ret);
+			goto out_release_firmware;
+		}
+		dev_dbg(mvm_dev->dev, "Sent MVM_INIT_FIFOS_DBL to televm\n");
+	}
+	else if (mvm_dev->vm_variant == PVM_ONLY)
+		initialise_fifos(mvm_dev);
 
 	goto ret;
 
 out_release_firmware:
 	release_firmware(mvm_dev->fw);
+doorbell_fail:
+	enable_mvm_gdsc(mvm_dev,false);
 gdsc_err:
 	clk_disable_unprepare(mvm_dev->cnoc_s_ahb_clk);
-	clk_disable_unprepare(mvm_dev->xo);
 	clk_disable_unprepare(mvm_dev->snoc_m_axi_clk);
 	clk_disable_unprepare(mvm_dev->sysnoc_mvmss_clk);
 ret:
@@ -2203,7 +2210,6 @@ static void disable_gcc_clocks(struct mvm_device *mvm_dev)
 	clk_disable_unprepare(mvm_dev->snoc_m_axi_clk);
 	clk_disable_unprepare(mvm_dev->cnoc_s_ahb_clk);
 	clk_disable_unprepare(mvm_dev->sysnoc_mvmss_clk);
-	clk_disable_unprepare(mvm_dev->xo);
 }
 
 static int send_pwr_collpase_ctrl_msg(struct mvm_device *mvm_dev, bool pwr_collapse) {
@@ -2244,27 +2250,8 @@ static void mvm_hostvm_rx_dbl_cb(int irq, void *data)
 			return;
 		}
 	} else if (dbl_mask == MVM_LOAD_FW_DBL_MASK) {
-		mvm_dev->state = MVM_RESTARTING;
+		mvm_dev->state = (mvm_dev->state == MVM_CRASHED)? MVM_RESTARTING : mvm_dev->state;
 		mvm_load_fw(mvm_dev);
-	} else if (dbl_mask == MVM_DO_SUSPEND_DBL_MASK) {
-		collapse_mvm_core(mvm_dev);
-		disable_gcc_clocks(mvm_dev);
-		dbl_mask = MVM_SUSPEND_DONE_DBL_MASK;
-		ret = gh_dbl_send(mvm_dev->hostvm_tx_dbl, &dbl_mask, 0);
-		if (ret)
-			dev_err(mvm_dev->dev, "Couldnt send MVM_SUSPEND_DONE_DBL to televm\n");
-	} else if (dbl_mask == MVM_DO_RESUME_DBL_MASK) {
-		int is_resume;
-		is_resume = enable_gcc_clocks(mvm_dev);
-	        if (is_resume)
-	                dev_err(mvm_dev->dev, "Failed to turn on gcc clocks\n");
-		else {
-			restore_mvm_core(mvm_dev);
-			dbl_mask = MVM_RESUME_DONE_DBL_MASK;
-			ret = gh_dbl_send(mvm_dev->hostvm_tx_dbl, &dbl_mask, 0);
-			if (ret)
-				dev_err(mvm_dev->dev, "Couldnt send MVM_RESUME_DONE_DBL to televm\n");
-		}
 	}
 	ret = gh_dbl_reset(mvm_dev->hostvm_rx_dbl, GH_DBL_NONBLOCK);
 	if(ret){
@@ -2287,14 +2274,6 @@ static void mvm_televm_rx_dbl_cb(int irq, void *data)
 
 	if (dbl_mask == MVM_INIT_FIFOS_DBL_MASK) {
 		initialise_fifos(mvm_dev);
-	} else if (dbl_mask == MVM_SUSPEND_DONE_DBL_MASK) {
-		dev_info(mvm_dev->dev, "televm suspend completed\n");
-		complete(&mvm_dev->mvm_suspend_done);
-	} else if (dbl_mask == MVM_RESUME_DONE_DBL_MASK) {
-		dev_info(mvm_dev->dev, "televm resume completed\n");
-		complete(&mvm_dev->mvm_resume_done);
-		enable_wfi_int(mvm_dev, false);
-		ret =  send_pwr_collpase_ctrl_msg(mvm_dev, 0);
 	}
 
 	ret = gh_dbl_reset(mvm_dev->televm_rx_dbl, GH_DBL_NONBLOCK);
@@ -2363,7 +2342,6 @@ static void trigger_ssr_work_hdlr(struct work_struct *work)
 			return;
 		}
 	}
-
 	reinit_completion(&mvm_dev->mvm_dump_collection_done);
 	mutex_lock(&mvm_dev->out_fifo_lock);
 	p0_fifo_has_results = out_fifo_get_results(mvm_dev, 0);
@@ -2391,25 +2369,16 @@ static void trigger_ssr_work_hdlr(struct work_struct *work)
 	if (ret == 0) {
 		dev_err(mvm_dev->dev, "Timed out as mvm dump collection is not complete\n");
 	}
+        collapse_mvm_core(mvm_dev);
+        disable_gcc_clocks(mvm_dev);
+
 	mvm_dev->pending_dump_read = true;
 	wake_up_interruptible(&mvm_dev->mvm_ssr_waitqueue);
 	dev_info(mvm_dev->dev, "MVM subsystem is restarting after SSR\n");
 
 	mvm_dev->state = MVM_RESTARTING;
 	send_mvm_state_to_user(mvm_dev, MVM_RESTARTING);
-	if (mvm_dev->vm_variant == TELEVM) {
-		dbl_mask = MVM_LOAD_FW_DBL_MASK;
-		ret = gh_dbl_send(mvm_dev->televm_tx_dbl, &dbl_mask, 0);
-		if (ret) {
-			dev_err(mvm_dev->dev, "failed to send MVM_LOAD_FW_DBL to hostvm %d\n", ret);
-			return;
-		}
-		dev_dbg(mvm_dev->dev, "Sent MVM_LOAD_FW_DBL to hostvm\n");
-	} else if (mvm_dev->vm_variant == PVM_ONLY)
-		mvm_load_fw(mvm_dev);
-
-	if (mvm_dev->vm_variant == PVM_ONLY)
-		initialise_fifos(mvm_dev);
+	mvm_load_fw(mvm_dev);
 
 	mod_timer(&mvm_dev->mvm_stats_timer,jiffies + msecs_to_jiffies(mvm_stats_timer_interval_ms));
 	return;
@@ -2712,10 +2681,6 @@ static int enable_gcc_clocks(struct mvm_device *mvm_dev)
 {
 	int ret = 0;
 
-	mvm_dev->xo = devm_clk_get(mvm_dev->dev, "xo");
-	if (IS_ERR(mvm_dev->xo))
-		return PTR_ERR(mvm_dev->xo);
-
 	mvm_dev->cnoc_s_ahb_clk = devm_clk_get(mvm_dev->dev, "mvmss_cnoc_ahb_clk");
 	if (IS_ERR(mvm_dev->cnoc_s_ahb_clk))
 		return PTR_ERR(mvm_dev->cnoc_s_ahb_clk);
@@ -2728,15 +2693,10 @@ static int enable_gcc_clocks(struct mvm_device *mvm_dev)
 	if (IS_ERR(mvm_dev->sysnoc_mvmss_clk))
 		return PTR_ERR(mvm_dev->sysnoc_mvmss_clk);
 
-	ret = clk_prepare_enable(mvm_dev->xo);
-	if (ret) {
-		dev_err(mvm_dev->dev, "Failed to vote for XO clk\n");
-		return ret;
-	}
 	ret = clk_prepare_enable(mvm_dev->cnoc_s_ahb_clk);
 	if (ret) {
 		dev_err(mvm_dev->dev, "Failed to vote for cnoc_s_ahb_clk\n");
-		goto unprepare_xo;
+		return ret;
 	}
 	ret = clk_prepare_enable(mvm_dev->snoc_m_axi_clk);
 	if (ret) {
@@ -2754,8 +2714,6 @@ unprepare_snoc_m_axi:
 	clk_disable_unprepare(mvm_dev->snoc_m_axi_clk);
 unprepare_cnoc_s_ahb:
 	clk_disable_unprepare(mvm_dev->cnoc_s_ahb_clk);
-unprepare_xo:
-	clk_disable_unprepare(mvm_dev->xo);
 	return ret;
 }
 
@@ -2814,7 +2772,7 @@ static int wait_for_mvmss_wfi_interrupt(struct mvm_device *mvm_dev)
 static int mvm_suspend(struct device *dev)
 {
 	struct mvm_device *mvm_dev = dev_get_drvdata(dev);
-	int is_suspend = 0, ret = 0;
+	int is_suspend = 0;
 	struct mvm_client *mvm_cli;
 
 	switch (mvm_dev->vm_variant) {
@@ -2822,51 +2780,13 @@ static int mvm_suspend(struct device *dev)
 		is_suspend = 0;//return 0 since hostvm no need take any actions for suspend
 		break;
 	case PVM_ONLY:
+	case TELEVM:
 		dev_info(mvm_dev->dev, "mvm_info:pvm suspend recieved \n");
 		is_suspend = wait_for_mvmss_wfi_interrupt(mvm_dev);
 		if (is_suspend == 0) {
 			collapse_mvm_core(mvm_dev);
 			disable_gcc_clocks(mvm_dev);
 			dev_dbg(mvm_dev->dev, "MVM subsystem in power collapse mode\n");
-		}
-		if (is_suspend)
-		{
-			reinit_completion(&mvm_dev->mvm_wfi_irq_recvd);
-			mvm_dev->resume_frm_pwr_collapse = true;
-			enable_wfi_int(mvm_dev, false);
-			list_for_each_entry(mvm_cli, &mvm_dev->client_list, list) { //if suspend is failed ,then keep client enabled
-				if (mvm_cli->state != CLIENT_DISCONNECTING) {
-					mvm_cli->state = CLIENT_READY;
-					dev_dbg(mvm_dev->dev, "mvm suspend failed : enable clients for mvm %d\n",mvm_cli->client_id);
-				}
-			}
-			mod_timer(&mvm_dev->mvm_stats_timer,jiffies + msecs_to_jiffies(mvm_stats_timer_interval_ms));
-		}
-		break;
-	case TELEVM:
-		is_suspend = wait_for_mvmss_wfi_interrupt(mvm_dev);
-		if (is_suspend == 0) {
-			gh_dbl_flags_t dbl_mask = MVM_DO_SUSPEND_DBL_MASK;
-			dbl_mask = MVM_DO_SUSPEND_DBL_MASK;
-			dev_info(mvm_dev->dev, "mvm_info:televm suspend recieved \n");
-			reinit_completion(&mvm_dev->mvm_suspend_done);
-			ret = gh_dbl_send(mvm_dev->televm_tx_dbl, &dbl_mask, 0);
-			if (ret) {
-				dev_err(mvm_dev->dev,
-					"Failed to send MVM_SUSPEND_DBL to hostvm %d\n", ret);
-			}
-			else
-				dev_info(mvm_dev->dev, "televm sent MVM_SUSPEND_DBL to suspend \n");
-			is_suspend = wait_for_completion_interruptible_timeout(
-						&mvm_dev->mvm_suspend_done,
-						msecs_to_jiffies(TIMEOUT_MS));
-			if (is_suspend == 0) {
-				dev_err(mvm_dev->dev, "tele Timed out waiting for mvm core collapse\n");
-				is_suspend = -EBUSY;
-			} else {
-				dev_info(mvm_dev->dev, "MVM subsystem in power collapse mode\n");
-				is_suspend = 0;
-			}
 		}
 		if (is_suspend)
 		{
@@ -2892,7 +2812,6 @@ static int mvm_suspend(struct device *dev)
 static int mvm_resume(struct device *dev)
 {
 	struct mvm_device *mvm_dev = dev_get_drvdata(dev);
-	gh_dbl_flags_t dbl_mask = MVM_DO_RESUME_DBL_MASK;
 	int is_resume = 0, ret = 0;
 	struct mvm_client *mvm_cli;
 
@@ -2902,6 +2821,7 @@ static int mvm_resume(struct device *dev)
 		is_resume = 0;//return 0 since hostvm no need take any actions for resume
 		break;
 	case PVM_ONLY:
+	case TELEVM:
 		dev_info(mvm_dev->dev, "pvm resume recieved \n");
 		is_resume = enable_gcc_clocks(mvm_dev);
 		if (is_resume)
@@ -2912,23 +2832,6 @@ static int mvm_resume(struct device *dev)
 		}
 		enable_wfi_int(mvm_dev, false);
 		ret =  send_pwr_collpase_ctrl_msg(mvm_dev, 0);
-		break;
-	case TELEVM:
-		reinit_completion(&mvm_dev->mvm_resume_done);
-		ret = gh_dbl_send(mvm_dev->televm_tx_dbl, &dbl_mask, 0);
-		if (ret) {
-			dev_err(mvm_dev->dev,
-				"Failed to send MVM_RESUME_DBL to hostvm %d\n", ret);
-		}
-		is_resume = wait_for_completion_interruptible_timeout(
-					&mvm_dev->mvm_resume_done,
-					msecs_to_jiffies(TIMEOUT_MS));
-		if (is_resume == 0)
-			dev_err(mvm_dev->dev, "Couldnt restore mvm subsystem resume done wait failed\n");
-		else {
-			dev_info(mvm_dev->dev, "MVM subsystem in Restored\n");
-			is_resume =0;
-		}
 		break;
 	default:
 		break;
@@ -3246,21 +3149,18 @@ static int mvm_probe(struct platform_device *pdev)
 			dev_err(mvm_dev->dev, "request_firmware for mvm failed\n");
 			goto doorbell_fail;
 		}
-
+	}
+	if (mvm_dev->vm_variant == PVM_ONLY || mvm_dev->vm_variant == TELEVM) {
 		ret = mvm_load_fw(mvm_dev);
 		if (ret)
 			goto doorbell_fail;
-	}
 
-	if (mvm_dev->vm_variant == PVM_ONLY || mvm_dev->vm_variant == TELEVM) {
 		ret = mvm_stats_init(mvm_dev);
 		if (ret) {
 			dev_err(mvm_dev->dev, "mvm_stats_init failed\n");
 			goto doorbell_fail;
 		}
-		initialise_fifos(mvm_dev);
 	}
-
 	return 0;
 
 doorbell_fail:
@@ -3356,12 +3256,12 @@ static int mvm_remove(struct platform_device *pdev)
 	if (mvm_dev->vm_variant == PVM_ONLY || mvm_dev->vm_variant == HOSTVM) {
 		mvm_iommu_release(mvm_dev);
                 mvm_dma_mem_free(mvm_dev);
-		clk_disable_unprepare(mvm_dev->cnoc_s_ahb_clk);
-		clk_disable_unprepare(mvm_dev->xo);
-		clk_disable_unprepare(mvm_dev->snoc_m_axi_clk);
-		clk_disable_unprepare(mvm_dev->sysnoc_mvmss_clk);
 	}
 	if(mvm_dev->vm_variant == PVM_ONLY || mvm_dev->vm_variant == TELEVM) {
+		enable_mvm_gdsc(mvm_dev,false);
+		clk_disable_unprepare(mvm_dev->cnoc_s_ahb_clk);
+		clk_disable_unprepare(mvm_dev->snoc_m_axi_clk);
+		clk_disable_unprepare(mvm_dev->sysnoc_mvmss_clk);
 		unregister_pm_notifier(&mvm_dev->pm_notifier);
 		sysfs_remove(mvm_dev);
 	}
