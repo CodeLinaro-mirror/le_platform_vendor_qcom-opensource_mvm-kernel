@@ -2201,6 +2201,8 @@ static void trigger_ssr_work_hdlr(struct work_struct *work)
 	if (mvm_dev->vm_variant == PVM_ONLY)
 		initialise_fifos(mvm_dev);
 
+	add_timer(&mvm_dev->mvm_stats_timer);//enable timer for dynamic clock change after ssr
+	mod_timer(&mvm_dev->mvm_stats_timer,jiffies + msecs_to_jiffies(mvm_stats_timer_interval_ms));
 	return;
 }
 
@@ -2208,6 +2210,7 @@ static irqreturn_t mvm_wdog_irq_handler(int irq, void *dev_id)
 {
 	struct mvm_device *mvm_dev = dev_id;
 
+	del_timer(&mvm_dev->mvm_stats_timer);//stop dynamic clock timer during ssr,stop sending control message for clock change
 	dev_info(mvm_dev->dev, "Received watchdog bite from MVM\n");
 	mvm_dev->state = MVM_CRASHED;
 	dev_dbg(mvm_dev->dev, "The current state of MVM is CRASHED\n");
