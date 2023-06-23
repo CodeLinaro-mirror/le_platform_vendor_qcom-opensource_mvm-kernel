@@ -33,17 +33,21 @@
 #include <linux/qcom-iommu-util.h>
 #include <linux/gunyah/gh_dbl.h>
 #include <linux/suspend.h>
+#include <linux/kthread.h>
+#include <linux/timekeeping.h>
+#include <linux/moduleparam.h>
 
-#define SIG_MVM_STATE           SIGRTMAX
+#define MVM_NOTIFY_SIGNO		SIGRTMAX
+#define MVM_NOTIFY_VALUE_STATE		10
+#define MVM_NOTIFY_VALUE_CAPACITY	11
 #define DDR_FIFO_COUNT			2
 #define DDR_FIFO_SIZE			128
 #define MSG_PRIORITY_BIT		BIT(19)
 #define OUT_BUFF_SIZE			32
 #define TIMEOUT_MS			10000
-#define WFI_TIMEOUT_MS    5000
-#define MAX_CLIENT_COUNT		15
-/*TODO Remove this once PIL validation is complete */
-#define KEEP_FW_IN_DDR			1
+#define WFI_TIMEOUT_MS				5000
+#define MAX_CLIENT_COUNT			15
+#define MIN_CLOCK_CHANGE_TIME_MS	500
 
 /* CSR to enable WFI interrupt from E21 to APPS */
 #define MVMSS_CSR_RVSS_CFG_OFFSET	0x00000010
@@ -145,7 +149,14 @@ each of the actual P0 and P1 buffer starts */
 #define MVM_DO_RESUME_DBL_MASK		0x5
 #define MVM_SUSPEND_DONE_DBL_MASK	0x6
 #define MVM_RESUME_DONE_DBL_MASK	0x7
+#define MAX_CURVES			5
+#define MAX_FREQ_PLAN			3
+#define MVM_STATS_TIMEOUT_MS		100
+#define MVM_INITIAL_CAPACITY 		100
 
+#define PKE_UTIL_UPPER_THRESH 		75
+#define PKE_UTIL_LOWER_THRESH 		25
+#define MVM_STATS_TIMER_DEFAULT_INTERVAL_MS	100
 /**
  * enum mvm_state - state of mvm subsystem
  * @MVM_OFFLINE: MVM firmware is not loaded/authenticated yet.
@@ -176,12 +187,26 @@ enum client_state {
 	CLIENT_SUSPEND
 };
 
+enum mvm_curve {
+	CURVE_NISTP256,
+	CURVE_BP256R1,
+	CURVE_SM2,
+	CURVE_NISTP384,
+	CURVE_BP384R1,
+};
+
 static const char * const mvm_states[] = {
 	[MVM_OFFLINE] = "OFFLINE",
 	[MVM_ONLINE] = "ONLINE",
 	[MVM_CRASHED] = "CRASHED",
 	[MVM_RESTARTING] = "RESTARTING",
 	[MVM_SUSPEND] = "SUSPEND",
+};
+
+static const char * const mvm_clk_freq_plan[] = {
+	[NOMINAL] = "NOMINAL",
+	[SVS] = "SVS",
+	[LOW_SVS] = "LOW_SVS",
 };
 
 struct input_fifo {
@@ -211,6 +236,7 @@ struct output_buffer {
 struct ring_buffers {
 	struct input_fifo in_fifo[DDR_FIFO_COUNT];
 	struct output_fifo out_fifo[DDR_FIFO_COUNT];
+	unsigned int pke_time_accumulator;
 };
 
 struct mvm_crashdump_buffer {
@@ -234,6 +260,11 @@ struct mvm_client {
 	unsigned int results_recvd;
 };
 
+struct mvm_stats_client {
+	struct list_head list;
+	struct task_struct *task;
+};
+
 struct mvm_device {
 	bool resume_frm_pwr_collapse;
 	DECLARE_BITMAP(client_id_bitmap, MAX_CLIENT_COUNT);
@@ -253,7 +284,6 @@ struct mvm_device {
 	struct device *dev;
 	struct class *mvm_class;
 	struct mutex mvm_cli_lock;
-	struct mutex mvm_csr_lock;
 	struct mutex in_fifo_lock;
 	struct mutex out_fifo_lock;
 	wait_queue_head_t mvm_waitqueue;
@@ -261,6 +291,7 @@ struct mvm_device {
 	wait_queue_head_t ssr_poll_wait;
 	struct work_struct drain_out_fifo_work;
 	struct work_struct trigger_ssr_work;
+	struct work_struct change_clk_freq_work;
 	struct completion p0_fifo_slot_available;
 	struct completion p1_fifo_slot_available;
 	struct completion mvm_wfi_irq_recvd;
@@ -268,7 +299,10 @@ struct mvm_device {
 	struct completion mvm_suspend_done;
 	struct completion mvm_resume_done;
 	struct kobject *kobj;
-	struct kobj_attribute attr;
+	struct kobj_attribute mvm_state_attr;
+	struct kobj_attribute mvm_capacity_attr;
+	struct kobj_attribute mvm_curr_clk_attr;
+	struct kobj_attribute mvm_max_clk_attr;
 	struct dentry *dir;
 	uint32_t *mvm_fw;
 	struct mvm_crashdump_buffer *dump_buff;
@@ -307,10 +341,32 @@ struct mvm_device {
 	void *hostvm_rx_dbl;
 	const struct firmware *fw;
 	struct notifier_block pm_notifier;
+	uint32_t max_rate;
+	uint32_t mvm_capacity[MAX_CURVES];
+	mvm_clk_freq req_clk;
+	mvm_clk_freq curr_clk;
+	mvm_clk_freq max_clk;
+	enum mvm_curve curve;
+	struct timer_list mvm_stats_timer;
+	uint32_t mvm_in_msg_count[MAX_CURVES];
+	unsigned int prev_pke_time;
+	unsigned int pke_util;
+	dev_t mvm_stats_cdev_devid;
+	struct list_head mvm_stats_client_list;
+	struct cdev mvm_stats_cdev;
+	struct class *mvm_stats_class;
+	struct device *mvm_stats_dev;
+	ktime_t clk_time_elapsed;
 };
+
+static const uint32_t mvm_rate[MAX_FREQ_PLAN][MAX_CURVES] = {
+		{5817, 3014, 6485, 1992, 1004},
+		{9551, 4955, 10706, 3291, 1663},
+		{14285, 7434, 16064, 4938, 2493}};
 
 static int enable_gcc_clocks(struct mvm_device *mvm_dev);
 int qcom_pil_info_store(const char *image, phys_addr_t base, size_t size);
+static int mvm_stats_timer_interval_ms = MVM_STATS_TIMER_DEFAULT_INTERVAL_MS;//set 100ms as default value
 
 static void send_mvm_state_to_user(struct mvm_device *mvm_dev)
 {
@@ -318,18 +374,40 @@ static void send_mvm_state_to_user(struct mvm_device *mvm_dev)
 	struct mvm_client *mvm_cli;
 
 	memset(&info, 0, sizeof(struct kernel_siginfo));
-	info.si_signo = SIG_MVM_STATE;
-	info.si_int = mvm_dev->state;
+	info.si_signo = MVM_NOTIFY_SIGNO;
+	info.si_int = MVM_NOTIFY_VALUE_STATE;
 
 	mutex_lock(&mvm_dev->mvm_cli_lock);
 	list_for_each_entry(mvm_cli, &mvm_dev->client_list, list) {
-		if (mvm_cli->task != NULL) {
-			if(send_sig_info(SIG_MVM_STATE, &info, mvm_cli->task) < 0)
+		if ((mvm_cli->task != NULL) && (mvm_cli->state != CLIENT_DISCONNECTING )) {
+			if(send_sig_info(MVM_NOTIFY_SIGNO, &info, mvm_cli->task) < 0)
 				dev_err(mvm_dev->dev, "Unable to send mvm state change signal to userspace\n");
 			dev_dbg(mvm_dev->dev, "Sent state change signal to client %d\n",mvm_cli->client_id);
 		}
 	}
 	mutex_unlock(&mvm_dev->mvm_cli_lock);
+}
+
+static void send_mvm_capacity_to_user(struct mvm_device *mvm_dev)
+{
+	struct kernel_siginfo info;
+	struct mvm_stats_client *mvm_stats_cli;
+	int i;
+
+	memset(&info, 0, sizeof(struct kernel_siginfo));
+	info.si_signo = MVM_NOTIFY_SIGNO;
+	info.si_int = MVM_NOTIFY_VALUE_CAPACITY;
+
+	for (i=0; i< MAX_CURVES; i++)
+		mvm_dev->mvm_capacity[i] = min(mvm_dev->max_rate, mvm_rate[MAX_FREQ_PLAN-1][i]);
+
+	list_for_each_entry(mvm_stats_cli, &mvm_dev->mvm_stats_client_list, list) {
+		if (mvm_stats_cli->task != NULL) {
+			if(send_sig_info(MVM_NOTIFY_SIGNO, &info, mvm_stats_cli->task) < 0)
+				dev_err(mvm_dev->dev, "Unable to send mvm state change signal to userspace\n");
+			dev_info(mvm_dev->dev, "Sent capacity state change to client\n");
+		}
+	}
 }
 
 static void enable_wfi_int(struct mvm_device *mvm_dev, bool enable)
@@ -397,13 +475,44 @@ static void restore_mvm_core(struct mvm_device *mvm_dev)
 }
 
 static ssize_t mvm_state_show(struct kobject *kobj,
-				struct kobj_attribute *attr,
+				struct kobj_attribute *mvm_state_attr,
 				char *buf)
 {
-	struct mvm_device *mvm_dev = container_of(attr,
+	struct mvm_device *mvm_dev = container_of(mvm_state_attr,
 						struct mvm_device,
-						attr);
-	return snprintf(buf, 0x10, "%s\n", mvm_states[mvm_dev->state]);
+						mvm_state_attr);
+	return snprintf(buf, 10, "%s\n", mvm_states[mvm_dev->state]);
+}
+
+static ssize_t mvm_curr_clk_show(struct kobject *kobj,
+                                struct kobj_attribute *mvm_curr_clk_attr,
+                                char *buf)
+{
+	struct mvm_device *mvm_dev = container_of(mvm_curr_clk_attr,
+											struct mvm_device,
+											mvm_curr_clk_attr);
+	return snprintf(buf, 10, "%s\n", mvm_clk_freq_plan[mvm_dev->curr_clk]);
+}
+
+static ssize_t mvm_capacity_show(struct kobject *kobj,
+                                struct kobj_attribute *mvm_capacity_attr,
+                                char *buf)
+{
+	struct mvm_device *mvm_dev = container_of(mvm_capacity_attr,
+											struct mvm_device,
+											mvm_capacity_attr);
+	return snprintf(buf, 26, "%d %d %d %d %d\n", mvm_dev->mvm_capacity[0], mvm_dev->mvm_capacity[1],
+							mvm_dev->mvm_capacity[2], mvm_dev->mvm_capacity[3], mvm_dev->mvm_capacity[4]);
+}
+
+static ssize_t mvm_max_clk_show(struct kobject *kobj,
+                                struct kobj_attribute *mvm_max_clk_attr,
+                                char *buf)
+{
+	struct mvm_device *mvm_dev = container_of(mvm_max_clk_attr,
+											struct mvm_device,
+											mvm_max_clk_attr);
+	return snprintf(buf, 10, "%s\n", mvm_clk_freq_plan[mvm_dev->max_clk]);
 }
 
 static int mvm_sysfs_init(struct mvm_device *mvm_dev)
@@ -416,21 +525,64 @@ static int mvm_sysfs_init(struct mvm_device *mvm_dev)
 		return -ENOMEM;
 	}
 
-	sysfs_attr_init(&mvm_dev->attr.attr);
-	mvm_dev->attr.attr.mode = 0444;
-	mvm_dev->attr.attr.name = "mvm_state";
-	mvm_dev->attr.show = mvm_state_show;
-	mvm_dev->attr.store = NULL;
-
-	ret = sysfs_create_file(mvm_dev->kobj, &mvm_dev->attr.attr);
+	sysfs_attr_init(&mvm_dev->mvm_state_attr.attr);
+	mvm_dev->mvm_state_attr.attr.mode = 0444;
+	mvm_dev->mvm_state_attr.attr.name = "mvm_state";
+	mvm_dev->mvm_state_attr.show = mvm_state_show;
+	mvm_dev->mvm_state_attr.store = NULL;
+	ret = sysfs_create_file(mvm_dev->kobj, &mvm_dev->mvm_state_attr.attr);
 	if (ret)        {
 		dev_err(mvm_dev->dev, "%s: sysfs_create_file failed\n",
 							__func__);
-		goto fail_sysfs;
+		goto fail_sysfs_mvm_state;
+	}
+	if (mvm_dev->vm_variant == PVM_ONLY || mvm_dev->vm_variant == TELEVM) {
+		sysfs_attr_init(&mvm_dev->mvm_curr_clk_attr.attr);
+		mvm_dev->mvm_curr_clk_attr.attr.mode = 0444;
+		mvm_dev->mvm_curr_clk_attr.attr.name = "mvm_curr_clk";
+		mvm_dev->mvm_curr_clk_attr.show = mvm_curr_clk_show;
+		mvm_dev->mvm_curr_clk_attr.store = NULL;
+		ret = sysfs_create_file(mvm_dev->kobj, &mvm_dev->mvm_curr_clk_attr.attr);
+		if (ret)        {
+			dev_err(mvm_dev->dev, "%s: sysfs_create_file mvm_curr_clk failed\n",
+								__func__);
+			goto fail_sysfs_mvm_curr_clk;
+		}
+		sysfs_attr_init(&mvm_dev->mvm_capacity_attr.attr);
+		mvm_dev->mvm_capacity_attr.attr.mode = 0444;
+		mvm_dev->mvm_capacity_attr.attr.name = "mvm_capacity";
+		mvm_dev->mvm_capacity_attr.show = mvm_capacity_show;
+		mvm_dev->mvm_capacity_attr.store = NULL;
+
+		ret = sysfs_create_file(mvm_dev->kobj, &mvm_dev->mvm_capacity_attr.attr);
+		if (ret)        {
+			dev_err(mvm_dev->dev, "%s: sysfs_create_file mvm_capacity failed\n",
+								__func__);
+			goto fail_sysfs_mvm_capacity;
+		}
+		sysfs_attr_init(&mvm_dev->mvm_max_clk_attr.attr);
+		mvm_dev->mvm_max_clk_attr.attr.mode = 0444;
+		mvm_dev->mvm_max_clk_attr.attr.name = "mvm_max_clk";
+		mvm_dev->mvm_max_clk_attr.show = mvm_max_clk_show;
+		mvm_dev->mvm_max_clk_attr.store = NULL;
+
+		ret = sysfs_create_file(mvm_dev->kobj, &mvm_dev->mvm_max_clk_attr.attr);
+		if (ret)        {
+			dev_err(mvm_dev->dev, "%s: sysfs_create_file mvm_max_clk failed\n",
+								__func__);
+			goto fail_sysfs_mvm_max_clk;
+		}
+		mvm_dev->clk_time_elapsed =0;
 	}
 	return 0;
 
-fail_sysfs:
+fail_sysfs_mvm_max_clk:
+	sysfs_remove_file(mvm_dev->kobj, &mvm_dev->mvm_capacity_attr.attr);
+fail_sysfs_mvm_capacity:
+	sysfs_remove_file(mvm_dev->kobj, &mvm_dev->mvm_curr_clk_attr.attr);
+fail_sysfs_mvm_curr_clk:
+	sysfs_remove_file(mvm_dev->kobj, &mvm_dev->mvm_state_attr.attr);
+fail_sysfs_mvm_state:
 	kobject_put(mvm_dev->kobj);
 	return ret;
 }
@@ -535,7 +687,7 @@ static __poll_t mvm_log_poll(struct file *filp, struct poll_table_struct *wait)
 	return events;
 }
 
-static int mvm_log_open(struct inode *inode, struct file *filp)
+static int mvm_generic_file_open(struct inode *inode, struct file *filp)
 {
 	struct mvm_device *mvm_dev = inode->i_private;
 	filp->private_data = mvm_dev;
@@ -544,17 +696,10 @@ static int mvm_log_open(struct inode *inode, struct file *filp)
 
 static const struct file_operations debugfs_mvm_log_ops = {
 	.owner     = THIS_MODULE,
-	.open      = mvm_log_open,
+	.open      = mvm_generic_file_open,
 	.read      = mvm_log_file_read,
 	.poll      = mvm_log_poll
 };
-
-static int mvm_log_policy_open(struct inode *inode, struct file *filp)
-{
-	struct mvm_device *mvm_dev = inode->i_private;
-	filp->private_data = mvm_dev;
-	return 0;
-}
 
 static ssize_t mvm_log_policy_store(struct file *filp, const char __user *ubuf, size_t count, loff_t *ppos)
 {
@@ -578,16 +723,9 @@ static ssize_t mvm_log_policy_store(struct file *filp, const char __user *ubuf, 
 
 static const struct file_operations debugfs_mvm_policy_ops = {
 	.owner      = THIS_MODULE,
-	.open     = mvm_log_policy_open,
+	.open     = mvm_generic_file_open,
 	.write    = mvm_log_policy_store,
 };
-
-static int mvm_log_transfer_open(struct inode *inode, struct file *filp)
-{
-	struct mvm_device *mvm_dev = inode->i_private;
-	filp->private_data = mvm_dev;
-	return 0;
-}
 
 static ssize_t mvm_log_transfer_store(struct file *filp, const char __user *ubuf, size_t count, loff_t *ppos)
 {
@@ -616,16 +754,9 @@ static ssize_t mvm_log_transfer_store(struct file *filp, const char __user *ubuf
 
 static const struct file_operations debugfs_mvm_transfer_ops = {
 	.owner      = THIS_MODULE,
-	.open     = mvm_log_transfer_open,
+	.open     = mvm_generic_file_open,
 	.write    = mvm_log_transfer_store,
 };
-
-static int mvm_trigger_ssr_open(struct inode *inode, struct file *filp)
-{
-	struct mvm_device *mvm_dev = inode->i_private;
-	filp->private_data = mvm_dev;
-	return 0;
-}
 
 static ssize_t mvm_trigger_ssr_store(struct file *filp, const char __user *ubuf, size_t count, loff_t *ppos)
 {
@@ -650,16 +781,9 @@ static ssize_t mvm_trigger_ssr_store(struct file *filp, const char __user *ubuf,
 
 static const struct file_operations debugfs_mvm_trigger_ssr_ops = {
 	.owner = THIS_MODULE,
-	.open = mvm_trigger_ssr_open,
+	.open = mvm_generic_file_open,
 	.write = mvm_trigger_ssr_store,
 };
-
-static int mvm_crash_dump_open(struct inode *inode, struct file *filp)
-{
-	struct mvm_device *mvm_dev = inode->i_private;
-	filp->private_data = mvm_dev;
-	return 0;
-}
 
 static unsigned int mvm_crash_dump_poll(struct file *filp, struct poll_table_struct *pt)
 {
@@ -691,17 +815,10 @@ static ssize_t mvm_crash_dump_read(struct file *filp, char __user *buff, size_t 
 
 static const struct file_operations debugfs_mvm_crash_dump_ops = {
 	.owner = THIS_MODULE,
-	.open = mvm_crash_dump_open,
+	.open = mvm_generic_file_open,
 	.poll = mvm_crash_dump_poll,
 	.read = mvm_crash_dump_read,
 };
-
-static int mvm_log_level_open(struct inode *inode, struct file *filp)
-{
-        struct mvm_device *mvm_dev = inode->i_private;
-        filp->private_data = mvm_dev;
-        return 0;
-}
 
 static ssize_t mvm_log_level_store(struct file *filp, const char __user *ubuf, size_t count, loff_t *ppos)
 {
@@ -726,8 +843,48 @@ static ssize_t mvm_log_level_store(struct file *filp, const char __user *ubuf, s
 
 static const struct file_operations debugfs_mvm_log_level_ops = {
 	.owner      = THIS_MODULE,
-	.open     = mvm_log_level_open,
+	.open     = mvm_generic_file_open,
 	.write    = mvm_log_level_store,
+};
+
+static ssize_t pke_time_accumulator_read(struct file *filp, char __user *buff, size_t count, loff_t *offset)
+{
+	if(*offset == 0){
+		char string[12] = {0};
+		struct mvm_device *mvm_dev = filp->private_data;
+
+		int to_copy = snprintf(string,12,"0x%x\n",mvm_dev->ring_buff->pke_time_accumulator);
+		unsigned long remain = copy_to_user(buff,string,to_copy);
+		*offset += (to_copy - remain);
+		return *offset;
+	}
+	return 0;
+}
+
+static const struct file_operations debugfs_mvm_pke_time_ops = {
+	.owner     = THIS_MODULE,
+	.open      = mvm_generic_file_open,
+	.read      = pke_time_accumulator_read,
+};
+
+static ssize_t pke_util_read(struct file *filp, char __user *buff, size_t count, loff_t *offset)
+{
+	if(*offset == 0){
+		char string[12] = {0};
+		struct mvm_device *mvm_dev = filp->private_data;
+
+		int to_copy = snprintf(string,12,"0x%x\n",mvm_dev->pke_util);
+		unsigned long remain = copy_to_user(buff,string,to_copy);
+		*offset += (to_copy - remain);
+		return *offset;
+	}
+	return 0;
+}
+
+static const struct file_operations debugfs_mvm_pke_util_ops = {
+	.owner     = THIS_MODULE,
+	.open      = mvm_generic_file_open,
+	.read      = pke_util_read,
 };
 
 static int mvm_debugfs_init(struct mvm_device *mvm_dev)
@@ -771,6 +928,16 @@ static int mvm_debugfs_init(struct mvm_device *mvm_dev)
 	if (!file)
 		goto file_err;
 
+	file = debugfs_create_file("pke_time_accumulator", 0644, mvm_dev->dir, mvm_dev,
+		&debugfs_mvm_pke_time_ops);
+	if (!file)
+		goto file_err;
+
+	file = debugfs_create_file("pke_utilization", 0644, mvm_dev->dir, mvm_dev,
+		&debugfs_mvm_pke_util_ops);
+	if (!file)
+		goto file_err;
+
 	mvm_dev->ddr_current_addr = &mvm_dev->log_buff->mvmlog_buffer[0];
 	mvm_dev->ddr_head_pos = &mvm_dev->log_buff->mvmlog_buffer[0];
 	mvm_dev->ddr_tail_pos = &mvm_dev->log_buff->mvmlog_buffer[0];
@@ -781,7 +948,7 @@ static int mvm_debugfs_init(struct mvm_device *mvm_dev)
 
 file_err:
 	ret = -ENOENT;
-	debugfs_remove(mvm_dev->dir);
+	debugfs_remove_recursive(mvm_dev->dir);
 ret:
 	return ret;
 }
@@ -832,6 +999,7 @@ static bool drain_out_fifo(struct mvm_device *mvm_dev, unsigned int fifo_index, 
 	bool control_message_written = false;
 	unsigned int *out_fifo_addr = NULL;
 	struct mvm_control *mvm_ctrl_recv;
+
 	while (count && !full) {
 		client_id =
 		mvm_dev->ring_buff->out_fifo[fifo_index].base[mvm_dev->ring_buff->out_fifo[fifo_index].tail].client_id;
@@ -854,6 +1022,17 @@ static bool drain_out_fifo(struct mvm_device *mvm_dev, unsigned int fifo_index, 
 			case MVM_CPU_FREQ:
 				break;
 			case MVM_POWER:
+				break;
+			case MVM_MAX_RATE:
+				mvm_dev->max_rate = mvm_ctrl_recv->mvm_ctrl_msg.max_rate.max_rate;
+				dev_info(mvm_dev->dev, "MVM License file is read and the max rate supported by MVM is %d\n",mvm_dev->max_rate);
+				send_mvm_capacity_to_user(mvm_dev);
+				break;
+			case MVM_CHANGE_CLK_FREQ:
+				dev_info(mvm_dev->dev, "Clock freq changed from %s to %s\n",
+						mvm_clk_freq_plan[mvm_dev->curr_clk],
+						mvm_clk_freq_plan[mvm_ctrl_recv->mvm_ctrl_msg.mvm_clk_freq.clk_freq]);
+				mvm_dev->curr_clk = mvm_ctrl_recv->mvm_ctrl_msg.mvm_clk_freq.clk_freq;
 				break;
 			default:
 				break;
@@ -1076,6 +1255,7 @@ static long mvm_ioctl(struct file *filp, unsigned int cmd, unsigned long arg)
 {
 	int ret = 0;
 	struct mvm_client *mvm_cli = filp->private_data;
+	struct mvm_device *mvm_dev = mvm_cli->mvm_dev;
 
 	switch (cmd) {
 	case GET_CLIENT_ID:
@@ -1096,6 +1276,12 @@ static long mvm_ioctl(struct file *filp, unsigned int cmd, unsigned long arg)
 		mvm_cli->out_buff->tail = 0;
 		break;
 
+	case GET_MVM_STATE:
+		if (copy_to_user((unsigned int *)arg, &mvm_dev->state,
+					sizeof(mvm_dev->state)))
+			ret = -EFAULT;
+		break;
+
 	default:
 		break;
 	}
@@ -1114,6 +1300,7 @@ static ssize_t mvm_write(
 	int rc, ret;
 	unsigned int no_of_msgs_written = 0;
 	unsigned int count;
+	unsigned int curve_id;
 
 	if (!(mvm_cli->state == CLIENT_READY))
 		return 0;
@@ -1181,6 +1368,8 @@ push_to_input_ring:
 			&mvm_dev->ring_buff->in_fifo[fifo_index].base[mvm_dev->ring_buff->in_fifo[fifo_index].head],
 			(buf+(i * sizeof(struct input_msg))),
 			sizeof(struct input_msg));
+			curve_id = mvm_dev->ring_buff->in_fifo[fifo_index].base[mvm_dev->ring_buff->in_fifo[fifo_index].head].curve_id;
+			mvm_dev->mvm_in_msg_count[curve_id]++;
 			if (!ret) {
 				mvm_dev->ring_buff->in_fifo[fifo_index].head =
 					(mvm_dev->ring_buff->in_fifo[fifo_index].head + 1)
@@ -1891,6 +2080,7 @@ static void trigger_ssr_work_hdlr(struct work_struct *work)
 	struct mvm_device *mvm_dev = container_of(work, struct mvm_device, trigger_ssr_work);
 	int ret = 0;
 	struct mvm_client *mvm_cli;
+	struct mvm_client *mvm_cli_temp;
 	bool p0_fifo_has_results =0 ,p1_fifo_has_results =0;
 	gh_dbl_flags_t dbl_mask;
 
@@ -1910,10 +2100,6 @@ static void trigger_ssr_work_hdlr(struct work_struct *work)
 		}
 	}
 
-	list_for_each_entry(mvm_cli, &mvm_dev->client_list, list) {
-		mvm_cli->state = CLIENT_SSR;
-		dev_dbg(mvm_dev->dev, "Set client flag %d\n",mvm_cli->client_id);
-	}
 	reinit_completion(&mvm_dev->mvm_dump_collection_done);
 	mutex_lock(&mvm_dev->out_fifo_lock);
 	p0_fifo_has_results = out_fifo_get_results(mvm_dev, 0);
@@ -1922,8 +2108,19 @@ static void trigger_ssr_work_hdlr(struct work_struct *work)
 	if (p0_fifo_has_results || p1_fifo_has_results)
 		dev_dbg(mvm_dev->dev, "mvm outfifo has results and draining out fifo started\n");
 	wake_up_interruptible_poll(&mvm_dev->mvm_waitqueue, POLLIN | POLLPRI);
-	send_mvm_state_to_user(mvm_dev);//Send crash signal to clients
 
+
+	list_for_each_entry_safe(mvm_cli, mvm_cli_temp, &mvm_dev->client_list, list) {
+		if (mvm_cli->state == CLIENT_DISCONNECTING ) {
+			mvm_client_remove(mvm_dev,mvm_cli);
+		}
+		else {
+			mvm_cli->state = CLIENT_SSR;
+			dev_dbg(mvm_dev->dev, "Set client flag %d\n",mvm_cli->client_id);
+		}
+	}
+
+	send_mvm_state_to_user(mvm_dev);//Send crash signal to clients
 	ret = wait_for_completion_interruptible_timeout(
 			&mvm_dev->mvm_dump_collection_done,
 			msecs_to_jiffies(MVM_DUMP_COLL_TIMEOUT_MS));
@@ -1932,12 +2129,10 @@ static void trigger_ssr_work_hdlr(struct work_struct *work)
 	}
 	mvm_dev->pending_dump_read = true;
 	wake_up_interruptible_poll(&mvm_dev->ssr_poll_wait, POLLIN | POLLPRI);
-
 	dev_info(mvm_dev->dev, "MVM subsystem is restarting after SSR\n");
 
 	mvm_dev->state = MVM_RESTARTING;
 	send_mvm_state_to_user(mvm_dev);
-
 	if (mvm_dev->vm_variant == TELEVM) {
 		dbl_mask = MVM_LOAD_FW_DBL_MASK;
 		ret = gh_dbl_send(mvm_dev->televm_tx_dbl, &dbl_mask, 0);
@@ -2156,8 +2351,7 @@ static int mvm_dma_mem_alloc(struct mvm_device *mvm_dev)
 				"dma_alloc_coherent of the firmware memory failed %d\n");
 		ret = -ENOMEM;
 		goto fw_mem_alloc_fail;
-	} else
-		printk("Allocated memmory during probe\n");
+	}
 
 	return 0;
 
@@ -2213,6 +2407,57 @@ static const struct file_operations mvm_fileops = {
 	.unlocked_ioctl = mvm_ioctl,
 	.poll = mvm_poll,
 	.read = mvm_read,
+	.owner = THIS_MODULE,
+};
+
+static long mvm_stats_ioctl(struct file *filp, unsigned int cmd, unsigned long arg)
+{
+	int ret = 0;
+	struct mvm_device *mvm_dev = filp->private_data;
+
+	switch (cmd) {
+	case GET_MVM_CAPACITY:
+		if (copy_to_user((unsigned int *)arg, mvm_dev->mvm_capacity, sizeof(mvm_dev->mvm_capacity)))
+			ret = -EFAULT;
+		break;
+
+	case GET_MVM_STATS_MSG_COUNT:
+		if (copy_to_user((unsigned int *)arg, mvm_dev->mvm_in_msg_count, sizeof(mvm_dev->mvm_in_msg_count)))
+			ret = -EFAULT;
+		break;
+
+	default:
+		break;
+	}
+
+	return ret;
+}
+
+static int mvm_stats_open(struct inode *inode, struct file *filp)
+{
+	struct mvm_device *mvm_dev = container_of(inode->i_cdev,
+				struct mvm_device, mvm_stats_cdev);
+	struct mvm_stats_client *mvm_stats_cli;
+	int ret = 0;
+
+	mvm_stats_cli = kzalloc(sizeof(*mvm_stats_cli), GFP_KERNEL);
+	if (!mvm_stats_cli) {
+		ret = -ENOMEM;
+		goto ret;
+	}
+
+	INIT_LIST_HEAD(&mvm_stats_cli->list);
+	mvm_stats_cli->task = get_current();
+	list_add_tail(&mvm_stats_cli->list, &mvm_dev->mvm_stats_client_list);
+	filp->private_data = mvm_dev;
+
+ret:
+	return 0;
+}
+
+static const struct file_operations mvm_stats_fileops = {
+	.open = mvm_stats_open,
+	.unlocked_ioctl = mvm_stats_ioctl,
 	.owner = THIS_MODULE,
 };
 
@@ -2284,6 +2529,7 @@ static int mvm_pm_notify(struct notifier_block *notifier,
 				mvm_dev->state = MVM_SUSPEND;
 				send_mvm_state_to_user(mvm_dev);
 				reinit_completion(&mvm_dev->mvm_wfi_irq_recvd);
+				del_timer(&mvm_dev->mvm_stats_timer);
 				ret =  send_pwr_collpase_ctrl_msg(mvm_dev, 1);
 				list_for_each_entry(mvm_cli, &mvm_dev->client_list, list) {
 					mvm_cli->state = CLIENT_SUSPEND;
@@ -2320,15 +2566,14 @@ static int mvm_suspend(struct device *dev)
 {
 	struct mvm_device *mvm_dev = dev_get_drvdata(dev);
 	int is_suspend = 0, ret = 0;
-
-	mutex_lock(&mvm_dev->mvm_csr_lock);
+	struct mvm_client *mvm_cli;
 
 	switch (mvm_dev->vm_variant) {
 	case HOSTVM:
 		is_suspend = 0;//return 0 since hostvm no need take any actions for suspend
 		break;
 	case PVM_ONLY:
-		dev_info(mvm_dev->dev, "pvm suspend recieved \n");
+		dev_info(mvm_dev->dev, "mvm_info:pvm suspend recieved \n");
 		is_suspend = wait_for_mvmss_wfi_interrupt(mvm_dev);
 		if (is_suspend == 0) {
 			collapse_mvm_core(mvm_dev);
@@ -2340,6 +2585,12 @@ static int mvm_suspend(struct device *dev)
 			reinit_completion(&mvm_dev->mvm_wfi_irq_recvd);
 			mvm_dev->resume_frm_pwr_collapse = true;
 			enable_wfi_int(mvm_dev, false);
+			list_for_each_entry(mvm_cli, &mvm_dev->client_list, list) { //if suspend is failed ,then keep client enabled
+				mvm_cli->state = CLIENT_READY;
+				dev_dbg(mvm_dev->dev, "mvm suspend failed : enable clients for mvm %d\n",mvm_cli->client_id);
+			}
+			add_timer(&mvm_dev->mvm_stats_timer);
+			mod_timer(&mvm_dev->mvm_stats_timer,jiffies + msecs_to_jiffies(mvm_stats_timer_interval_ms));
 		}
 		break;
 	case TELEVM:
@@ -2347,7 +2598,7 @@ static int mvm_suspend(struct device *dev)
 		if (is_suspend == 0) {
 			gh_dbl_flags_t dbl_mask = MVM_DO_SUSPEND_DBL_MASK;
 			dbl_mask = MVM_DO_SUSPEND_DBL_MASK;
-			dev_info(mvm_dev->dev, "televm suspend recieved \n");
+			dev_info(mvm_dev->dev, "mvm_info:televm suspend recieved \n");
 			reinit_completion(&mvm_dev->mvm_suspend_done);
 			ret = gh_dbl_send(mvm_dev->televm_tx_dbl, &dbl_mask, 0);
 			if (ret) {
@@ -2372,13 +2623,18 @@ static int mvm_suspend(struct device *dev)
 			reinit_completion(&mvm_dev->mvm_wfi_irq_recvd);
 			mvm_dev->resume_frm_pwr_collapse = true;
 			enable_wfi_int(mvm_dev, false);
+			list_for_each_entry(mvm_cli, &mvm_dev->client_list, list) { //if suspend is failed ,then keep client enabled
+				mvm_cli->state = CLIENT_READY;
+				dev_dbg(mvm_dev->dev, "mvm suspend failed : enable clients for mvm %d\n",mvm_cli->client_id);
+			}
+			add_timer(&mvm_dev->mvm_stats_timer);
+			mod_timer(&mvm_dev->mvm_stats_timer,jiffies + msecs_to_jiffies(mvm_stats_timer_interval_ms));
 		}
 		break;
 	default:
 		break;
 	}
 
-	mutex_unlock(&mvm_dev->mvm_csr_lock);
 	return is_suspend;
 }
 
@@ -2426,14 +2682,122 @@ static int mvm_resume(struct device *dev)
 	default:
 		break;
 	}
-
-	list_for_each_entry(mvm_cli, &mvm_dev->client_list, list) {
-		mvm_cli->state = CLIENT_READY;
-		dev_dbg(mvm_dev->dev, "mvm is restoring and enable clients for mvm %d\n",mvm_cli->client_id);
+	if(mvm_dev->vm_variant == PVM_ONLY || mvm_dev->vm_variant == TELEVM) {
+		list_for_each_entry(mvm_cli, &mvm_dev->client_list, list) {
+			mvm_cli->state = CLIENT_READY;
+			dev_dbg(mvm_dev->dev, "mvm is restoring and enable clients for mvm %d\n",mvm_cli->client_id);
+		}
+		mvm_dev->state = MVM_ONLINE;
+		send_mvm_state_to_user(mvm_dev);
+		mvm_dev->curr_clk = LOW_SVS;
+		mvm_dev->req_clk = LOW_SVS;
+		mvm_dev->prev_pke_time = 0;
+		add_timer(&mvm_dev->mvm_stats_timer);
+		mod_timer(&mvm_dev->mvm_stats_timer,jiffies + msecs_to_jiffies(mvm_stats_timer_interval_ms));
 	}
-	mvm_dev->state = MVM_ONLINE;
-	send_mvm_state_to_user(mvm_dev);
 	return is_resume;
+}
+
+static void change_clk_freq_work_hdlr(struct work_struct *work)
+{
+	struct mvm_device *mvm_dev = container_of(work, struct mvm_device, change_clk_freq_work);
+	int ret = 0;
+	ktime_t now;
+	ktime_t de_bounce_time;
+
+	mvm_dev->pke_util = (100 * (mvm_dev->ring_buff->pke_time_accumulator - mvm_dev->prev_pke_time)) / (3 * 1920000);
+	mvm_dev->prev_pke_time = mvm_dev->ring_buff->pke_time_accumulator;
+
+	now = ktime_get();
+	de_bounce_time = ktime_sub(now, mvm_dev->clk_time_elapsed);
+	if((mvm_dev->req_clk == mvm_dev->curr_clk) &&(ktime_to_ms(de_bounce_time) > MIN_CLOCK_CHANGE_TIME_MS)){
+		if (mvm_dev->pke_util > PKE_UTIL_UPPER_THRESH && mvm_dev->curr_clk > NOMINAL) {
+			mvm_dev->req_clk--;
+			dev_dbg(mvm_dev->dev, "Requesting clock increase from %s to %s\n",
+				mvm_clk_freq_plan[mvm_dev->curr_clk],
+				mvm_clk_freq_plan[mvm_dev->req_clk]);
+		}
+		else if (mvm_dev->pke_util < PKE_UTIL_LOWER_THRESH && mvm_dev->curr_clk < LOW_SVS) {
+			mvm_dev->req_clk++;
+			dev_dbg(mvm_dev->dev, "Requesting clock decrease from %s to %s\n",
+				mvm_clk_freq_plan[mvm_dev->curr_clk],
+				mvm_clk_freq_plan[mvm_dev->req_clk]);
+		}
+		if (mvm_dev->req_clk != mvm_dev->curr_clk) {
+			/* Send control message to change the clock frequency */
+			struct mvm_control *mvm_ctrl = kzalloc(sizeof(struct mvm_control), GFP_KERNEL);
+			mvm_ctrl->type = MVM_CHANGE_CLK_FREQ;
+			mvm_ctrl->mvm_ctrl_msg.mvm_clk_freq.clk_freq = mvm_dev->req_clk;
+			ret = send_ctrl_msg_to_mvm(mvm_ctrl, mvm_dev);
+			dev_dbg(mvm_dev->dev, "time taken for changing clock rate %lld \n",ktime_to_ms(de_bounce_time));
+			mvm_dev->clk_time_elapsed = ktime_get();
+		}
+	}
+	mod_timer(&mvm_dev->mvm_stats_timer,jiffies + msecs_to_jiffies(mvm_stats_timer_interval_ms));
+}
+
+static void mvm_stats_monitor_timeout_handler(struct timer_list *t)
+{
+	struct mvm_device *mvm_dev = from_timer(mvm_dev, t, mvm_stats_timer);
+
+	schedule_work(&mvm_dev->change_clk_freq_work);
+}
+
+static int mvm_stats_init(struct mvm_device *mvm_dev)
+{
+	int i, ret = 0;
+
+	ret = alloc_chrdev_region(&mvm_dev->mvm_stats_cdev_devid, 0, 2, "mvm_stats");
+	if (ret < 0) {
+		dev_err(mvm_dev->dev,
+			"can't allocate major number, %d\n", ret);
+		goto ret;
+	}
+
+	cdev_init(&mvm_dev->mvm_stats_cdev, &mvm_stats_fileops);
+	cdev_add(&mvm_dev->mvm_stats_cdev, mvm_dev->mvm_stats_cdev_devid, 1);
+
+	mvm_dev->mvm_stats_class = class_create(THIS_MODULE, "mvm_stats");
+	if (IS_ERR(mvm_dev->mvm_stats_class)) {
+		dev_err(mvm_dev->dev,
+			"can't create mvm_stats class, %d\n",
+			-ENOMEM);
+		goto class_fail;
+	}
+
+	mvm_dev->mvm_stats_dev = device_create(mvm_dev->mvm_stats_class, NULL,
+				mvm_dev->mvm_stats_cdev_devid, NULL, "mvm_stats");
+	if (IS_ERR(mvm_dev->mvm_stats_dev)) {
+		dev_err(mvm_dev->dev,
+			"can't create mvm_stats device, %d\n",
+			-ENOMEM);
+		goto device_fail;
+	}
+
+	dev_info(mvm_dev->dev, "mvm_stats device created\n");
+
+	for(i=0; i<MAX_CURVES; i++) {
+		mvm_dev->mvm_capacity[i] = MVM_INITIAL_CAPACITY;
+		mvm_dev->mvm_in_msg_count[i] = 0;
+	}
+
+	mvm_dev->curr_clk = LOW_SVS;
+	mvm_dev->req_clk = LOW_SVS;
+	mvm_dev->max_clk = NOMINAL;
+
+	timer_setup(&mvm_dev->mvm_stats_timer, mvm_stats_monitor_timeout_handler, 0);
+	mvm_dev->mvm_stats_timer.expires = jiffies + msecs_to_jiffies(mvm_stats_timer_interval_ms);
+	add_timer(&mvm_dev->mvm_stats_timer);
+
+	return 0;
+
+device_fail:
+	class_destroy(mvm_dev->mvm_stats_class);
+class_fail:
+	cdev_del(&mvm_dev->mvm_stats_cdev);
+	unregister_chrdev_region(mvm_dev->mvm_stats_cdev_devid, 1);
+ret:
+	return ret;
 }
 
 static int mvm_probe(struct platform_device *pdev)
@@ -2492,6 +2856,7 @@ static int mvm_probe(struct platform_device *pdev)
 		dev_err(mvm_dev->dev, "Cant ioremap resources\n");
 		goto ioremap_fail;
 	}
+
 
 	ret = mvm_sysfs_init(mvm_dev);
 	if (ret) {
@@ -2569,7 +2934,6 @@ static int mvm_probe(struct platform_device *pdev)
 			goto isrs_fail;
 
 		mutex_init(&mvm_dev->mvm_cli_lock);
-		mutex_init(&mvm_dev->mvm_csr_lock);
 		mutex_init(&mvm_dev->in_fifo_lock);
 		mutex_init(&mvm_dev->out_fifo_lock);
 
@@ -2581,11 +2945,13 @@ static int mvm_probe(struct platform_device *pdev)
 		init_completion(&mvm_dev->mvm_resume_done);
 
 		INIT_LIST_HEAD(&mvm_dev->client_list);
+		INIT_LIST_HEAD(&mvm_dev->mvm_stats_client_list);
 		init_waitqueue_head(&mvm_dev->mvm_waitqueue);
 		init_waitqueue_head(&mvm_dev->log_poll_wait);
 		init_waitqueue_head(&mvm_dev->ssr_poll_wait);
 		INIT_WORK(&mvm_dev->drain_out_fifo_work, drain_out_fifo_work_hdlr);
 		INIT_WORK(&mvm_dev->trigger_ssr_work, trigger_ssr_work_hdlr);
+		INIT_WORK(&mvm_dev->change_clk_freq_work, change_clk_freq_work_hdlr);
 
 		bitmap_zero(mvm_dev->client_id_bitmap, MAX_CLIENT_COUNT);
 		mvm_dev->pending_dump_read = false;
@@ -2618,8 +2984,14 @@ static int mvm_probe(struct platform_device *pdev)
 			goto doorbell_fail;
 	}
 
-	if (mvm_dev->vm_variant == PVM_ONLY || mvm_dev->vm_variant == TELEVM)
+	if (mvm_dev->vm_variant == PVM_ONLY || mvm_dev->vm_variant == TELEVM) {
+		ret = mvm_stats_init(mvm_dev);
+		if (ret) {
+			dev_err(mvm_dev->dev, "mvm_stats_init failed\n");
+			goto doorbell_fail;
+		}
 		initialise_fifos(mvm_dev);
+	}
 
 	return 0;
 
@@ -2634,13 +3006,14 @@ doorbell_fail:
 	} else if (mvm_dev->vm_variant == PVM_ONLY) {
 		mutex_destroy(&mvm_dev->in_fifo_lock);
 		mutex_destroy(&mvm_dev->out_fifo_lock);
-		mutex_destroy(&mvm_dev->mvm_csr_lock);
 		mutex_destroy(&mvm_dev->mvm_cli_lock);
 	}
-pm_err:
 	if(mvm_dev->vm_variant == PVM_ONLY || mvm_dev->vm_variant == TELEVM) {
 		unregister_pm_notifier(&mvm_dev->pm_notifier);
 	}
+pm_err:
+	if (mvm_dev->vm_variant == PVM_ONLY || mvm_dev->vm_variant == TELEVM)
+		debugfs_remove_recursive(mvm_dev->dir);
 hostvm_mem_share_fail:
 	if(mvm_dev->vm_variant == HOSTVM) {
 		gh_rm_mem_reclaim(mvm_dev->mvmss_mem_handle, 0);
@@ -2659,7 +3032,12 @@ iommu_init_fail:
 	if (mvm_dev->vm_variant == PVM_ONLY || mvm_dev->vm_variant == HOSTVM)
 		mvm_dma_mem_free(mvm_dev);
 dma_mem_fail:
-	sysfs_remove_file(mvm_dev->kobj, &mvm_dev->attr.attr);
+	if(mvm_dev->vm_variant == PVM_ONLY || mvm_dev->vm_variant == TELEVM) {
+		sysfs_remove_file(mvm_dev->kobj, &mvm_dev->mvm_capacity_attr.attr);
+		sysfs_remove_file(mvm_dev->kobj, &mvm_dev->mvm_max_clk_attr.attr);
+		sysfs_remove_file(mvm_dev->kobj, &mvm_dev->mvm_curr_clk_attr.attr);
+	}
+	sysfs_remove_file(mvm_dev->kobj, &mvm_dev->mvm_state_attr.attr);
 	kobject_put(mvm_dev->kobj);
 sysfs_fail:
 	devm_iounmap(mvm_dev->dev, mvm_dev->mvm_base);
@@ -2685,8 +3063,12 @@ static int mvm_remove(struct platform_device *pdev)
 	if (mvm_dev->vm_variant == PVM_ONLY || mvm_dev->vm_variant == TELEVM) {
 		mutex_destroy(&mvm_dev->in_fifo_lock);
 		mutex_destroy(&mvm_dev->out_fifo_lock);
-		mutex_destroy(&mvm_dev->mvm_csr_lock);
 		mutex_destroy(&mvm_dev->mvm_cli_lock);
+		device_destroy(mvm_dev->mvm_stats_class, mvm_dev->mvm_stats_cdev_devid);
+		class_destroy(mvm_dev->mvm_stats_class);
+		cdev_del(&mvm_dev->mvm_stats_cdev);
+		unregister_chrdev_region(mvm_dev->mvm_stats_cdev_devid, 1);
+		del_timer(&mvm_dev->mvm_stats_timer);
 	}
 
         if (mvm_dev->vm_variant == HOSTVM) {
@@ -2717,8 +3099,12 @@ static int mvm_remove(struct platform_device *pdev)
 	}
 	if(mvm_dev->vm_variant == PVM_ONLY || mvm_dev->vm_variant == TELEVM) {
 		unregister_pm_notifier(&mvm_dev->pm_notifier);
+		sysfs_remove_file(mvm_dev->kobj, &mvm_dev->mvm_capacity_attr.attr);
+		sysfs_remove_file(mvm_dev->kobj, &mvm_dev->mvm_max_clk_attr.attr);
+		sysfs_remove_file(mvm_dev->kobj, &mvm_dev->mvm_curr_clk_attr.attr);
+		debugfs_remove_recursive(mvm_dev->dir);
 	}
-	sysfs_remove_file(mvm_dev->kobj, &mvm_dev->attr.attr);
+	sysfs_remove_file(mvm_dev->kobj, &mvm_dev->mvm_state_attr.attr);
 	kobject_put(mvm_dev->kobj);
 	device_destroy(mvm_dev->mvm_class, mvm_dev->mvm_cdev_devid);
 	class_destroy(mvm_dev->mvm_class);
@@ -2759,5 +3145,6 @@ static void __exit mvm_unregister(void)
 {
 	platform_driver_unregister(&mvm_driver);
 }
+module_param(mvm_stats_timer_interval_ms, int, 0644);
 module_exit(mvm_unregister);
 MODULE_LICENSE("GPL v2");

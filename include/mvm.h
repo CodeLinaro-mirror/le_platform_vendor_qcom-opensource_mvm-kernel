@@ -30,10 +30,13 @@ struct output_msg {
 	uint8_t data[VER_RES_DATA_LEN];
 };
 
-#define MVM_DEV_NODE      "/dev/mvm"
-#define GET_CLIENT_ID     100
-#define SET_TIMEOUT_MS    101
-#define READY_AFTER_SSR   102
-#define CTL_MSG_OPCODE    0x02
+#define MVM_DEV_NODE      	"/dev/mvm"
+#define GET_CLIENT_ID     	100
+#define SET_TIMEOUT_MS    	101
+#define READY_AFTER_SSR   	102
+#define GET_MVM_CAPACITY  	103
+#define GET_MVM_STATS_MSG_COUNT	104
+#define GET_MVM_STATE		105
+#define CTL_MSG_OPCODE    	0x02
 
 #endif
