@@ -1046,7 +1046,6 @@ static bool drain_out_fifo(struct mvm_device *mvm_dev, unsigned int fifo_index, 
 				case MVM_DEBUG:
 					mvm_dev->active_buffer_index = mvm_ctrl_recv->mvm_ctrl_msg.debug.transfer_msg.active_buffer_index;
 					process_control_message(mvm_ctrl_recv, mvm_dev);
-					control_message_written = true;
 					break;
 				case MVM_POLICY:
 					break;
@@ -1068,6 +1067,7 @@ static bool drain_out_fifo(struct mvm_device *mvm_dev, unsigned int fifo_index, 
 				default:
 					break;
 				}
+				control_message_written = true;
 				kfree(mvm_ctrl_recv);
 			}
 			else {
