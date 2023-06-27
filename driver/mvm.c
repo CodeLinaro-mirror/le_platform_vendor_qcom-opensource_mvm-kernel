@@ -153,9 +153,20 @@ each of the actual P0 and P1 buffer starts */
 #define MVM_STATS_TIMEOUT_MS		100
 #define MVM_INITIAL_CAPACITY 		100
 
-#define PKE_UTIL_UPPER_THRESH 		75
-#define PKE_UTIL_LOWER_THRESH 		25
-#define MVM_STATS_TIMER_DEFAULT_INTERVAL_MS	100
+#define CLK_CHANGE_MIN_CAPACITY		3001
+#define PKE_UTIL_ADJUST_THRESH		90
+#define PKE_UTIL_UPPER_THRESH		70
+#define PKE_UTIL_LOWER_THRESH		40
+#define MAX_PKE_UTIL_LOW_SVS		100
+#define PKE_UTIL_ADJUST_FACTOR_LOWSVS(x)	(x/2)
+#define PKE_UTIL_ADJUST_FACTOR_SVS(x)		((x*3)/4)
+#define MVM_STATS_TIMER_DEFAULT_INTERVAL_MS	300
+#define PKE_UTIL_PERIOD_TICKS (19200 * mvm_stats_timer_interval_ms)
+#define PKE_COUNT 3
+#define LOW_SVS_THRESH_RANGE	1 ... 50
+#define SVS_THRESH_RANGE		51 ... 70
+#define NOMINAL_THRESH_RANGE	71 ... 100
+
 /**
  * enum mvm_state - state of mvm subsystem
  * @MVM_OFFLINE: MVM firmware is not loaded/authenticated yet.
@@ -349,7 +360,8 @@ struct mvm_device {
 	struct timer_list mvm_stats_timer;
 	uint32_t mvm_in_msg_count[MAX_CURVES];
 	unsigned int prev_pke_time;
-	unsigned int pke_util;
+	unsigned int curr_pke_util ;
+	unsigned int prev_pke_util;
 	dev_t mvm_stats_cdev_devid;
 	struct list_head mvm_stats_client_list;
 	struct cdev mvm_stats_cdev;
@@ -365,7 +377,7 @@ static const uint32_t mvm_rate[MAX_FREQ_PLAN][MAX_CURVES] = {
 
 static int enable_gcc_clocks(struct mvm_device *mvm_dev);
 int qcom_pil_info_store(const char *image, phys_addr_t base, size_t size);
-static int mvm_stats_timer_interval_ms = MVM_STATS_TIMER_DEFAULT_INTERVAL_MS;//set 100ms as default value
+static int mvm_stats_timer_interval_ms = MVM_STATS_TIMER_DEFAULT_INTERVAL_MS;//set 300ms as default value
 
 static void send_mvm_state_to_user(struct mvm_device *mvm_dev, enum mvm_state state)
 {
@@ -897,7 +909,7 @@ static ssize_t pke_util_read(struct file *filp, char __user *buff, size_t count,
 		char string[12] = {0};
 		struct mvm_device *mvm_dev = filp->private_data;
 
-		int to_copy = snprintf(string,12,"0x%x\n",mvm_dev->pke_util);
+		int to_copy = snprintf(string,12,"0x%x\n",mvm_dev->curr_pke_util);
 		unsigned long remain = copy_to_user(buff,string,to_copy);
 		*offset += (to_copy - remain);
 		return *offset;
@@ -1058,7 +1070,7 @@ static bool drain_out_fifo(struct mvm_device *mvm_dev, unsigned int fifo_index, 
 					send_mvm_capacity_to_user(mvm_dev);
 					break;
 				case MVM_CHANGE_CLK_FREQ:
-					dev_info(mvm_dev->dev, "Clock freq changed from %s to %s\n",
+					dev_dbg(mvm_dev->dev, "Clock freq changed from %s to %s\n",
 							mvm_clk_freq_plan[mvm_dev->curr_clk],
 							mvm_clk_freq_plan[mvm_ctrl_recv->mvm_ctrl_msg.mvm_clk_freq.clk_freq]);
 					mvm_dev->curr_clk = mvm_ctrl_recv->mvm_ctrl_msg.mvm_clk_freq.clk_freq;
@@ -2747,30 +2759,51 @@ static void change_clk_freq_work_hdlr(struct work_struct *work)
 {
 	struct mvm_device *mvm_dev = container_of(work, struct mvm_device, change_clk_freq_work);
 	int ret = 0;
-	ktime_t now;
-	ktime_t de_bounce_time;
+	unsigned int pke_utility_now = 0;
+	bool change_clock = true;
+	ktime_t now,de_bounce_time;
 
 	/*Do not change clock frequency when entering suspend or when MVM has crashed */
 	if (mvm_dev->state == MVM_CRASHED || mvm_dev->state == MVM_SUSPEND)
 		return;
 
-	mvm_dev->pke_util = (100 * (mvm_dev->ring_buff->pke_time_accumulator - mvm_dev->prev_pke_time)) / (3 * 1920000);
-	mvm_dev->prev_pke_time = mvm_dev->ring_buff->pke_time_accumulator;
-
+	pke_utility_now = mvm_dev->ring_buff->pke_time_accumulator;
+	mvm_dev->curr_pke_util= (100 * (pke_utility_now - mvm_dev->prev_pke_time)) / (PKE_COUNT  * PKE_UTIL_PERIOD_TICKS);
+	mvm_dev->curr_pke_util = (mvm_dev->prev_pke_util + mvm_dev->curr_pke_util)/2;//take average of pke_prev_util and pke_curr_util
+	mvm_dev->prev_pke_util = mvm_dev->curr_pke_util;
+	mvm_dev->prev_pke_time = pke_utility_now;
+	pke_utility_now = mvm_dev->curr_pke_util;
 	now = ktime_get();
+	if (mvm_dev->max_rate < CLK_CHANGE_MIN_CAPACITY) {//When max_rate is 3000 or less, operate at LOW_SVS.
+		change_clock = false;
+	}
+	if (mvm_dev->curr_clk == LOW_SVS) {
+		if (mvm_dev->curr_pke_util < MAX_PKE_UTIL_LOW_SVS)
+			change_clock = false;//operate in low_svs untill utilization upto MAX_PKE_UTIL_LOW_SVS
+		else
+			pke_utility_now = PKE_UTIL_ADJUST_FACTOR_LOWSVS(pke_utility_now);
+		/*Once pke utilisation goes beyond MAX_PKE_UTIL_LOW_SVS, then clock will be switched to SVS.
+		Since we are running at a higher frequency compared to the previous run, utilisation will drop now.
+		Hence adjust the pke utilisation with the division factor to avoid switching to LOW_SVS or NOMINAL*/
+	}
+	else if((mvm_dev->curr_clk == SVS)&& (mvm_dev->curr_pke_util > PKE_UTIL_UPPER_THRESH) &&(mvm_dev->curr_pke_util < PKE_UTIL_ADJUST_THRESH)){
+		/*When operating at SVS, do not switch the clock unless the pke utilisation is more than PKE_UTIL_ADJUST_THRESH.*/
+		pke_utility_now = PKE_UTIL_ADJUST_FACTOR_SVS(pke_utility_now);//Adjust the pke utilisation value by PKE_UTIL_ADJUST_FACTOR_SVS to ensure we dont switch clock unnecessarily.
+	}
 	de_bounce_time = ktime_sub(now, mvm_dev->clk_time_elapsed);
-	if((mvm_dev->req_clk == mvm_dev->curr_clk) &&(ktime_to_ms(de_bounce_time) > MIN_CLOCK_CHANGE_TIME_MS)){
-		if (mvm_dev->pke_util > PKE_UTIL_UPPER_THRESH && mvm_dev->curr_clk > NOMINAL) {
-			mvm_dev->req_clk--;
-			dev_dbg(mvm_dev->dev, "Requesting clock increase from %s to %s\n",
-				mvm_clk_freq_plan[mvm_dev->curr_clk],
-				mvm_clk_freq_plan[mvm_dev->req_clk]);
-		}
-		else if (mvm_dev->pke_util < PKE_UTIL_LOWER_THRESH && mvm_dev->curr_clk < LOW_SVS) {
-			mvm_dev->req_clk++;
-			dev_dbg(mvm_dev->dev, "Requesting clock decrease from %s to %s\n",
-				mvm_clk_freq_plan[mvm_dev->curr_clk],
-				mvm_clk_freq_plan[mvm_dev->req_clk]);
+	if((mvm_dev->req_clk == mvm_dev->curr_clk) && (ktime_to_ms(de_bounce_time) > MIN_CLOCK_CHANGE_TIME_MS) && (change_clock)){
+		switch (pke_utility_now) {
+		 case LOW_SVS_THRESH_RANGE:
+		 	mvm_dev->req_clk = LOW_SVS;
+		 	break;
+		 case SVS_THRESH_RANGE:
+			mvm_dev->req_clk = SVS;
+		 	break;
+		 case NOMINAL_THRESH_RANGE:
+		 	mvm_dev->req_clk = NOMINAL;
+		 	break;
+		 default:
+		 	break;
 		}
 		if (mvm_dev->req_clk != mvm_dev->curr_clk) {
 			/* Send control message to change the clock frequency */
@@ -2779,7 +2812,7 @@ static void change_clk_freq_work_hdlr(struct work_struct *work)
 				mvm_ctrl->type = MVM_CHANGE_CLK_FREQ;
 				mvm_ctrl->mvm_ctrl_msg.mvm_clk_freq.clk_freq = mvm_dev->req_clk;
 				ret = send_ctrl_msg_to_mvm(mvm_ctrl, mvm_dev);
-				dev_dbg(mvm_dev->dev, "time taken for changing clock rate %lld \n",ktime_to_ms(de_bounce_time));
+				dev_dbg(mvm_dev->dev, "time taken for changing clock rate %lld %d\n",ktime_to_ms(de_bounce_time));
 				mvm_dev->clk_time_elapsed = ktime_get();
 			}
 			else {
