@@ -2138,6 +2138,7 @@ static void trigger_ssr_work_hdlr(struct work_struct *work)
 	bool p0_fifo_has_results =0 ,p1_fifo_has_results =0;
 	gh_dbl_flags_t dbl_mask;
 
+	del_timer_sync(&mvm_dev->mvm_stats_timer);
 	if (mvm_dev->vm_variant == TELEVM) {
 		dbl_mask = MVM_SHUTDOWN_DBL_MASK;
 		ret = gh_dbl_send(mvm_dev->televm_tx_dbl, &dbl_mask, 0);
@@ -2201,7 +2202,6 @@ static void trigger_ssr_work_hdlr(struct work_struct *work)
 	if (mvm_dev->vm_variant == PVM_ONLY)
 		initialise_fifos(mvm_dev);
 
-	add_timer(&mvm_dev->mvm_stats_timer);//enable timer for dynamic clock change after ssr
 	mod_timer(&mvm_dev->mvm_stats_timer,jiffies + msecs_to_jiffies(mvm_stats_timer_interval_ms));
 	return;
 }
@@ -2210,7 +2210,6 @@ static irqreturn_t mvm_wdog_irq_handler(int irq, void *dev_id)
 {
 	struct mvm_device *mvm_dev = dev_id;
 
-	del_timer(&mvm_dev->mvm_stats_timer);//stop dynamic clock timer during ssr,stop sending control message for clock change
 	dev_info(mvm_dev->dev, "Received watchdog bite from MVM\n");
 	mvm_dev->state = MVM_CRASHED;
 	dev_dbg(mvm_dev->dev, "The current state of MVM is CRASHED\n");
@@ -2585,8 +2584,8 @@ static int mvm_pm_notify(struct notifier_block *notifier,
 				mvm_dev->resume_frm_pwr_collapse = false;
 				mvm_dev->state = MVM_SUSPEND;
 				send_mvm_state_to_user(mvm_dev);
+				del_timer_sync(&mvm_dev->mvm_stats_timer);
 				reinit_completion(&mvm_dev->mvm_wfi_irq_recvd);
-				del_timer(&mvm_dev->mvm_stats_timer);
 				ret =  send_pwr_collpase_ctrl_msg(mvm_dev, 1);
 				list_for_each_entry(mvm_cli, &mvm_dev->client_list, list) {
 					mvm_cli->state = CLIENT_SUSPEND;
@@ -2761,6 +2760,10 @@ static void change_clk_freq_work_hdlr(struct work_struct *work)
 	int ret = 0;
 	ktime_t now;
 	ktime_t de_bounce_time;
+
+	/*Do not change clock frequency when entering suspend or when MVM has crashed */
+	if (mvm_dev->state == MVM_CRASHED || mvm_dev->state == MVM_SUSPEND)
+		return;
 
 	mvm_dev->pke_util = (100 * (mvm_dev->ring_buff->pke_time_accumulator - mvm_dev->prev_pke_time)) / (3 * 1920000);
 	mvm_dev->prev_pke_time = mvm_dev->ring_buff->pke_time_accumulator;
@@ -3130,7 +3133,7 @@ static int mvm_remove(struct platform_device *pdev)
 		class_destroy(mvm_dev->mvm_stats_class);
 		cdev_del(&mvm_dev->mvm_stats_cdev);
 		unregister_chrdev_region(mvm_dev->mvm_stats_cdev_devid, 1);
-		del_timer(&mvm_dev->mvm_stats_timer);
+		del_timer_sync(&mvm_dev->mvm_stats_timer);
 	}
 
         if (mvm_dev->vm_variant == HOSTVM) {
