@@ -36,7 +36,6 @@ struct output_msg {
 #define READY_AFTER_SSR   	102
 #define GET_MVM_CAPACITY  	103
 #define GET_MVM_STATS_MSG_COUNT	104
-#define GET_MVM_STATE		105
 #define CTL_MSG_OPCODE    	0x02
 
 #endif

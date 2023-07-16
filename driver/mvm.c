@@ -38,7 +38,6 @@
 #include <linux/moduleparam.h>
 
 #define MVM_NOTIFY_SIGNO		SIGRTMAX
-#define MVM_NOTIFY_VALUE_STATE		10
 #define MVM_NOTIFY_VALUE_CAPACITY	11
 #define DDR_FIFO_COUNT			2
 #define DDR_FIFO_SIZE			128
@@ -368,14 +367,14 @@ static int enable_gcc_clocks(struct mvm_device *mvm_dev);
 int qcom_pil_info_store(const char *image, phys_addr_t base, size_t size);
 static int mvm_stats_timer_interval_ms = MVM_STATS_TIMER_DEFAULT_INTERVAL_MS;//set 100ms as default value
 
-static void send_mvm_state_to_user(struct mvm_device *mvm_dev)
+static void send_mvm_state_to_user(struct mvm_device *mvm_dev, enum mvm_state state)
 {
 	struct kernel_siginfo info;
 	struct mvm_client *mvm_cli;
 
 	memset(&info, 0, sizeof(struct kernel_siginfo));
 	info.si_signo = MVM_NOTIFY_SIGNO;
-	info.si_int = MVM_NOTIFY_VALUE_STATE;
+	info.si_int = state;
 
 	mutex_lock(&mvm_dev->mvm_cli_lock);
 	list_for_each_entry(mvm_cli, &mvm_dev->client_list, list) {
@@ -1296,7 +1295,6 @@ static long mvm_ioctl(struct file *filp, unsigned int cmd, unsigned long arg)
 {
 	int ret = 0;
 	struct mvm_client *mvm_cli = filp->private_data;
-	struct mvm_device *mvm_dev = mvm_cli->mvm_dev;
 
 	switch (cmd) {
 	case GET_CLIENT_ID:
@@ -1315,15 +1313,6 @@ static long mvm_ioctl(struct file *filp, unsigned int cmd, unsigned long arg)
 		mvm_cli->state = CLIENT_READY;
 		mvm_cli->out_buff->head = 0;
 		mvm_cli->out_buff->tail = 0;
-		break;
-
-	case GET_MVM_STATE:
-		if (copy_to_user((unsigned int *)arg, &mvm_dev->state,
-					sizeof(mvm_dev->state)))
-			ret = -EFAULT;
-		break;
-
-	default:
 		break;
 	}
 
@@ -1611,7 +1600,7 @@ static void initialise_fifos(struct mvm_device *mvm_dev)
 	writel_relaxed(IRQ_APSS0, mvm_dev->apss_shared_base + APSS_SHARED_IPC_INTERRUPT_OFFSET);
 	mvm_dev->state = MVM_ONLINE;
 	dev_info(mvm_dev->dev, "The current state of MVM is ONLINE\n");
-	send_mvm_state_to_user(mvm_dev);
+	send_mvm_state_to_user(mvm_dev, MVM_ONLINE);
 }
 
 static int mvm_televm_map_shared_mem(struct mvm_device *mvm_dev, char *compat, uint32_t shm_label)
@@ -2138,6 +2127,7 @@ static void trigger_ssr_work_hdlr(struct work_struct *work)
 	bool p0_fifo_has_results =0 ,p1_fifo_has_results =0;
 	gh_dbl_flags_t dbl_mask;
 
+	del_timer_sync(&mvm_dev->mvm_stats_timer);
 	if (mvm_dev->vm_variant == TELEVM) {
 		dbl_mask = MVM_SHUTDOWN_DBL_MASK;
 		ret = gh_dbl_send(mvm_dev->televm_tx_dbl, &dbl_mask, 0);
@@ -2174,7 +2164,7 @@ static void trigger_ssr_work_hdlr(struct work_struct *work)
 		}
 	}
 
-	send_mvm_state_to_user(mvm_dev);//Send crash signal to clients
+	send_mvm_state_to_user(mvm_dev, MVM_CRASHED);//Send crash signal to clients
 	ret = wait_for_completion_interruptible_timeout(
 			&mvm_dev->mvm_dump_collection_done,
 			msecs_to_jiffies(MVM_DUMP_COLL_TIMEOUT_MS));
@@ -2186,7 +2176,7 @@ static void trigger_ssr_work_hdlr(struct work_struct *work)
 	dev_info(mvm_dev->dev, "MVM subsystem is restarting after SSR\n");
 
 	mvm_dev->state = MVM_RESTARTING;
-	send_mvm_state_to_user(mvm_dev);
+	send_mvm_state_to_user(mvm_dev, MVM_RESTARTING);
 	if (mvm_dev->vm_variant == TELEVM) {
 		dbl_mask = MVM_LOAD_FW_DBL_MASK;
 		ret = gh_dbl_send(mvm_dev->televm_tx_dbl, &dbl_mask, 0);
@@ -2201,7 +2191,6 @@ static void trigger_ssr_work_hdlr(struct work_struct *work)
 	if (mvm_dev->vm_variant == PVM_ONLY)
 		initialise_fifos(mvm_dev);
 
-	add_timer(&mvm_dev->mvm_stats_timer);//enable timer for dynamic clock change after ssr
 	mod_timer(&mvm_dev->mvm_stats_timer,jiffies + msecs_to_jiffies(mvm_stats_timer_interval_ms));
 	return;
 }
@@ -2210,7 +2199,6 @@ static irqreturn_t mvm_wdog_irq_handler(int irq, void *dev_id)
 {
 	struct mvm_device *mvm_dev = dev_id;
 
-	del_timer(&mvm_dev->mvm_stats_timer);//stop dynamic clock timer during ssr,stop sending control message for clock change
 	dev_info(mvm_dev->dev, "Received watchdog bite from MVM\n");
 	mvm_dev->state = MVM_CRASHED;
 	dev_dbg(mvm_dev->dev, "The current state of MVM is CRASHED\n");
@@ -2584,9 +2572,9 @@ static int mvm_pm_notify(struct notifier_block *notifier,
 			if (mvm_dev->vm_variant == PVM_ONLY || mvm_dev->vm_variant == TELEVM) {
 				mvm_dev->resume_frm_pwr_collapse = false;
 				mvm_dev->state = MVM_SUSPEND;
-				send_mvm_state_to_user(mvm_dev);
+				send_mvm_state_to_user(mvm_dev, MVM_SUSPEND);
+				del_timer_sync(&mvm_dev->mvm_stats_timer);
 				reinit_completion(&mvm_dev->mvm_wfi_irq_recvd);
-				del_timer(&mvm_dev->mvm_stats_timer);
 				ret =  send_pwr_collpase_ctrl_msg(mvm_dev, 1);
 				list_for_each_entry(mvm_cli, &mvm_dev->client_list, list) {
 					mvm_cli->state = CLIENT_SUSPEND;
@@ -2745,7 +2733,7 @@ static int mvm_resume(struct device *dev)
 			dev_dbg(mvm_dev->dev, "mvm is restoring and enable clients for mvm %d\n",mvm_cli->client_id);
 		}
 		mvm_dev->state = MVM_ONLINE;
-		send_mvm_state_to_user(mvm_dev);
+		send_mvm_state_to_user(mvm_dev, MVM_ONLINE);
 		mvm_dev->curr_clk = LOW_SVS;
 		mvm_dev->req_clk = LOW_SVS;
 		mvm_dev->prev_pke_time = 0;
@@ -2761,6 +2749,10 @@ static void change_clk_freq_work_hdlr(struct work_struct *work)
 	int ret = 0;
 	ktime_t now;
 	ktime_t de_bounce_time;
+
+	/*Do not change clock frequency when entering suspend or when MVM has crashed */
+	if (mvm_dev->state == MVM_CRASHED || mvm_dev->state == MVM_SUSPEND)
+		return;
 
 	mvm_dev->pke_util = (100 * (mvm_dev->ring_buff->pke_time_accumulator - mvm_dev->prev_pke_time)) / (3 * 1920000);
 	mvm_dev->prev_pke_time = mvm_dev->ring_buff->pke_time_accumulator;
@@ -3130,7 +3122,7 @@ static int mvm_remove(struct platform_device *pdev)
 		class_destroy(mvm_dev->mvm_stats_class);
 		cdev_del(&mvm_dev->mvm_stats_cdev);
 		unregister_chrdev_region(mvm_dev->mvm_stats_cdev_devid, 1);
-		del_timer(&mvm_dev->mvm_stats_timer);
+		del_timer_sync(&mvm_dev->mvm_stats_timer);
 	}
 
         if (mvm_dev->vm_variant == HOSTVM) {
