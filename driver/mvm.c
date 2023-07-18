@@ -2891,7 +2891,6 @@ static int mvm_probe(struct platform_device *pdev)
 {
 	struct device_node *node;
 	struct mvm_device *mvm_dev;
-	struct device *dev;
 	int ret;
 
 	node = pdev->dev.of_node;
@@ -2903,39 +2902,43 @@ static int mvm_probe(struct platform_device *pdev)
 
 	platform_set_drvdata(pdev, mvm_dev);
 
-	ret = alloc_chrdev_region(&mvm_dev->mvm_cdev_devid, 0, 1, "mvm");
-	if (ret < 0) {
-		dev_err(mvm_dev->dev,
-			"can't allocate major number, %d\n", ret);
-		goto drv_err;
-	}
-
-	cdev_init(&mvm_dev->mvm_cdev, &mvm_fileops);
-	cdev_add(&mvm_dev->mvm_cdev, mvm_dev->mvm_cdev_devid, 1);
-	mvm_dev->mvm_class = class_create(THIS_MODULE, "mvm");
-	if (IS_ERR(mvm_dev->mvm_class)) {
-		dev_err(mvm_dev->dev,
-			"can't create rmt_sys_evt class, %d\n",
-			-ENOMEM);
-		goto class_fail;
-	}
-
-	dev = device_create(mvm_dev->mvm_class, &pdev->dev,
-				mvm_dev->mvm_cdev_devid, mvm_dev,
-				"mvm");
-	if (IS_ERR(dev)) {
-		dev_err(mvm_dev->dev,
-				"can't create rmt_sys_evt device, %d\n",
-				-ENOMEM);
-		goto device_fail;
-	}
-
-	dev_dbg(mvm_dev->dev, "mvm character device driver created\n");
-
 	ret = of_property_read_u32(node, "qcom,vm-variant", &mvm_dev->vm_variant);
 	if (ret) {
 		dev_err(mvm_dev->dev, "qcom,vm_variant property not defined\n");
-		goto device_fail;
+		goto drv_err;
+	}
+
+	if (mvm_dev->vm_variant == PVM_ONLY || mvm_dev->vm_variant == TELEVM) {
+		struct device *dev;
+
+		ret = alloc_chrdev_region(&mvm_dev->mvm_cdev_devid, 0, 1, "mvm");
+		if (ret < 0) {
+			dev_err(mvm_dev->dev,
+				"can't allocate major number, %d\n", ret);
+			goto drv_err;
+		}
+
+		cdev_init(&mvm_dev->mvm_cdev, &mvm_fileops);
+		cdev_add(&mvm_dev->mvm_cdev, mvm_dev->mvm_cdev_devid, 1);
+		mvm_dev->mvm_class = class_create(THIS_MODULE, "mvm");
+		if (IS_ERR(mvm_dev->mvm_class)) {
+			dev_err(mvm_dev->dev,
+				"can't create rmt_sys_evt class, %d\n",
+				-ENOMEM)	;
+			goto class_fail;
+		}
+
+		dev = device_create(mvm_dev->mvm_class, &pdev->dev,
+				mvm_dev->mvm_cdev_devid, mvm_dev,
+				"mvm");
+		if (IS_ERR(dev)) {
+			dev_err(mvm_dev->dev,
+				"can't create rmt_sys_evt device, %d\n",
+				-ENOMEM);
+			goto device_fail;
+		}
+
+		dev_dbg(mvm_dev->dev, "mvm character device driver created\n");
 	}
 
 	ret = ioremap_resources(pdev);
@@ -2943,7 +2946,6 @@ static int mvm_probe(struct platform_device *pdev)
 		dev_err(mvm_dev->dev, "Cant ioremap resources\n");
 		goto ioremap_fail;
 	}
-
 
 	ret = mvm_sysfs_init(mvm_dev);
 	if (ret) {
@@ -3130,12 +3132,16 @@ sysfs_fail:
 	devm_iounmap(mvm_dev->dev, mvm_dev->mvm_base);
 	devm_iounmap(mvm_dev->dev, mvm_dev->apss_shared_base);
 ioremap_fail:
-	device_destroy(mvm_dev->mvm_class, mvm_dev->mvm_cdev_devid);
+	if (mvm_dev->vm_variant == PVM_ONLY || mvm_dev->vm_variant == TELEVM)
+		device_destroy(mvm_dev->mvm_class, mvm_dev->mvm_cdev_devid);
 device_fail:
-	class_destroy(mvm_dev->mvm_class);
+	if (mvm_dev->vm_variant == PVM_ONLY || mvm_dev->vm_variant == TELEVM)
+		class_destroy(mvm_dev->mvm_class);
 class_fail:
-	cdev_del(&mvm_dev->mvm_cdev);
-	unregister_chrdev_region(mvm_dev->mvm_cdev_devid, 1);
+	if (mvm_dev->vm_variant == PVM_ONLY || mvm_dev->vm_variant == TELEVM) {
+		cdev_del(&mvm_dev->mvm_cdev);
+		unregister_chrdev_region(mvm_dev->mvm_cdev_devid, 1);
+	}
 drv_err:
 	platform_set_drvdata(pdev, NULL);
 	return ret;
