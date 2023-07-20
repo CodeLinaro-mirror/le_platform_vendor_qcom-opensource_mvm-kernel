@@ -2646,7 +2646,6 @@ static int mvm_suspend(struct device *dev)
 				mvm_cli->state = CLIENT_READY;
 				dev_dbg(mvm_dev->dev, "mvm suspend failed : enable clients for mvm %d\n",mvm_cli->client_id);
 			}
-			add_timer(&mvm_dev->mvm_stats_timer);
 			mod_timer(&mvm_dev->mvm_stats_timer,jiffies + msecs_to_jiffies(mvm_stats_timer_interval_ms));
 		}
 		break;
@@ -2684,7 +2683,6 @@ static int mvm_suspend(struct device *dev)
 				mvm_cli->state = CLIENT_READY;
 				dev_dbg(mvm_dev->dev, "mvm suspend failed : enable clients for mvm %d\n",mvm_cli->client_id);
 			}
-			add_timer(&mvm_dev->mvm_stats_timer);
 			mod_timer(&mvm_dev->mvm_stats_timer,jiffies + msecs_to_jiffies(mvm_stats_timer_interval_ms));
 		}
 		break;
@@ -2749,7 +2747,6 @@ static int mvm_resume(struct device *dev)
 		mvm_dev->curr_clk = LOW_SVS;
 		mvm_dev->req_clk = LOW_SVS;
 		mvm_dev->prev_pke_time = 0;
-		add_timer(&mvm_dev->mvm_stats_timer);
 		mod_timer(&mvm_dev->mvm_stats_timer,jiffies + msecs_to_jiffies(mvm_stats_timer_interval_ms));
 	}
 	return is_resume;
