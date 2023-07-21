@@ -2589,8 +2589,10 @@ static int mvm_pm_notify(struct notifier_block *notifier,
 				reinit_completion(&mvm_dev->mvm_wfi_irq_recvd);
 				ret =  send_pwr_collpase_ctrl_msg(mvm_dev, 1);
 				list_for_each_entry(mvm_cli, &mvm_dev->client_list, list) {
-					mvm_cli->state = CLIENT_SUSPEND;
-					dev_dbg(mvm_dev->dev, "disable mvm write clients at suspend  %d\n",mvm_cli->client_id);
+					if (mvm_cli->state != CLIENT_DISCONNECTING) {
+						mvm_cli->state = CLIENT_SUSPEND;
+						dev_dbg(mvm_dev->dev, "disable mvm write clients at suspend  %d\n",mvm_cli->client_id);
+					}
 				}
 			}
 		}
@@ -2643,8 +2645,10 @@ static int mvm_suspend(struct device *dev)
 			mvm_dev->resume_frm_pwr_collapse = true;
 			enable_wfi_int(mvm_dev, false);
 			list_for_each_entry(mvm_cli, &mvm_dev->client_list, list) { //if suspend is failed ,then keep client enabled
-				mvm_cli->state = CLIENT_READY;
-				dev_dbg(mvm_dev->dev, "mvm suspend failed : enable clients for mvm %d\n",mvm_cli->client_id);
+				if (mvm_cli->state != CLIENT_DISCONNECTING) {
+					mvm_cli->state = CLIENT_READY;
+					dev_dbg(mvm_dev->dev, "mvm suspend failed : enable clients for mvm %d\n",mvm_cli->client_id);
+				}
 			}
 			mod_timer(&mvm_dev->mvm_stats_timer,jiffies + msecs_to_jiffies(mvm_stats_timer_interval_ms));
 		}
@@ -2680,8 +2684,10 @@ static int mvm_suspend(struct device *dev)
 			mvm_dev->resume_frm_pwr_collapse = true;
 			enable_wfi_int(mvm_dev, false);
 			list_for_each_entry(mvm_cli, &mvm_dev->client_list, list) { //if suspend is failed ,then keep client enabled
-				mvm_cli->state = CLIENT_READY;
-				dev_dbg(mvm_dev->dev, "mvm suspend failed : enable clients for mvm %d\n",mvm_cli->client_id);
+				if (mvm_cli->state != CLIENT_DISCONNECTING) {
+					mvm_cli->state = CLIENT_READY;
+					dev_dbg(mvm_dev->dev, "mvm suspend failed : enable clients for mvm %d\n",mvm_cli->client_id);
+				}
 			}
 			mod_timer(&mvm_dev->mvm_stats_timer,jiffies + msecs_to_jiffies(mvm_stats_timer_interval_ms));
 		}
@@ -2739,8 +2745,10 @@ static int mvm_resume(struct device *dev)
 	}
 	if(mvm_dev->vm_variant == PVM_ONLY || mvm_dev->vm_variant == TELEVM) {
 		list_for_each_entry(mvm_cli, &mvm_dev->client_list, list) {
-			mvm_cli->state = CLIENT_READY;
-			dev_dbg(mvm_dev->dev, "mvm is restoring and enable clients for mvm %d\n",mvm_cli->client_id);
+			if (mvm_cli->state != CLIENT_DISCONNECTING) {
+				mvm_cli->state = CLIENT_READY;
+				dev_dbg(mvm_dev->dev, "mvm is restoring and enable clients for mvm %d\n",mvm_cli->client_id);
+			}
 		}
 		mvm_dev->state = MVM_ONLINE;
 		send_mvm_state_to_user(mvm_dev, MVM_ONLINE);
