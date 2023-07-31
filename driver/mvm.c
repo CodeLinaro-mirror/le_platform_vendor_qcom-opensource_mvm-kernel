@@ -2003,6 +2003,7 @@ static void disable_gcc_clocks(struct mvm_device *mvm_dev)
 	clk_disable_unprepare(mvm_dev->snoc_m_axi_clk);
 	clk_disable_unprepare(mvm_dev->cnoc_s_ahb_clk);
 	clk_disable_unprepare(mvm_dev->sysnoc_mvmss_clk);
+	clk_disable_unprepare(mvm_dev->xo);
 }
 
 static int send_pwr_collpase_ctrl_msg(struct mvm_device *mvm_dev, bool pwr_collapse) {
