@@ -166,6 +166,7 @@ each of the actual P0 and P1 buffer starts */
 #define LOW_SVS_THRESH_RANGE	1 ... 50
 #define SVS_THRESH_RANGE		51 ... 70
 #define NOMINAL_THRESH_RANGE	71 ... 100
+#define LOWSVS_RATE_LIMIT		3000
 
 /**
  * enum mvm_state - state of mvm subsystem
@@ -313,6 +314,7 @@ struct mvm_device {
 	struct kobj_attribute mvm_capacity_attr;
 	struct kobj_attribute mvm_curr_clk_attr;
 	struct kobj_attribute mvm_max_clk_attr;
+	struct kobj_attribute mvm_rate_lut_attr;
 	struct dentry *dir;
 	uint32_t *mvm_fw;
 	struct mvm_crashdump_buffer *dump_buff;
@@ -370,10 +372,11 @@ struct mvm_device {
 	ktime_t clk_time_elapsed;
 };
 
-static const uint32_t mvm_rate[MAX_FREQ_PLAN][MAX_CURVES] = {
-		{5817, 3014, 6485, 1992, 1004},
-		{9551, 4955, 10706, 3291, 1663},
-		{14285, 7434, 16064, 4938, 2493}};
+static const uint32_t mvm_rate_lut[MAX_FREQ_PLAN][MAX_CURVES] = {
+	/* NISTP256, BP256, SM2, NISTP384, BP384 */
+	{5817, 3014, 6485, 1992, 1004},    /* LOW_SVS */
+	{9551, 4955, 10706, 3291, 1663},   /* SVS */
+	{14285, 7434, 16064, 4938, 2493}}; /*NOMINAL */
 
 // Static copies for crashscope to access these variables
 static struct mvm_crashdump_buffer *crashdump_buffer = NULL;
@@ -411,18 +414,22 @@ static void send_mvm_capacity_to_user(struct mvm_device *mvm_dev)
 	struct kernel_siginfo info;
 	struct mvm_stats_client *mvm_stats_cli;
 	int i;
+	uint8_t rate_idx = 0;
 
 	memset(&info, 0, sizeof(struct kernel_siginfo));
 	info.si_signo = MVM_NOTIFY_SIGNO;
 	info.si_int = MVM_NOTIFY_VALUE_CAPACITY;
 
+	if (mvm_dev->max_rate > LOWSVS_RATE_LIMIT)
+		rate_idx = MAX_FREQ_PLAN-1;
+
 	for (i=0; i< MAX_CURVES; i++)
-		mvm_dev->mvm_capacity[i] = min(mvm_dev->max_rate, mvm_rate[MAX_FREQ_PLAN-1][i]);
+		mvm_dev->mvm_capacity[i] = min(mvm_dev->max_rate, mvm_rate_lut[rate_idx][i]);
 
 	list_for_each_entry(mvm_stats_cli, &mvm_dev->mvm_stats_client_list, list) {
 		if (mvm_stats_cli->task != NULL) {
 			if(send_sig_info(MVM_NOTIFY_SIGNO, &info, mvm_stats_cli->task) < 0)
-				dev_err(mvm_dev->dev, "Unable to send mvm state change signal to userspace\n");
+				dev_err(mvm_dev->dev, "Unable to send mvm capacity signal to userspace\n");
 			dev_info(mvm_dev->dev, "Sent capacity state change to client\n");
 		}
 	}
@@ -533,6 +540,18 @@ static ssize_t mvm_max_clk_show(struct kobject *kobj,
 	return snprintf(buf, 10, "%s\n", mvm_clk_freq_plan[mvm_dev->max_clk]);
 }
 
+static ssize_t mvm_rate_lut_show(struct kobject *kobj,
+				struct kobj_attribute *mvm_rate_lut_attr,
+				char *buf)
+{
+        return snprintf(buf, 80, "%d %d %d %d %d\n%d %d %d %d %d\n%d %d %d %d %d",
+				mvm_rate_lut[0][0], mvm_rate_lut[0][1], mvm_rate_lut[0][2],
+				mvm_rate_lut[0][3], mvm_rate_lut[0][4], mvm_rate_lut[1][0],
+				mvm_rate_lut[1][1], mvm_rate_lut[1][2], mvm_rate_lut[1][3],
+				mvm_rate_lut[1][4], mvm_rate_lut[2][0], mvm_rate_lut[2][1],
+				mvm_rate_lut[2][2], mvm_rate_lut[2][3], mvm_rate_lut[2][4]);
+}
+
 static int mvm_sysfs_init(struct mvm_device *mvm_dev)
 {
 	int ret = 0;
@@ -590,10 +609,25 @@ static int mvm_sysfs_init(struct mvm_device *mvm_dev)
 								__func__);
 			goto fail_sysfs_mvm_max_clk;
 		}
+		sysfs_attr_init(&mvm_dev->mvm_rate_lut_attr.attr);
+		mvm_dev->mvm_rate_lut_attr.attr.mode = 0444;
+		mvm_dev->mvm_rate_lut_attr.attr.name = "mvm_rate_lut";
+		mvm_dev->mvm_rate_lut_attr.show = mvm_rate_lut_show;
+		mvm_dev->mvm_rate_lut_attr.store = NULL;
+
+		ret = sysfs_create_file(mvm_dev->kobj, &mvm_dev->mvm_rate_lut_attr.attr);
+		if (ret)        {
+			dev_err(mvm_dev->dev, "%s: sysfs_create_file mvm_rate_lut failed\n",
+							__func__);
+			goto fail_sysfs_mvm_rate_lut;
+		}
+
 		mvm_dev->clk_time_elapsed =0;
 	}
 	return 0;
 
+fail_sysfs_mvm_rate_lut:
+	sysfs_remove_file(mvm_dev->kobj, &mvm_dev->mvm_max_clk_attr.attr);
 fail_sysfs_mvm_max_clk:
 	sysfs_remove_file(mvm_dev->kobj, &mvm_dev->mvm_capacity_attr.attr);
 fail_sysfs_mvm_capacity:
@@ -1074,6 +1108,8 @@ static bool drain_out_fifo(struct mvm_device *mvm_dev, unsigned int fifo_index, 
 				case MVM_MAX_RATE:
 					mvm_dev->max_rate = mvm_ctrl_recv->mvm_ctrl_msg.max_rate.max_rate;
 					dev_info(mvm_dev->dev, "MVM License file is read and the max rate supported by MVM is %d\n",mvm_dev->max_rate);
+					if (mvm_dev->max_rate > LOWSVS_RATE_LIMIT)
+						mvm_dev->max_clk = 0;
 					send_mvm_capacity_to_user(mvm_dev);
 					break;
 				case MVM_CHANGE_CLK_FREQ:
@@ -2886,7 +2922,7 @@ static int mvm_stats_init(struct mvm_device *mvm_dev)
 
 	mvm_dev->curr_clk = LOW_SVS;
 	mvm_dev->req_clk = LOW_SVS;
-	mvm_dev->max_clk = NOMINAL;
+	mvm_dev->max_clk = LOW_SVS;
 
 	timer_setup(&mvm_dev->mvm_stats_timer, mvm_stats_monitor_timeout_handler, 0);
 	mvm_dev->mvm_stats_timer.expires = jiffies + msecs_to_jiffies(mvm_stats_timer_interval_ms);
@@ -3138,6 +3174,7 @@ iommu_init_fail:
 		mvm_dma_mem_free(mvm_dev);
 dma_mem_fail:
 	if(mvm_dev->vm_variant == PVM_ONLY || mvm_dev->vm_variant == TELEVM) {
+		sysfs_remove_file(mvm_dev->kobj, &mvm_dev->mvm_rate_lut_attr.attr);
 		sysfs_remove_file(mvm_dev->kobj, &mvm_dev->mvm_capacity_attr.attr);
 		sysfs_remove_file(mvm_dev->kobj, &mvm_dev->mvm_max_clk_attr.attr);
 		sysfs_remove_file(mvm_dev->kobj, &mvm_dev->mvm_curr_clk_attr.attr);
@@ -3208,6 +3245,7 @@ static int mvm_remove(struct platform_device *pdev)
 	}
 	if(mvm_dev->vm_variant == PVM_ONLY || mvm_dev->vm_variant == TELEVM) {
 		unregister_pm_notifier(&mvm_dev->pm_notifier);
+		sysfs_remove_file(mvm_dev->kobj, &mvm_dev->mvm_rate_lut_attr.attr);
 		sysfs_remove_file(mvm_dev->kobj, &mvm_dev->mvm_capacity_attr.attr);
 		sysfs_remove_file(mvm_dev->kobj, &mvm_dev->mvm_max_clk_attr.attr);
 		sysfs_remove_file(mvm_dev->kobj, &mvm_dev->mvm_curr_clk_attr.attr);
