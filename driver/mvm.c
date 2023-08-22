@@ -139,7 +139,6 @@ each of the actual P0 and P1 buffer starts */
 #define BASE_ADDR_OFFSET		0x10
 #define MAX_LOG_BUFFER_SIZE		0x1800
 #define AC_VM_HLOS                      3
-#define AC_VM_GVM1			52
 #define APSS_SHARED_IPC_INTERRUPT_OFFSET	0xC
 #define DBL_MASK			0x1
 #define MVM_SHUTDOWN_DBL_MASK		0x1
@@ -372,6 +371,7 @@ struct mvm_device {
 	struct device *mvm_stats_dev;
 	ktime_t clk_time_elapsed;
 	struct notifier_block rm_nb;
+	gh_vmid_t televm_vmid;
 };
 
 static const uint32_t mvm_rate_lut[MAX_FREQ_PLAN][MAX_CURVES] = {
@@ -1737,7 +1737,7 @@ err:
 static int hyp_unassign_mem_reclaim(struct mvm_device *mvm_dev, dma_addr_t dma_addr, uint32_t label,
 				     uint32_t size, gh_memparcel_handle_t handle) {
 	int srcVMperm[1] = {PERM_READ | PERM_WRITE};
-	int srcVM[2] = {AC_VM_HLOS, AC_VM_GVM1};
+	int srcVM[2] = {AC_VM_HLOS, mvm_dev->televm_vmid};
 	int destVM[1] = {AC_VM_HLOS};
 	int ret;
 
@@ -1757,7 +1757,7 @@ static int hyp_assign_mem_share(struct mvm_device *mvm_dev, struct gh_acl_desc *
 	int srcVMperm[1] = {PERM_READ | PERM_WRITE};
 	int destVMperm[2] = {PERM_READ | PERM_WRITE, PERM_READ | PERM_WRITE};
 	int srcVM[1] = {AC_VM_HLOS};
-	int destVM[2] = {AC_VM_HLOS, AC_VM_GVM1};
+	int destVM[2] = {AC_VM_HLOS, mvm_dev->televm_vmid};
 	int ret = 0;
 
         mvm_sgl_desc->n_sgl_entries = 1;
@@ -1824,7 +1824,7 @@ static int mvm_hostvm_mem_share(struct mvm_device *mvm_dev)
 	struct gh_sgl_desc *mvm_sgl_desc;
 	int srcVMperm[1] = {PERM_READ | PERM_WRITE};
 	int srcVM[1] = {AC_VM_HLOS};
-	int destVM[2] = {AC_VM_HLOS, AC_VM_GVM1};
+	int destVM[2] = {AC_VM_HLOS, mvm_dev->televm_vmid};
 	int ret = 0;
 
 	mvm_dev->ring_buff_mem_handle = 0;
@@ -1846,7 +1846,7 @@ static int mvm_hostvm_mem_share(struct mvm_device *mvm_dev)
         mvm_acl_desc->n_acl_entries = 2;
         mvm_acl_desc->acl_entries[0].vmid = AC_VM_HLOS;
         mvm_acl_desc->acl_entries[0].perms = GH_RM_ACL_R | GH_RM_ACL_W;
-        mvm_acl_desc->acl_entries[1].vmid = AC_VM_GVM1;
+        mvm_acl_desc->acl_entries[1].vmid = mvm_dev->televm_vmid;
         mvm_acl_desc->acl_entries[1].perms = GH_RM_ACL_R | GH_RM_ACL_W;
 
         /* Share ring buffers from hostvm to televm */
@@ -1926,7 +1926,7 @@ static int mvm_hostvm_io_lend(struct mvm_device *mvm_dev)
 	}
 
 	mvm_acl_desc->n_acl_entries = 1;
-	mvm_acl_desc->acl_entries[0].vmid = AC_VM_GVM1;
+	mvm_acl_desc->acl_entries[0].vmid = mvm_dev->televm_vmid;
 	mvm_acl_desc->acl_entries[0].perms = GH_RM_ACL_R | GH_RM_ACL_W;
 
 	mvm_sgl_desc->n_sgl_entries = 1;
@@ -1944,7 +1944,7 @@ static int mvm_hostvm_io_lend(struct mvm_device *mvm_dev)
 	mvm_acl_desc->n_acl_entries = 2;
 	mvm_acl_desc->acl_entries[0].vmid = AC_VM_HLOS;
 	mvm_acl_desc->acl_entries[0].perms = GH_RM_ACL_R | GH_RM_ACL_W;
-	mvm_acl_desc->acl_entries[1].vmid = AC_VM_GVM1;
+	mvm_acl_desc->acl_entries[1].vmid = mvm_dev->televm_vmid;
 	mvm_acl_desc->acl_entries[1].perms = GH_RM_ACL_R | GH_RM_ACL_W;
 
 	mvm_sgl_desc->n_sgl_entries = 1;
@@ -2000,12 +2000,17 @@ static int qcom_mvm_rm_cb(struct notifier_block *nb, unsigned long cmd,
 	struct gh_rm_notif_vm_status_payload *vm_status_payload;
 	struct mvm_device *mvm_dev;
 	int ret;
+	gh_vmid_t vmid;
 
 	mvm_dev = container_of(nb, struct mvm_device, rm_nb);
-	(void) mvm_dev;
 	vm_status_payload = data;
-
-	if (vm_status_payload->vmid == AC_VM_GVM1 && cmd == GH_VM_BEFORE_POWERUP) {
+	ret = gh_rm_get_vmid(GH_TELE_VM, &vmid);
+	if (ret) {
+		dev_err(mvm_dev->dev, "gh_rm_get_vmid failed\n");
+		return NOTIFY_DONE;
+	}
+	if (vm_status_payload->vmid == vmid && cmd == GH_VM_BEFORE_POWERUP) {
+		mvm_dev->televm_vmid = vmid;
 
 		ret = read_shm_labels(mvm_dev);
 		if (ret) {
@@ -2024,7 +2029,7 @@ static int qcom_mvm_rm_cb(struct notifier_block *nb, unsigned long cmd,
 			goto hostvm_mem_share_fail;
 		}
 	}
-	else if (vm_status_payload->vmid == AC_VM_GVM1 && cmd == GH_VM_POWEROFF) {
+	else if (vm_status_payload->vmid == mvm_dev->televm_vmid && cmd == GH_VM_POWEROFF) {
 		ret = gh_rm_mem_reclaim(mvm_dev->mvmss_mem_handle, 0);
 		if (ret)
 			dev_err(mvm_dev->dev,"mem reclaim of mvmss_mem_handle failed with ret = %d\n",ret);
@@ -3209,9 +3214,7 @@ static int mvm_probe(struct platform_device *pdev)
 	return 0;
 
 doorbell_fail:
-	if (mvm_dev->vm_variant == HOSTVM) {
-		mvm_hostvm_unshare_mem(mvm_dev);
-	} else if (mvm_dev->vm_variant == PVM_ONLY) {
+	if (mvm_dev->vm_variant == PVM_ONLY) {
 		mutex_destroy(&mvm_dev->in_fifo_lock);
 		mutex_destroy(&mvm_dev->out_fifo_lock);
 		mutex_destroy(&mvm_dev->mvm_cli_lock);
