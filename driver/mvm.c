@@ -153,9 +153,21 @@ each of the actual P0 and P1 buffer starts */
 #define MVM_STATS_TIMEOUT_MS		100
 #define MVM_INITIAL_CAPACITY 		100
 
-#define PKE_UTIL_UPPER_THRESH 		75
-#define PKE_UTIL_LOWER_THRESH 		25
-#define MVM_STATS_TIMER_DEFAULT_INTERVAL_MS	100
+#define CLK_CHANGE_MIN_CAPACITY		3001
+#define PKE_UTIL_ADJUST_THRESH		90
+#define PKE_UTIL_UPPER_THRESH		70
+#define PKE_UTIL_LOWER_THRESH		40
+#define MAX_PKE_UTIL_LOW_SVS		100
+#define PKE_UTIL_ADJUST_FACTOR_LOWSVS(x)	(x/2)
+#define PKE_UTIL_ADJUST_FACTOR_SVS(x)		((x*3)/4)
+#define MVM_STATS_TIMER_DEFAULT_INTERVAL_MS	300
+#define PKE_UTIL_PERIOD_TICKS (19200 * mvm_stats_timer_interval_ms)
+#define PKE_COUNT 3
+#define LOW_SVS_THRESH_RANGE	1 ... 50
+#define SVS_THRESH_RANGE		51 ... 70
+#define NOMINAL_THRESH_RANGE	71 ... 100
+#define LOWSVS_RATE_LIMIT		3000
+
 /**
  * enum mvm_state - state of mvm subsystem
  * @MVM_OFFLINE: MVM firmware is not loaded/authenticated yet.
@@ -302,6 +314,7 @@ struct mvm_device {
 	struct kobj_attribute mvm_capacity_attr;
 	struct kobj_attribute mvm_curr_clk_attr;
 	struct kobj_attribute mvm_max_clk_attr;
+	struct kobj_attribute mvm_rate_lut_attr;
 	struct dentry *dir;
 	uint32_t *mvm_fw;
 	struct mvm_crashdump_buffer *dump_buff;
@@ -349,7 +362,8 @@ struct mvm_device {
 	struct timer_list mvm_stats_timer;
 	uint32_t mvm_in_msg_count[MAX_CURVES];
 	unsigned int prev_pke_time;
-	unsigned int pke_util;
+	unsigned int curr_pke_util ;
+	unsigned int prev_pke_util;
 	dev_t mvm_stats_cdev_devid;
 	struct list_head mvm_stats_client_list;
 	struct cdev mvm_stats_cdev;
@@ -358,14 +372,22 @@ struct mvm_device {
 	ktime_t clk_time_elapsed;
 };
 
-static const uint32_t mvm_rate[MAX_FREQ_PLAN][MAX_CURVES] = {
-		{5817, 3014, 6485, 1992, 1004},
-		{9551, 4955, 10706, 3291, 1663},
-		{14285, 7434, 16064, 4938, 2493}};
+static const uint32_t mvm_rate_lut[MAX_FREQ_PLAN][MAX_CURVES] = {
+	/* NISTP256, BP256, SM2, NISTP384, BP384 */
+	{5817, 3014, 6485, 1992, 1004},    /* LOW_SVS */
+	{9551, 4955, 10706, 3291, 1663},   /* SVS */
+	{14285, 7434, 16064, 4938, 2493}}; /*NOMINAL */
+
+// Static copies for crashscope to access these variables
+static struct mvm_crashdump_buffer *crashdump_buffer = NULL;
+__attribute__((used))
+static dma_addr_t crashdump_dma_addr = 0;
+__attribute__((used))
+static size_t crashdump_size = MVM_CRASH_DUMP_SIZE;
 
 static int enable_gcc_clocks(struct mvm_device *mvm_dev);
 int qcom_pil_info_store(const char *image, phys_addr_t base, size_t size);
-static int mvm_stats_timer_interval_ms = MVM_STATS_TIMER_DEFAULT_INTERVAL_MS;//set 100ms as default value
+static int mvm_stats_timer_interval_ms = MVM_STATS_TIMER_DEFAULT_INTERVAL_MS;//set 300ms as default value
 
 static void send_mvm_state_to_user(struct mvm_device *mvm_dev, enum mvm_state state)
 {
@@ -392,18 +414,22 @@ static void send_mvm_capacity_to_user(struct mvm_device *mvm_dev)
 	struct kernel_siginfo info;
 	struct mvm_stats_client *mvm_stats_cli;
 	int i;
+	uint8_t rate_idx = 0;
 
 	memset(&info, 0, sizeof(struct kernel_siginfo));
 	info.si_signo = MVM_NOTIFY_SIGNO;
 	info.si_int = MVM_NOTIFY_VALUE_CAPACITY;
 
+	if (mvm_dev->max_rate > LOWSVS_RATE_LIMIT)
+		rate_idx = MAX_FREQ_PLAN-1;
+
 	for (i=0; i< MAX_CURVES; i++)
-		mvm_dev->mvm_capacity[i] = min(mvm_dev->max_rate, mvm_rate[MAX_FREQ_PLAN-1][i]);
+		mvm_dev->mvm_capacity[i] = min(mvm_dev->max_rate, mvm_rate_lut[rate_idx][i]);
 
 	list_for_each_entry(mvm_stats_cli, &mvm_dev->mvm_stats_client_list, list) {
 		if (mvm_stats_cli->task != NULL) {
 			if(send_sig_info(MVM_NOTIFY_SIGNO, &info, mvm_stats_cli->task) < 0)
-				dev_err(mvm_dev->dev, "Unable to send mvm state change signal to userspace\n");
+				dev_err(mvm_dev->dev, "Unable to send mvm capacity signal to userspace\n");
 			dev_info(mvm_dev->dev, "Sent capacity state change to client\n");
 		}
 	}
@@ -514,6 +540,18 @@ static ssize_t mvm_max_clk_show(struct kobject *kobj,
 	return snprintf(buf, 10, "%s\n", mvm_clk_freq_plan[mvm_dev->max_clk]);
 }
 
+static ssize_t mvm_rate_lut_show(struct kobject *kobj,
+				struct kobj_attribute *mvm_rate_lut_attr,
+				char *buf)
+{
+        return snprintf(buf, 80, "%d %d %d %d %d\n%d %d %d %d %d\n%d %d %d %d %d",
+				mvm_rate_lut[0][0], mvm_rate_lut[0][1], mvm_rate_lut[0][2],
+				mvm_rate_lut[0][3], mvm_rate_lut[0][4], mvm_rate_lut[1][0],
+				mvm_rate_lut[1][1], mvm_rate_lut[1][2], mvm_rate_lut[1][3],
+				mvm_rate_lut[1][4], mvm_rate_lut[2][0], mvm_rate_lut[2][1],
+				mvm_rate_lut[2][2], mvm_rate_lut[2][3], mvm_rate_lut[2][4]);
+}
+
 static int mvm_sysfs_init(struct mvm_device *mvm_dev)
 {
 	int ret = 0;
@@ -571,10 +609,25 @@ static int mvm_sysfs_init(struct mvm_device *mvm_dev)
 								__func__);
 			goto fail_sysfs_mvm_max_clk;
 		}
+		sysfs_attr_init(&mvm_dev->mvm_rate_lut_attr.attr);
+		mvm_dev->mvm_rate_lut_attr.attr.mode = 0444;
+		mvm_dev->mvm_rate_lut_attr.attr.name = "mvm_rate_lut";
+		mvm_dev->mvm_rate_lut_attr.show = mvm_rate_lut_show;
+		mvm_dev->mvm_rate_lut_attr.store = NULL;
+
+		ret = sysfs_create_file(mvm_dev->kobj, &mvm_dev->mvm_rate_lut_attr.attr);
+		if (ret)        {
+			dev_err(mvm_dev->dev, "%s: sysfs_create_file mvm_rate_lut failed\n",
+							__func__);
+			goto fail_sysfs_mvm_rate_lut;
+		}
+
 		mvm_dev->clk_time_elapsed =0;
 	}
 	return 0;
 
+fail_sysfs_mvm_rate_lut:
+	sysfs_remove_file(mvm_dev->kobj, &mvm_dev->mvm_max_clk_attr.attr);
 fail_sysfs_mvm_max_clk:
 	sysfs_remove_file(mvm_dev->kobj, &mvm_dev->mvm_capacity_attr.attr);
 fail_sysfs_mvm_capacity:
@@ -897,7 +950,7 @@ static ssize_t pke_util_read(struct file *filp, char __user *buff, size_t count,
 		char string[12] = {0};
 		struct mvm_device *mvm_dev = filp->private_data;
 
-		int to_copy = snprintf(string,12,"0x%x\n",mvm_dev->pke_util);
+		int to_copy = snprintf(string,12,"0x%x\n",mvm_dev->curr_pke_util);
 		unsigned long remain = copy_to_user(buff,string,to_copy);
 		*offset += (to_copy - remain);
 		return *offset;
@@ -1055,10 +1108,12 @@ static bool drain_out_fifo(struct mvm_device *mvm_dev, unsigned int fifo_index, 
 				case MVM_MAX_RATE:
 					mvm_dev->max_rate = mvm_ctrl_recv->mvm_ctrl_msg.max_rate.max_rate;
 					dev_info(mvm_dev->dev, "MVM License file is read and the max rate supported by MVM is %d\n",mvm_dev->max_rate);
+					if (mvm_dev->max_rate > LOWSVS_RATE_LIMIT)
+						mvm_dev->max_clk = 0;
 					send_mvm_capacity_to_user(mvm_dev);
 					break;
 				case MVM_CHANGE_CLK_FREQ:
-					dev_info(mvm_dev->dev, "Clock freq changed from %s to %s\n",
+					dev_dbg(mvm_dev->dev, "Clock freq changed from %s to %s\n",
 							mvm_clk_freq_plan[mvm_dev->curr_clk],
 							mvm_clk_freq_plan[mvm_ctrl_recv->mvm_ctrl_msg.mvm_clk_freq.clk_freq]);
 					mvm_dev->curr_clk = mvm_ctrl_recv->mvm_ctrl_msg.mvm_clk_freq.clk_freq;
@@ -1984,6 +2039,7 @@ static void disable_gcc_clocks(struct mvm_device *mvm_dev)
 	clk_disable_unprepare(mvm_dev->snoc_m_axi_clk);
 	clk_disable_unprepare(mvm_dev->cnoc_s_ahb_clk);
 	clk_disable_unprepare(mvm_dev->sysnoc_mvmss_clk);
+	clk_disable_unprepare(mvm_dev->xo);
 }
 
 static int send_pwr_collpase_ctrl_msg(struct mvm_device *mvm_dev, bool pwr_collapse) {
@@ -2380,6 +2436,9 @@ static int mvm_dma_mem_alloc(struct mvm_device *mvm_dev)
 		ret = -ENOMEM;
 		goto dump_dma_mem_alloc_fail;
 	}
+	// Static copies for crashscope to access these variables
+	crashdump_buffer = mvm_dev->dump_buff;
+	crashdump_dma_addr = mvm_dev->mvm_dump_dma;
 
 	mvm_dev->log_buff = dma_alloc_coherent(mvm_dev->dev, round_up(sizeof(struct mvmlog_buffers), PAGE_SIZE),
 								&mvm_dev->mvmlog_buff_dma, GFP_KERNEL);
@@ -2577,8 +2636,10 @@ static int mvm_pm_notify(struct notifier_block *notifier,
 				reinit_completion(&mvm_dev->mvm_wfi_irq_recvd);
 				ret =  send_pwr_collpase_ctrl_msg(mvm_dev, 1);
 				list_for_each_entry(mvm_cli, &mvm_dev->client_list, list) {
-					mvm_cli->state = CLIENT_SUSPEND;
-					dev_dbg(mvm_dev->dev, "disable mvm write clients at suspend  %d\n",mvm_cli->client_id);
+					if (mvm_cli->state != CLIENT_DISCONNECTING) {
+						mvm_cli->state = CLIENT_SUSPEND;
+						dev_dbg(mvm_dev->dev, "disable mvm write clients at suspend  %d\n",mvm_cli->client_id);
+					}
 				}
 			}
 		}
@@ -2631,10 +2692,11 @@ static int mvm_suspend(struct device *dev)
 			mvm_dev->resume_frm_pwr_collapse = true;
 			enable_wfi_int(mvm_dev, false);
 			list_for_each_entry(mvm_cli, &mvm_dev->client_list, list) { //if suspend is failed ,then keep client enabled
-				mvm_cli->state = CLIENT_READY;
-				dev_dbg(mvm_dev->dev, "mvm suspend failed : enable clients for mvm %d\n",mvm_cli->client_id);
+				if (mvm_cli->state != CLIENT_DISCONNECTING) {
+					mvm_cli->state = CLIENT_READY;
+					dev_dbg(mvm_dev->dev, "mvm suspend failed : enable clients for mvm %d\n",mvm_cli->client_id);
+				}
 			}
-			add_timer(&mvm_dev->mvm_stats_timer);
 			mod_timer(&mvm_dev->mvm_stats_timer,jiffies + msecs_to_jiffies(mvm_stats_timer_interval_ms));
 		}
 		break;
@@ -2669,10 +2731,11 @@ static int mvm_suspend(struct device *dev)
 			mvm_dev->resume_frm_pwr_collapse = true;
 			enable_wfi_int(mvm_dev, false);
 			list_for_each_entry(mvm_cli, &mvm_dev->client_list, list) { //if suspend is failed ,then keep client enabled
-				mvm_cli->state = CLIENT_READY;
-				dev_dbg(mvm_dev->dev, "mvm suspend failed : enable clients for mvm %d\n",mvm_cli->client_id);
+				if (mvm_cli->state != CLIENT_DISCONNECTING) {
+					mvm_cli->state = CLIENT_READY;
+					dev_dbg(mvm_dev->dev, "mvm suspend failed : enable clients for mvm %d\n",mvm_cli->client_id);
+				}
 			}
-			add_timer(&mvm_dev->mvm_stats_timer);
 			mod_timer(&mvm_dev->mvm_stats_timer,jiffies + msecs_to_jiffies(mvm_stats_timer_interval_ms));
 		}
 		break;
@@ -2729,15 +2792,16 @@ static int mvm_resume(struct device *dev)
 	}
 	if(mvm_dev->vm_variant == PVM_ONLY || mvm_dev->vm_variant == TELEVM) {
 		list_for_each_entry(mvm_cli, &mvm_dev->client_list, list) {
-			mvm_cli->state = CLIENT_READY;
-			dev_dbg(mvm_dev->dev, "mvm is restoring and enable clients for mvm %d\n",mvm_cli->client_id);
+			if (mvm_cli->state != CLIENT_DISCONNECTING) {
+				mvm_cli->state = CLIENT_READY;
+				dev_dbg(mvm_dev->dev, "mvm is restoring and enable clients for mvm %d\n",mvm_cli->client_id);
+			}
 		}
 		mvm_dev->state = MVM_ONLINE;
 		send_mvm_state_to_user(mvm_dev, MVM_ONLINE);
 		mvm_dev->curr_clk = LOW_SVS;
 		mvm_dev->req_clk = LOW_SVS;
 		mvm_dev->prev_pke_time = 0;
-		add_timer(&mvm_dev->mvm_stats_timer);
 		mod_timer(&mvm_dev->mvm_stats_timer,jiffies + msecs_to_jiffies(mvm_stats_timer_interval_ms));
 	}
 	return is_resume;
@@ -2747,30 +2811,51 @@ static void change_clk_freq_work_hdlr(struct work_struct *work)
 {
 	struct mvm_device *mvm_dev = container_of(work, struct mvm_device, change_clk_freq_work);
 	int ret = 0;
-	ktime_t now;
-	ktime_t de_bounce_time;
+	unsigned int pke_utility_now = 0;
+	bool change_clock = true;
+	ktime_t now,de_bounce_time;
 
 	/*Do not change clock frequency when entering suspend or when MVM has crashed */
 	if (mvm_dev->state == MVM_CRASHED || mvm_dev->state == MVM_SUSPEND)
 		return;
 
-	mvm_dev->pke_util = (100 * (mvm_dev->ring_buff->pke_time_accumulator - mvm_dev->prev_pke_time)) / (3 * 1920000);
-	mvm_dev->prev_pke_time = mvm_dev->ring_buff->pke_time_accumulator;
-
+	pke_utility_now = mvm_dev->ring_buff->pke_time_accumulator;
+	mvm_dev->curr_pke_util= (100 * (pke_utility_now - mvm_dev->prev_pke_time)) / (PKE_COUNT  * PKE_UTIL_PERIOD_TICKS);
+	mvm_dev->curr_pke_util = (mvm_dev->prev_pke_util + mvm_dev->curr_pke_util)/2;//take average of pke_prev_util and pke_curr_util
+	mvm_dev->prev_pke_util = mvm_dev->curr_pke_util;
+	mvm_dev->prev_pke_time = pke_utility_now;
+	pke_utility_now = mvm_dev->curr_pke_util;
 	now = ktime_get();
+	if (mvm_dev->max_rate < CLK_CHANGE_MIN_CAPACITY) {//When max_rate is 3000 or less, operate at LOW_SVS.
+		change_clock = false;
+	}
+	if (mvm_dev->curr_clk == LOW_SVS) {
+		if (mvm_dev->curr_pke_util < MAX_PKE_UTIL_LOW_SVS)
+			change_clock = false;//operate in low_svs untill utilization upto MAX_PKE_UTIL_LOW_SVS
+		else
+			pke_utility_now = PKE_UTIL_ADJUST_FACTOR_LOWSVS(pke_utility_now);
+		/*Once pke utilisation goes beyond MAX_PKE_UTIL_LOW_SVS, then clock will be switched to SVS.
+		Since we are running at a higher frequency compared to the previous run, utilisation will drop now.
+		Hence adjust the pke utilisation with the division factor to avoid switching to LOW_SVS or NOMINAL*/
+	}
+	else if((mvm_dev->curr_clk == SVS)&& (mvm_dev->curr_pke_util > PKE_UTIL_UPPER_THRESH) &&(mvm_dev->curr_pke_util < PKE_UTIL_ADJUST_THRESH)){
+		/*When operating at SVS, do not switch the clock unless the pke utilisation is more than PKE_UTIL_ADJUST_THRESH.*/
+		pke_utility_now = PKE_UTIL_ADJUST_FACTOR_SVS(pke_utility_now);//Adjust the pke utilisation value by PKE_UTIL_ADJUST_FACTOR_SVS to ensure we dont switch clock unnecessarily.
+	}
 	de_bounce_time = ktime_sub(now, mvm_dev->clk_time_elapsed);
-	if((mvm_dev->req_clk == mvm_dev->curr_clk) &&(ktime_to_ms(de_bounce_time) > MIN_CLOCK_CHANGE_TIME_MS)){
-		if (mvm_dev->pke_util > PKE_UTIL_UPPER_THRESH && mvm_dev->curr_clk > NOMINAL) {
-			mvm_dev->req_clk--;
-			dev_dbg(mvm_dev->dev, "Requesting clock increase from %s to %s\n",
-				mvm_clk_freq_plan[mvm_dev->curr_clk],
-				mvm_clk_freq_plan[mvm_dev->req_clk]);
-		}
-		else if (mvm_dev->pke_util < PKE_UTIL_LOWER_THRESH && mvm_dev->curr_clk < LOW_SVS) {
-			mvm_dev->req_clk++;
-			dev_dbg(mvm_dev->dev, "Requesting clock decrease from %s to %s\n",
-				mvm_clk_freq_plan[mvm_dev->curr_clk],
-				mvm_clk_freq_plan[mvm_dev->req_clk]);
+	if((mvm_dev->req_clk == mvm_dev->curr_clk) && (ktime_to_ms(de_bounce_time) > MIN_CLOCK_CHANGE_TIME_MS) && (change_clock)){
+		switch (pke_utility_now) {
+		 case LOW_SVS_THRESH_RANGE:
+		 	mvm_dev->req_clk = LOW_SVS;
+		 	break;
+		 case SVS_THRESH_RANGE:
+			mvm_dev->req_clk = SVS;
+		 	break;
+		 case NOMINAL_THRESH_RANGE:
+		 	mvm_dev->req_clk = NOMINAL;
+		 	break;
+		 default:
+		 	break;
 		}
 		if (mvm_dev->req_clk != mvm_dev->curr_clk) {
 			/* Send control message to change the clock frequency */
@@ -2779,7 +2864,7 @@ static void change_clk_freq_work_hdlr(struct work_struct *work)
 				mvm_ctrl->type = MVM_CHANGE_CLK_FREQ;
 				mvm_ctrl->mvm_ctrl_msg.mvm_clk_freq.clk_freq = mvm_dev->req_clk;
 				ret = send_ctrl_msg_to_mvm(mvm_ctrl, mvm_dev);
-				dev_dbg(mvm_dev->dev, "time taken for changing clock rate %lld \n",ktime_to_ms(de_bounce_time));
+				dev_dbg(mvm_dev->dev, "time taken for changing clock rate %lld %d\n",ktime_to_ms(de_bounce_time));
 				mvm_dev->clk_time_elapsed = ktime_get();
 			}
 			else {
@@ -2837,7 +2922,7 @@ static int mvm_stats_init(struct mvm_device *mvm_dev)
 
 	mvm_dev->curr_clk = LOW_SVS;
 	mvm_dev->req_clk = LOW_SVS;
-	mvm_dev->max_clk = NOMINAL;
+	mvm_dev->max_clk = LOW_SVS;
 
 	timer_setup(&mvm_dev->mvm_stats_timer, mvm_stats_monitor_timeout_handler, 0);
 	mvm_dev->mvm_stats_timer.expires = jiffies + msecs_to_jiffies(mvm_stats_timer_interval_ms);
@@ -2858,7 +2943,6 @@ static int mvm_probe(struct platform_device *pdev)
 {
 	struct device_node *node;
 	struct mvm_device *mvm_dev;
-	struct device *dev;
 	int ret;
 
 	node = pdev->dev.of_node;
@@ -2870,39 +2954,43 @@ static int mvm_probe(struct platform_device *pdev)
 
 	platform_set_drvdata(pdev, mvm_dev);
 
-	ret = alloc_chrdev_region(&mvm_dev->mvm_cdev_devid, 0, 1, "mvm");
-	if (ret < 0) {
-		dev_err(mvm_dev->dev,
-			"can't allocate major number, %d\n", ret);
-		goto drv_err;
-	}
-
-	cdev_init(&mvm_dev->mvm_cdev, &mvm_fileops);
-	cdev_add(&mvm_dev->mvm_cdev, mvm_dev->mvm_cdev_devid, 1);
-	mvm_dev->mvm_class = class_create(THIS_MODULE, "mvm");
-	if (IS_ERR(mvm_dev->mvm_class)) {
-		dev_err(mvm_dev->dev,
-			"can't create rmt_sys_evt class, %d\n",
-			-ENOMEM);
-		goto class_fail;
-	}
-
-	dev = device_create(mvm_dev->mvm_class, &pdev->dev,
-				mvm_dev->mvm_cdev_devid, mvm_dev,
-				"mvm");
-	if (IS_ERR(dev)) {
-		dev_err(mvm_dev->dev,
-				"can't create rmt_sys_evt device, %d\n",
-				-ENOMEM);
-		goto device_fail;
-	}
-
-	dev_dbg(mvm_dev->dev, "mvm character device driver created\n");
-
 	ret = of_property_read_u32(node, "qcom,vm-variant", &mvm_dev->vm_variant);
 	if (ret) {
 		dev_err(mvm_dev->dev, "qcom,vm_variant property not defined\n");
-		goto device_fail;
+		goto drv_err;
+	}
+
+	if (mvm_dev->vm_variant == PVM_ONLY || mvm_dev->vm_variant == TELEVM) {
+		struct device *dev;
+
+		ret = alloc_chrdev_region(&mvm_dev->mvm_cdev_devid, 0, 1, "mvm");
+		if (ret < 0) {
+			dev_err(mvm_dev->dev,
+				"can't allocate major number, %d\n", ret);
+			goto drv_err;
+		}
+
+		cdev_init(&mvm_dev->mvm_cdev, &mvm_fileops);
+		cdev_add(&mvm_dev->mvm_cdev, mvm_dev->mvm_cdev_devid, 1);
+		mvm_dev->mvm_class = class_create(THIS_MODULE, "mvm");
+		if (IS_ERR(mvm_dev->mvm_class)) {
+			dev_err(mvm_dev->dev,
+				"can't create rmt_sys_evt class, %d\n",
+				-ENOMEM)	;
+			goto class_fail;
+		}
+
+		dev = device_create(mvm_dev->mvm_class, &pdev->dev,
+				mvm_dev->mvm_cdev_devid, mvm_dev,
+				"mvm");
+		if (IS_ERR(dev)) {
+			dev_err(mvm_dev->dev,
+				"can't create rmt_sys_evt device, %d\n",
+				-ENOMEM);
+			goto device_fail;
+		}
+
+		dev_dbg(mvm_dev->dev, "mvm character device driver created\n");
 	}
 
 	ret = ioremap_resources(pdev);
@@ -2910,7 +2998,6 @@ static int mvm_probe(struct platform_device *pdev)
 		dev_err(mvm_dev->dev, "Cant ioremap resources\n");
 		goto ioremap_fail;
 	}
-
 
 	ret = mvm_sysfs_init(mvm_dev);
 	if (ret) {
@@ -3087,6 +3174,7 @@ iommu_init_fail:
 		mvm_dma_mem_free(mvm_dev);
 dma_mem_fail:
 	if(mvm_dev->vm_variant == PVM_ONLY || mvm_dev->vm_variant == TELEVM) {
+		sysfs_remove_file(mvm_dev->kobj, &mvm_dev->mvm_rate_lut_attr.attr);
 		sysfs_remove_file(mvm_dev->kobj, &mvm_dev->mvm_capacity_attr.attr);
 		sysfs_remove_file(mvm_dev->kobj, &mvm_dev->mvm_max_clk_attr.attr);
 		sysfs_remove_file(mvm_dev->kobj, &mvm_dev->mvm_curr_clk_attr.attr);
@@ -3097,12 +3185,16 @@ sysfs_fail:
 	devm_iounmap(mvm_dev->dev, mvm_dev->mvm_base);
 	devm_iounmap(mvm_dev->dev, mvm_dev->apss_shared_base);
 ioremap_fail:
-	device_destroy(mvm_dev->mvm_class, mvm_dev->mvm_cdev_devid);
+	if (mvm_dev->vm_variant == PVM_ONLY || mvm_dev->vm_variant == TELEVM)
+		device_destroy(mvm_dev->mvm_class, mvm_dev->mvm_cdev_devid);
 device_fail:
-	class_destroy(mvm_dev->mvm_class);
+	if (mvm_dev->vm_variant == PVM_ONLY || mvm_dev->vm_variant == TELEVM)
+		class_destroy(mvm_dev->mvm_class);
 class_fail:
-	cdev_del(&mvm_dev->mvm_cdev);
-	unregister_chrdev_region(mvm_dev->mvm_cdev_devid, 1);
+	if (mvm_dev->vm_variant == PVM_ONLY || mvm_dev->vm_variant == TELEVM) {
+		cdev_del(&mvm_dev->mvm_cdev);
+		unregister_chrdev_region(mvm_dev->mvm_cdev_devid, 1);
+	}
 drv_err:
 	platform_set_drvdata(pdev, NULL);
 	return ret;
@@ -3153,6 +3245,7 @@ static int mvm_remove(struct platform_device *pdev)
 	}
 	if(mvm_dev->vm_variant == PVM_ONLY || mvm_dev->vm_variant == TELEVM) {
 		unregister_pm_notifier(&mvm_dev->pm_notifier);
+		sysfs_remove_file(mvm_dev->kobj, &mvm_dev->mvm_rate_lut_attr.attr);
 		sysfs_remove_file(mvm_dev->kobj, &mvm_dev->mvm_capacity_attr.attr);
 		sysfs_remove_file(mvm_dev->kobj, &mvm_dev->mvm_max_clk_attr.attr);
 		sysfs_remove_file(mvm_dev->kobj, &mvm_dev->mvm_curr_clk_attr.attr);
