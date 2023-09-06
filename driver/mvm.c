@@ -1106,6 +1106,12 @@ static void mvm_client_remove(struct mvm_device *mvm_dev,struct mvm_client *mvm_
 	kfree(mvm_cli);
 }
 
+static void mvm_stats_client_remove(struct mvm_device *mvm_dev,struct mvm_stats_client *mvm_stats_cli)
+{
+	list_del(&mvm_stats_cli->list);
+	kfree(mvm_stats_cli);
+}
+
 static bool drain_out_fifo(struct mvm_device *mvm_dev, unsigned int fifo_index, unsigned int count)
 {
 	struct mvm_client *mvm_cli;
@@ -3002,6 +3008,7 @@ static void change_clk_freq_work_hdlr(struct work_struct *work)
 				ret = send_ctrl_msg_to_mvm(mvm_ctrl, mvm_dev);
 				dev_dbg(mvm_dev->dev, "time taken for changing clock rate %lld %d\n",ktime_to_ms(de_bounce_time));
 				mvm_dev->clk_time_elapsed = ktime_get();
+				kfree(mvm_ctrl);
 			}
 			else {
 				dev_err(mvm_dev->dev, "change_clk_freq_work_hdlr failed with null mvm_ctrl pointer\n");
@@ -3309,10 +3316,19 @@ drv_err:
 static int mvm_remove(struct platform_device *pdev)
 {
 	struct mvm_device *mvm_dev;
+	struct mvm_client *mvm_cli;
+	struct mvm_client *mvm_cli_temp;
+	struct mvm_stats_client *mvm_stats_cli;
+	struct mvm_stats_client *mvm_stats_cli_temp;
 
 	mvm_dev = dev_get_drvdata(&pdev->dev);
-
 	if (mvm_dev->vm_variant == PVM_ONLY || mvm_dev->vm_variant == TELEVM) {
+		list_for_each_entry_safe(mvm_cli, mvm_cli_temp, &mvm_dev->client_list, list) {
+				mvm_client_remove(mvm_dev,mvm_cli);
+		}
+		list_for_each_entry_safe(mvm_stats_cli,mvm_stats_cli_temp, &mvm_dev->mvm_stats_client_list, list) {
+				mvm_stats_client_remove(mvm_dev,mvm_stats_cli);
+		}
 		mutex_destroy(&mvm_dev->in_fifo_lock);
 		mutex_destroy(&mvm_dev->out_fifo_lock);
 		mutex_destroy(&mvm_dev->mvm_cli_lock);
