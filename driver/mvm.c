@@ -1376,6 +1376,11 @@ static long mvm_ioctl(struct file *filp, unsigned int cmd, unsigned long arg)
 	return ret;
 }
 
+static long mvm_compat_ioctl(struct file *filp, unsigned int cmd, unsigned long arg)
+{
+	return mvm_ioctl(filp, cmd, arg);
+}
+
 static ssize_t mvm_write(
 	struct file *filp, const char __user *buf, size_t len, loff_t *off)
 {
@@ -2595,6 +2600,9 @@ static const struct file_operations mvm_fileops = {
 	.release = mvm_release,
 	.write = mvm_write,
 	.unlocked_ioctl = mvm_ioctl,
+#ifdef CONFIG_COMPAT
+	.compat_ioctl = mvm_compat_ioctl,
+#endif
 	.poll = mvm_poll,
 	.read = mvm_read,
 	.owner = THIS_MODULE,
@@ -2623,6 +2631,11 @@ static long mvm_stats_ioctl(struct file *filp, unsigned int cmd, unsigned long a
 	return ret;
 }
 
+static long mvm_stats_compat_ioctl(struct file *filp, unsigned int cmd, unsigned long arg)
+{
+	return mvm_stats_ioctl(filp, cmd, arg);
+}
+
 static int mvm_stats_open(struct inode *inode, struct file *filp)
 {
 	struct mvm_device *mvm_dev = container_of(inode->i_cdev,
@@ -2648,6 +2661,9 @@ ret:
 static const struct file_operations mvm_stats_fileops = {
 	.open = mvm_stats_open,
 	.unlocked_ioctl = mvm_stats_ioctl,
+#ifdef CONFIG_COMPAT
+        .compat_ioctl = mvm_stats_compat_ioctl,
+#endif
 	.owner = THIS_MODULE,
 };
 
