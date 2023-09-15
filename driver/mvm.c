@@ -1695,6 +1695,7 @@ static void initialise_fifos(struct mvm_device *mvm_dev)
 	writel_relaxed(IRQ_APSS0, mvm_dev->apss_shared_base + APSS_SHARED_IPC_INTERRUPT_OFFSET);
 	mvm_dev->state = MVM_ONLINE;
 	dev_info(mvm_dev->dev, "The current state of MVM is ONLINE\n");
+	update_marker("M - MVM is ONLINE");
 	send_mvm_state_to_user(mvm_dev, MVM_ONLINE);
 }
 
