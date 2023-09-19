@@ -776,7 +776,7 @@ static int mvm_sysfs_init(struct mvm_device *mvm_dev)
 		
 		sysfs_attr_init(&mvm_dev->mvm_log_level_attr.attr);
 		mvm_dev->mvm_log_level_attr.attr.mode = S_IRUGO|S_IWUSR;
-		mvm_dev->mvm_log_level_attr.attr.name = "";
+		mvm_dev->mvm_log_level_attr.attr.name = "mvm_log_level";
 		mvm_dev->mvm_log_level_attr.show = NULL;
 		mvm_dev->mvm_log_level_attr.store = mvm_log_level_store;
 
