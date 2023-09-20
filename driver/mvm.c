@@ -30,6 +30,7 @@
 #include <soc/qcom/boot_stats.h>
 #include <soc/qcom/secure_buffer.h>
 #include <linux/gunyah/gh_rm_drv.h>
+#include <linux/gunyah/gh_vm.h>
 #include <linux/qcom-iommu-util.h>
 #include <linux/gunyah/gh_dbl.h>
 #include <linux/suspend.h>
@@ -138,7 +139,6 @@ each of the actual P0 and P1 buffer starts */
 #define BASE_ADDR_OFFSET		0x10
 #define MAX_LOG_BUFFER_SIZE		0x1800
 #define AC_VM_HLOS                      3
-#define AC_VM_GVM1			52
 #define APSS_SHARED_IPC_INTERRUPT_OFFSET	0xC
 #define DBL_MASK			0x1
 #define MVM_SHUTDOWN_DBL_MASK		0x1
@@ -370,6 +370,8 @@ struct mvm_device {
 	struct class *mvm_stats_class;
 	struct device *mvm_stats_dev;
 	ktime_t clk_time_elapsed;
+	struct notifier_block rm_nb;
+	gh_vmid_t televm_vmid;
 };
 
 static const uint32_t mvm_rate_lut[MAX_FREQ_PLAN][MAX_CURVES] = {
@@ -1732,24 +1734,30 @@ err:
 	return ret;
 }
 
-static void hyp_unassign_mem_reclaim(struct mvm_device *mvm_dev, dma_addr_t dma_addr, uint32_t label,
+static int hyp_unassign_mem_reclaim(struct mvm_device *mvm_dev, dma_addr_t dma_addr, uint32_t label,
 				     uint32_t size, gh_memparcel_handle_t handle) {
 	int srcVMperm[1] = {PERM_READ | PERM_WRITE};
-	int srcVM[1] = {AC_VM_HLOS};
-	int destVM[2] = {AC_VM_HLOS, AC_VM_GVM1};
+	int srcVM[2] = {AC_VM_HLOS, mvm_dev->televm_vmid};
+	int destVM[1] = {AC_VM_HLOS};
+	int ret;
 
-	gh_rm_mem_reclaim(handle, 0);
-	hyp_assign_phys(dma_addr, size, destVM, 2, srcVM, srcVMperm, 1);
+	ret = gh_rm_mem_reclaim(handle, 0);
+	if (ret)
+		dev_err(mvm_dev->dev, "mem reclaim for label %u failed with ret = %d\n", label, ret);
+	else
+		ret = hyp_assign_phys(dma_addr, size, srcVM, 2, destVM, srcVMperm, 1);
+
+	return ret;
 }
 
 static int hyp_assign_mem_share(struct mvm_device *mvm_dev, struct gh_acl_desc *mvm_acl_desc,
  				struct gh_sgl_desc *mvm_sgl_desc, dma_addr_t dma_addr,
-				uint32_t size, uint32_t label, gh_memparcel_handle_t handle)
+				uint32_t size, uint32_t label, gh_memparcel_handle_t *handle)
 {
 	int srcVMperm[1] = {PERM_READ | PERM_WRITE};
 	int destVMperm[2] = {PERM_READ | PERM_WRITE, PERM_READ | PERM_WRITE};
 	int srcVM[1] = {AC_VM_HLOS};
-	int destVM[2] = {AC_VM_HLOS, AC_VM_GVM1};
+	int destVM[2] = {AC_VM_HLOS, mvm_dev->televm_vmid};
 	int ret = 0;
 
         mvm_sgl_desc->n_sgl_entries = 1;
@@ -1763,7 +1771,7 @@ static int hyp_assign_mem_share(struct mvm_device *mvm_dev, struct gh_acl_desc *
         }
 
         ret = gh_rm_mem_share(GH_RM_MEM_TYPE_NORMAL, 0, label, mvm_acl_desc, mvm_sgl_desc,
-				NULL, &handle);
+				NULL, handle);
 
         if (ret) {
                 dev_err(mvm_dev->dev, "mem_share of ring buffers from hostvm to televm failed\n");
@@ -1779,13 +1787,44 @@ ret:
 
 }
 
+static int read_shm_labels(struct mvm_device *mvm_dev)
+{
+	int ret = 0;
+	struct device_node *node;
+
+	node = mvm_dev->dev->of_node;
+	ret = of_property_read_u32(node, "qcom,mvm-ring-buff-shm-label", &mvm_dev->mvm_ring_buff_shm_label);
+	if (ret) {
+		dev_err(mvm_dev->dev, "qcom,mvm-ring-buff-shm-label not defined\n");
+		ret = -EINVAL;
+		goto ret;
+	}
+
+	ret = of_property_read_u32(node, "qcom,mvm-dump-buff-shm-label", &mvm_dev->mvm_dump_buff_shm_label);
+	if (ret) {
+		dev_err(mvm_dev->dev, "qcom,mvm-dump-buff-shm-label not defined\n");
+		ret = -EINVAL;
+		goto ret;
+	}
+
+	ret = of_property_read_u32(node, "qcom,mvm-log-buff-shm-label", &mvm_dev->mvm_log_buff_shm_label);
+	if (ret) {
+		dev_err(mvm_dev->dev, "qcom,mvm-log-buff-shm-label not defined\n");
+		ret = -EINVAL;
+		goto ret;
+	}
+
+ret:
+	return ret;
+}
+
 static int mvm_hostvm_mem_share(struct mvm_device *mvm_dev)
 {
 	struct gh_acl_desc *mvm_acl_desc;
 	struct gh_sgl_desc *mvm_sgl_desc;
 	int srcVMperm[1] = {PERM_READ | PERM_WRITE};
 	int srcVM[1] = {AC_VM_HLOS};
-	int destVM[2] = {AC_VM_HLOS, AC_VM_GVM1};
+	int destVM[2] = {AC_VM_HLOS, mvm_dev->televm_vmid};
 	int ret = 0;
 
 	mvm_dev->ring_buff_mem_handle = 0;
@@ -1807,7 +1846,7 @@ static int mvm_hostvm_mem_share(struct mvm_device *mvm_dev)
         mvm_acl_desc->n_acl_entries = 2;
         mvm_acl_desc->acl_entries[0].vmid = AC_VM_HLOS;
         mvm_acl_desc->acl_entries[0].perms = GH_RM_ACL_R | GH_RM_ACL_W;
-        mvm_acl_desc->acl_entries[1].vmid = AC_VM_GVM1;
+        mvm_acl_desc->acl_entries[1].vmid = mvm_dev->televm_vmid;
         mvm_acl_desc->acl_entries[1].perms = GH_RM_ACL_R | GH_RM_ACL_W;
 
         /* Share ring buffers from hostvm to televm */
@@ -1815,7 +1854,7 @@ static int mvm_hostvm_mem_share(struct mvm_device *mvm_dev)
 				   mvm_dev->ring_buff_dma,
 				   round_up(sizeof(struct ring_buffers), PAGE_SIZE),
 				   mvm_dev->mvm_ring_buff_shm_label,
-				   mvm_dev->ring_buff_mem_handle);
+				   &mvm_dev->ring_buff_mem_handle);
 	if (ret)
 		goto free_mem;
 
@@ -1824,7 +1863,7 @@ static int mvm_hostvm_mem_share(struct mvm_device *mvm_dev)
 				   mvm_dev->mvm_dump_dma,
 				   round_up(sizeof(struct mvm_crashdump_buffer), PAGE_SIZE),
 				   mvm_dev->mvm_dump_buff_shm_label,
-				   mvm_dev->dump_buff_mem_handle);
+				   &mvm_dev->dump_buff_mem_handle);
 	if (ret)
 		goto mem_share_dump_buff_fail;
 
@@ -1833,7 +1872,7 @@ static int mvm_hostvm_mem_share(struct mvm_device *mvm_dev)
 				   mvm_dev->mvmlog_buff_dma,
 				   round_up(sizeof(struct mvmlog_buffers), PAGE_SIZE),
 				   mvm_dev->mvm_log_buff_shm_label,
-				   mvm_dev->log_buff_mem_handle);
+				   &mvm_dev->log_buff_mem_handle);
 	if (ret)
 		goto mem_share_log_buff_fail;
 	else
@@ -1887,7 +1926,7 @@ static int mvm_hostvm_io_lend(struct mvm_device *mvm_dev)
 	}
 
 	mvm_acl_desc->n_acl_entries = 1;
-	mvm_acl_desc->acl_entries[0].vmid = AC_VM_GVM1;
+	mvm_acl_desc->acl_entries[0].vmid = mvm_dev->televm_vmid;
 	mvm_acl_desc->acl_entries[0].perms = GH_RM_ACL_R | GH_RM_ACL_W;
 
 	mvm_sgl_desc->n_sgl_entries = 1;
@@ -1905,7 +1944,7 @@ static int mvm_hostvm_io_lend(struct mvm_device *mvm_dev)
 	mvm_acl_desc->n_acl_entries = 2;
 	mvm_acl_desc->acl_entries[0].vmid = AC_VM_HLOS;
 	mvm_acl_desc->acl_entries[0].perms = GH_RM_ACL_R | GH_RM_ACL_W;
-	mvm_acl_desc->acl_entries[1].vmid = AC_VM_GVM1;
+	mvm_acl_desc->acl_entries[1].vmid = mvm_dev->televm_vmid;
 	mvm_acl_desc->acl_entries[1].perms = GH_RM_ACL_R | GH_RM_ACL_W;
 
 	mvm_sgl_desc->n_sgl_entries = 1;
@@ -1929,6 +1968,85 @@ sgl_alloc_fail:
 	kfree(mvm_acl_desc);
 ret:
 	return ret;
+}
+
+static void mvm_hostvm_unshare_mem(struct mvm_device *mvm_dev)
+{
+	int ret;
+
+	ret = hyp_unassign_mem_reclaim(mvm_dev, mvm_dev->ring_buff_dma, mvm_dev->mvm_ring_buff_shm_label,
+				round_up(sizeof(struct ring_buffers), PAGE_SIZE), mvm_dev->ring_buff_mem_handle);
+	if (ret)
+		dev_err(mvm_dev->dev,"hyp_unassign_mem_reclaim failed for label %u with ret = %d\n",
+					mvm_dev->mvm_ring_buff_shm_label, ret);
+
+	ret = hyp_unassign_mem_reclaim(mvm_dev, mvm_dev->mvm_dump_dma, mvm_dev->mvm_dump_buff_shm_label,
+				round_up(sizeof(struct mvm_crashdump_buffer), PAGE_SIZE), mvm_dev->dump_buff_mem_handle);
+	if (ret)
+		dev_err(mvm_dev->dev, "hyp_unassign_mem_reclaim failed for label %u with ret = %d\n",
+					mvm_dev->mvm_dump_buff_shm_label, ret);
+
+
+	ret = hyp_unassign_mem_reclaim(mvm_dev, mvm_dev->mvmlog_buff_dma, mvm_dev->mvm_log_buff_shm_label,
+				round_up(sizeof(struct mvmlog_buffers), PAGE_SIZE), mvm_dev->log_buff_mem_handle);
+	if (ret)
+		dev_err(mvm_dev->dev,"hyp_unassign_mem_reclaim failed for label %u with ret = %d\n",
+					mvm_dev->mvm_log_buff_shm_label, ret);
+}
+
+static int qcom_mvm_rm_cb(struct notifier_block *nb, unsigned long cmd,
+						void *data)
+{
+	struct gh_rm_notif_vm_status_payload *vm_status_payload;
+	struct mvm_device *mvm_dev;
+	int ret;
+	gh_vmid_t vmid;
+
+	mvm_dev = container_of(nb, struct mvm_device, rm_nb);
+	vm_status_payload = data;
+	ret = gh_rm_get_vmid(GH_TELE_VM, &vmid);
+	if (ret) {
+		dev_err(mvm_dev->dev, "gh_rm_get_vmid failed\n");
+		return NOTIFY_DONE;
+	}
+	if (vm_status_payload->vmid == vmid && cmd == GH_VM_BEFORE_POWERUP) {
+		mvm_dev->televm_vmid = vmid;
+
+		ret = read_shm_labels(mvm_dev);
+		if (ret) {
+			dev_err(mvm_dev->dev, "read_shm_labels failed\n");
+			return NOTIFY_DONE;
+		}
+		ret = mvm_hostvm_io_lend(mvm_dev);
+		if (ret) {
+			dev_err(mvm_dev->dev, "mvm_hostvm_io_lend failed\n");
+			return NOTIFY_DONE;
+		}
+
+		ret = mvm_hostvm_mem_share(mvm_dev);
+		if (ret) {
+			dev_err(mvm_dev->dev, "mvm_hostvm_mem_share failed\n");
+			goto hostvm_mem_share_fail;
+		}
+	}
+	else if (vm_status_payload->vmid == mvm_dev->televm_vmid && cmd == GH_VM_POWEROFF) {
+		ret = gh_rm_mem_reclaim(mvm_dev->mvmss_mem_handle, 0);
+		if (ret)
+			dev_err(mvm_dev->dev,"mem reclaim of mvmss_mem_handle failed with ret = %d\n",ret);
+
+		ret = gh_rm_mem_reclaim(mvm_dev->apss_mem_handle, 0);
+		if (ret)
+			dev_err(mvm_dev->dev, "mem reclaim of apss_mem_handle failed with ret = %d\n",ret);
+
+		mvm_hostvm_unshare_mem(mvm_dev);
+	}
+	return NOTIFY_DONE;
+
+hostvm_mem_share_fail:
+	gh_rm_mem_reclaim(mvm_dev->mvmss_mem_handle, 0);
+	gh_rm_mem_reclaim(mvm_dev->apss_mem_handle, 0);
+
+	return NOTIFY_DONE;
 }
 
 static int ioremap_resources(struct platform_device *pdev)
@@ -2472,38 +2590,6 @@ ring_buff_dma_mem_alloc_fail:
 	return ret;
 }
 
-static int read_shm_labels(struct mvm_device *mvm_dev)
-{
-	int ret = 0;
-	struct device_node *node;
-
-        node = mvm_dev->dev->of_node;
-
-	ret = of_property_read_u32(node, "qcom,mvm-ring-buff-shm-label", &mvm_dev->mvm_ring_buff_shm_label);
-	if (ret) {
-		dev_err(mvm_dev->dev, "qcom,mvm-ring-buff-shm-label not defined\n");
-		ret = -EINVAL;
-		goto ret;
-	}
-
-	ret = of_property_read_u32(node, "qcom,mvm-dump-buff-shm-label", &mvm_dev->mvm_dump_buff_shm_label);
-	if (ret) {
-		dev_err(mvm_dev->dev, "qcom,mvm-dump-buff-shm-label not defined\n");
-		ret = -EINVAL;
-		goto ret;
-	}
-
-	ret = of_property_read_u32(node, "qcom,mvm-log-buff-shm-label", &mvm_dev->mvm_log_buff_shm_label);
-	if (ret) {
-		dev_err(mvm_dev->dev, "qcom,mvm-log-buff-shm-label not defined\n");
-		ret = -EINVAL;
-		goto ret;
-	}
-
-ret:
-	return ret;
-}
-
 static const struct file_operations mvm_fileops = {
 	.open = mvm_open,
 	.release = mvm_release,
@@ -2957,7 +3043,6 @@ static int mvm_probe(struct platform_device *pdev)
 	ret = of_property_read_u32(node, "qcom,vm-variant", &mvm_dev->vm_variant);
 	if (ret) {
 		dev_err(mvm_dev->dev, "qcom,vm_variant property not defined\n");
-		goto drv_err;
 	}
 
 	if (mvm_dev->vm_variant == PVM_ONLY || mvm_dev->vm_variant == TELEVM) {
@@ -3018,47 +3103,39 @@ static int mvm_probe(struct platform_device *pdev)
 			goto iommu_init_fail;
 	}
 
-	if (mvm_dev->vm_variant == HOSTVM || mvm_dev->vm_variant == TELEVM) {
+	if(mvm_dev->vm_variant == HOSTVM) {
+		mvm_dev->rm_nb.notifier_call = qcom_mvm_rm_cb;
+		mvm_dev->rm_nb.priority = INT_MAX;
+#ifdef CONFIG_GUNYAH
+		gh_register_vm_notifier(&mvm_dev->rm_nb);
+#endif /* CONFIG_GUNYAH */
+	} else if (mvm_dev->vm_variant == TELEVM) {
 		ret = read_shm_labels(mvm_dev);
 		if (ret) {
 			dev_err(mvm_dev->dev, "read_shm_labels failed\n");
 			goto shm_label_fail;
 		}
 
-		if(mvm_dev->vm_variant == HOSTVM) {
-			ret = mvm_hostvm_io_lend(mvm_dev);
-			if (ret) {
-				dev_err(mvm_dev->dev, "mvm_hostvm_io_lend failed\n");
-				goto shm_label_fail;
-			}
+		ret = mvm_televm_map_shared_mem(mvm_dev, "mvm-ring-buff-shm",
+						mvm_dev->mvm_ring_buff_shm_label);
+		if (ret) {
+			dev_err(mvm_dev->dev, "Couldnt map ring buffers from hostvm to televm\n");
+			ret = -ENOMEM;
+			goto shm_label_fail;
+		}
 
-			ret = mvm_hostvm_mem_share(mvm_dev);
-			if (ret) {
-				dev_err(mvm_dev->dev, "mvm_hostvm_mem_share failed\n");
-				goto hostvm_mem_share_fail;
-			}
-		} else if (mvm_dev->vm_variant == TELEVM) {
-			ret = mvm_televm_map_shared_mem(mvm_dev, "mvm-ring-buff-shm",
-							mvm_dev->mvm_ring_buff_shm_label);
-			if (ret) {
-				dev_err(mvm_dev->dev, "Couldnt map ring buffers from hostvm to televm\n");
-				ret = -ENOMEM;
-				goto shm_label_fail;
-			}
+		ret = mvm_televm_map_shared_mem(mvm_dev, "mvm-dump-buff-shm", mvm_dev->mvm_dump_buff_shm_label);
+		if (ret) {
+			dev_err(mvm_dev->dev, "Couldnt map ring buffers from hostvm to televm\n");
+			ret = -ENOMEM;
+			goto shm_label_fail;
+		}
 
-			ret = mvm_televm_map_shared_mem(mvm_dev, "mvm-dump-buff-shm", mvm_dev->mvm_dump_buff_shm_label);
-			if (ret) {
-				dev_err(mvm_dev->dev, "Couldnt map ring buffers from hostvm to televm\n");
-				ret = -ENOMEM;
-				goto shm_label_fail;
-			}
-
-			ret = mvm_televm_map_shared_mem(mvm_dev, "mvm-log-buff-shm", mvm_dev->mvm_log_buff_shm_label);
-			if (ret) {
-				dev_err(mvm_dev->dev, "Couldnt map ring buffers from hostvm to televm\n");
-				ret = -ENOMEM;
-				goto shm_label_fail;
-			}
+		ret = mvm_televm_map_shared_mem(mvm_dev, "mvm-log-buff-shm", mvm_dev->mvm_log_buff_shm_label);
+		if (ret) {
+			dev_err(mvm_dev->dev, "Couldnt map ring buffers from hostvm to televm\n");
+			ret = -ENOMEM;
+			goto shm_label_fail;
 		}
 	}
 
@@ -3137,14 +3214,7 @@ static int mvm_probe(struct platform_device *pdev)
 	return 0;
 
 doorbell_fail:
-	if (mvm_dev->vm_variant == HOSTVM) {
-		hyp_unassign_mem_reclaim(mvm_dev, mvm_dev->ring_buff_dma, mvm_dev->mvm_ring_buff_shm_label,
-				round_up(sizeof(struct ring_buffers), PAGE_SIZE), mvm_dev->ring_buff_mem_handle);
-		hyp_unassign_mem_reclaim(mvm_dev, mvm_dev->mvm_dump_dma, mvm_dev->mvm_dump_buff_shm_label,
-				round_up(sizeof(struct mvm_crashdump_buffer), PAGE_SIZE), mvm_dev->dump_buff_mem_handle);
-		hyp_unassign_mem_reclaim(mvm_dev, mvm_dev->mvmlog_buff_dma, mvm_dev->mvm_log_buff_shm_label,
-                                   round_up(sizeof(struct mvmlog_buffers), PAGE_SIZE), mvm_dev->log_buff_mem_handle);
-	} else if (mvm_dev->vm_variant == PVM_ONLY) {
+	if (mvm_dev->vm_variant == PVM_ONLY) {
 		mutex_destroy(&mvm_dev->in_fifo_lock);
 		mutex_destroy(&mvm_dev->out_fifo_lock);
 		mutex_destroy(&mvm_dev->mvm_cli_lock);
@@ -3155,11 +3225,6 @@ doorbell_fail:
 pm_err:
 	if (mvm_dev->vm_variant == PVM_ONLY || mvm_dev->vm_variant == TELEVM)
 		debugfs_remove_recursive(mvm_dev->dir);
-hostvm_mem_share_fail:
-	if(mvm_dev->vm_variant == HOSTVM) {
-		gh_rm_mem_reclaim(mvm_dev->mvmss_mem_handle, 0);
-		gh_rm_mem_reclaim(mvm_dev->apss_mem_handle, 0);
-	}
 isrs_fail:
 	if (mvm_dev->vm_variant == TELEVM) {
 		devm_iounmap(mvm_dev->dev, mvm_dev->ring_buff);
@@ -3220,12 +3285,7 @@ static int mvm_remove(struct platform_device *pdev)
         if (mvm_dev->vm_variant == HOSTVM) {
                 gh_rm_mem_reclaim(mvm_dev->mvmss_mem_handle, 0);
                 gh_rm_mem_reclaim(mvm_dev->apss_mem_handle, 0);
-                hyp_unassign_mem_reclaim(mvm_dev, mvm_dev->ring_buff_dma, mvm_dev->mvm_ring_buff_shm_label,
-                        round_up(sizeof(struct ring_buffers), PAGE_SIZE), mvm_dev->ring_buff_mem_handle);
-                hyp_unassign_mem_reclaim(mvm_dev, mvm_dev->mvm_dump_dma, mvm_dev->mvm_dump_buff_shm_label,
-                        round_up(sizeof(struct mvm_crashdump_buffer), PAGE_SIZE), mvm_dev->dump_buff_mem_handle);
-                hyp_unassign_mem_reclaim(mvm_dev, mvm_dev->mvmlog_buff_dma, mvm_dev->mvm_log_buff_shm_label,
-                        round_up(sizeof(struct mvmlog_buffers), PAGE_SIZE), mvm_dev->log_buff_mem_handle);
+		mvm_hostvm_unshare_mem(mvm_dev);
 		gh_dbl_tx_unregister(mvm_dev->hostvm_tx_dbl);
 		gh_dbl_rx_unregister(mvm_dev->hostvm_rx_dbl);
         }
