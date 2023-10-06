@@ -3057,7 +3057,6 @@ static int mvm_probe(struct platform_device *pdev)
 		if (ret)
 			goto iommu_init_fail;
 	}
-	ret = mvm_sysfs_init(mvm_dev);
 	if (ret) {
 		dev_err(mvm_dev->dev, "mvm sysfs initialisation failed\n");
 		goto sysfs_fail;
@@ -3097,6 +3096,7 @@ static int mvm_probe(struct platform_device *pdev)
 			goto shm_label_fail;
 		}
 	}
+        ret = mvm_sysfs_init(mvm_dev);
 
 	if (mvm_dev->vm_variant == PVM_ONLY || mvm_dev->vm_variant == TELEVM) {
 		ret = register_isrs(pdev);
