@@ -2196,11 +2196,14 @@ static int mvm_load_fw(struct mvm_device *mvm_dev)
 out_release_firmware:
 	release_firmware(mvm_dev->fw);
 doorbell_fail:
-	enable_mvm_gdsc(mvm_dev,false);
+	if (mvm_dev->vm_variant == PVM_ONLY || mvm_dev->vm_variant == TELEVM)
+		enable_mvm_gdsc(mvm_dev,false);
 gdsc_err:
-	clk_disable_unprepare(mvm_dev->cnoc_s_ahb_clk);
-	clk_disable_unprepare(mvm_dev->snoc_m_axi_clk);
-	clk_disable_unprepare(mvm_dev->sysnoc_mvmss_clk);
+	if (mvm_dev->vm_variant == PVM_ONLY || mvm_dev->vm_variant == TELEVM) {
+		clk_disable_unprepare(mvm_dev->cnoc_s_ahb_clk);
+		clk_disable_unprepare(mvm_dev->snoc_m_axi_clk);
+		clk_disable_unprepare(mvm_dev->sysnoc_mvmss_clk);
+	}
 ret:
 	return ret;
 }
@@ -3147,7 +3150,6 @@ static int mvm_probe(struct platform_device *pdev)
 		ret = request_firmware(&mvm_dev->fw, "mvm_ecc.mdt", mvm_dev->dev);
 		if (ret) {
 			dev_err(mvm_dev->dev, "request_firmware for mvm failed\n");
-			goto doorbell_fail;
 		}
 	}
 	if (mvm_dev->vm_variant == PVM_ONLY || mvm_dev->vm_variant == TELEVM) {
