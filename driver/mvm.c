@@ -597,17 +597,19 @@ static ssize_t mvm_rate_lut_show(struct kobject *kobj,
 
 static void sysfs_remove(struct mvm_device *mvm_dev)
 {
-	sysfs_remove_file(mvm_dev->kobj, &mvm_dev->pke_utilization_attr.attr);
-	sysfs_remove_file(mvm_dev->kobj, &mvm_dev->pke_time_accumulator_attr.attr);
-	sysfs_remove_file(mvm_dev->kobj, &mvm_dev->mvm_crash_dump_attr.attr);
-	sysfs_remove_file(mvm_dev->kobj, &mvm_dev->trigger_ssr_attr.attr);
-	sysfs_remove_file(mvm_dev->kobj, &mvm_dev->mvm_transfer_attr.attr);
-	sysfs_remove_file(mvm_dev->kobj, &mvm_dev->mvm_policy_attr.attr);
-	sysfs_remove_file(mvm_dev->kobj, &mvm_dev->mvm_log_attr.attr);
-	sysfs_remove_file(mvm_dev->kobj, &mvm_dev->mvm_rate_lut_attr.attr);
-	sysfs_remove_file(mvm_dev->kobj, &mvm_dev->mvm_max_clk_attr.attr);
-	sysfs_remove_file(mvm_dev->kobj, &mvm_dev->mvm_capacity_attr.attr);
-	sysfs_remove_file(mvm_dev->kobj, &mvm_dev->mvm_curr_clk_attr.attr);
+	if (mvm_dev->vm_variant == PVM_ONLY || mvm_dev->vm_variant == TELEVM) {
+		sysfs_remove_file(mvm_dev->kobj, &mvm_dev->pke_utilization_attr.attr);
+		sysfs_remove_file(mvm_dev->kobj, &mvm_dev->pke_time_accumulator_attr.attr);
+		sysfs_remove_file(mvm_dev->kobj, &mvm_dev->mvm_crash_dump_attr.attr);
+		sysfs_remove_file(mvm_dev->kobj, &mvm_dev->trigger_ssr_attr.attr);
+		sysfs_remove_file(mvm_dev->kobj, &mvm_dev->mvm_transfer_attr.attr);
+		sysfs_remove_file(mvm_dev->kobj, &mvm_dev->mvm_policy_attr.attr);
+		sysfs_remove_file(mvm_dev->kobj, &mvm_dev->mvm_log_attr.attr);
+		sysfs_remove_file(mvm_dev->kobj, &mvm_dev->mvm_rate_lut_attr.attr);
+		sysfs_remove_file(mvm_dev->kobj, &mvm_dev->mvm_max_clk_attr.attr);
+		sysfs_remove_file(mvm_dev->kobj, &mvm_dev->mvm_capacity_attr.attr);
+		sysfs_remove_file(mvm_dev->kobj, &mvm_dev->mvm_curr_clk_attr.attr);
+	}
 	sysfs_remove_file(mvm_dev->kobj, &mvm_dev->mvm_state_attr.attr);
 	kobject_put(mvm_dev->kobj);
 }
@@ -631,7 +633,7 @@ static int mvm_sysfs_init(struct mvm_device *mvm_dev)
 	if (ret)        {
 		dev_err(mvm_dev->dev, "%s: sysfs_create_file failed\n",
 							__func__);
-		goto fail_sysfs;
+		goto fail_mvm_state_sysfs;
 	}
 	if (mvm_dev->vm_variant == PVM_ONLY || mvm_dev->vm_variant == TELEVM) {
 		sysfs_attr_init(&mvm_dev->mvm_curr_clk_attr.attr);
@@ -643,7 +645,7 @@ static int mvm_sysfs_init(struct mvm_device *mvm_dev)
 		if (ret)        {
 			dev_err(mvm_dev->dev, "%s: sysfs_create_file mvm_curr_clk failed\n",
 								__func__);
-			goto fail_sysfs;
+			goto fail_mvm_curr_clk_sysfs;
 		}
 		sysfs_attr_init(&mvm_dev->mvm_capacity_attr.attr);
 		mvm_dev->mvm_capacity_attr.attr.mode = S_IRUGO;
@@ -655,7 +657,7 @@ static int mvm_sysfs_init(struct mvm_device *mvm_dev)
 		if (ret)        {
 			dev_err(mvm_dev->dev, "%s: sysfs_create_file mvm_capacity failed\n",
 								__func__);
-			goto fail_sysfs;
+			goto fail_mvm_capacity_sysfs;
 		}
 		sysfs_attr_init(&mvm_dev->mvm_max_clk_attr.attr);
 		mvm_dev->mvm_max_clk_attr.attr.mode = S_IRUGO;
@@ -667,7 +669,7 @@ static int mvm_sysfs_init(struct mvm_device *mvm_dev)
 		if (ret)        {
 			dev_err(mvm_dev->dev, "%s: sysfs_create_file mvm_max_clk failed\n",
 								__func__);
-			goto fail_sysfs;
+			goto fail_mvm_max_clk_sysfs;
 		}
 		sysfs_attr_init(&mvm_dev->mvm_rate_lut_attr.attr);
 		mvm_dev->mvm_rate_lut_attr.attr.mode = S_IRUGO;
@@ -679,7 +681,7 @@ static int mvm_sysfs_init(struct mvm_device *mvm_dev)
 		if (ret)        {
 			dev_err(mvm_dev->dev, "%s: sysfs_create_file mvm_rate_lut failed\n",
 							__func__);
-			goto fail_sysfs;
+			goto fail_mvm_rate_lut_sysfs;
 		}
 
 		sysfs_attr_init(&mvm_dev->mvm_log_attr.attr);
@@ -692,7 +694,7 @@ static int mvm_sysfs_init(struct mvm_device *mvm_dev)
 		if (ret) {
 			dev_err(mvm_dev->dev, "%s: sysfs_create_file mvm_log_show failed\n",
 							__func__);
-			goto fail_sysfs;
+			goto fail_mvm_log_sysfs;
 		}
 		sysfs_attr_init(&mvm_dev->mvm_policy_attr.attr);
 		mvm_dev->mvm_policy_attr.attr.mode = S_IRUGO|S_IWUSR;
@@ -704,7 +706,7 @@ static int mvm_sysfs_init(struct mvm_device *mvm_dev)
 		if (ret) {
 			dev_err(mvm_dev->dev, "%s: sysfs_create_file mvm_policy_attr failed\n",
 							__func__);
-			goto fail_sysfs;
+			goto fail_mvm_log_policy_sysfs;
 		}
 
 		sysfs_attr_init(&mvm_dev->mvm_transfer_attr.attr);
@@ -717,9 +719,9 @@ static int mvm_sysfs_init(struct mvm_device *mvm_dev)
 		if (ret) {
 			dev_err(mvm_dev->dev, "%s: sysfs_create_file mvm_transfer_attr failed\n",
 							__func__);
-			goto fail_sysfs;
+			goto fail_mvm_log_transfer_sysfs;
 		}
-		
+
 		sysfs_attr_init(&mvm_dev->trigger_ssr_attr.attr);
 		mvm_dev->trigger_ssr_attr.attr.mode = S_IRUGO|S_IWUSR;
 		mvm_dev->trigger_ssr_attr.attr.name = "mvm_trigger_ssr";
@@ -730,7 +732,7 @@ static int mvm_sysfs_init(struct mvm_device *mvm_dev)
 		if (ret) {
 			dev_err(mvm_dev->dev, "%s: sysfs_create_file trigger_ssr_attr failed\n",
 							__func__);
-			goto fail_sysfs;
+			goto fail_mvm_trigger_ssr_sysfs;
 		}
 
 		sysfs_attr_init(&mvm_dev->mvm_crash_dump_attr.attr);
@@ -743,7 +745,7 @@ static int mvm_sysfs_init(struct mvm_device *mvm_dev)
 		if (ret) {
 			dev_err(mvm_dev->dev, "%s: sysfs_create_file mvm_crash_dump_attr failed\n",
 							__func__);
-			goto fail_sysfs;
+			goto fail_mvm_crash_dump_sysfs;
 		}
 		sysfs_attr_init(&mvm_dev->pke_time_accumulator_attr.attr);
 		mvm_dev->pke_time_accumulator_attr.attr.mode = S_IRUGO|S_IWUSR;
@@ -755,9 +757,9 @@ static int mvm_sysfs_init(struct mvm_device *mvm_dev)
 		if (ret) {
 			dev_err(mvm_dev->dev, "%s: sysfs_create_file pke_time_accumulator_attr failed\n",
 							__func__);
-			goto fail_sysfs;
+			goto fail_pke_time_accumulator_sysfs;
 		}
-		
+
 		sysfs_attr_init(&mvm_dev->pke_utilization_attr.attr);
 		mvm_dev->pke_utilization_attr.attr.mode = S_IRUGO|S_IWUSR;
 		mvm_dev->pke_utilization_attr.attr.name = "pke_utilization";
@@ -768,9 +770,9 @@ static int mvm_sysfs_init(struct mvm_device *mvm_dev)
 		if (ret) {
 			dev_err(mvm_dev->dev, "%s: sysfs_create_file pke_utilization_attr failed\n",
 							__func__);
-			goto fail_sysfs;
+			goto fail_pke_utilization_sysfs;
 		}
-		
+
 		sysfs_attr_init(&mvm_dev->mvm_log_level_attr.attr);
 		mvm_dev->mvm_log_level_attr.attr.mode = S_IRUGO|S_IWUSR;
 		mvm_dev->mvm_log_level_attr.attr.name = "mvm_log_level";
@@ -781,7 +783,7 @@ static int mvm_sysfs_init(struct mvm_device *mvm_dev)
 		if (ret) {
 			dev_err(mvm_dev->dev, "%s: sysfs_create_file mvm_log_level_attr failed\n",
 							__func__);
-			goto fail_sysfs;
+			goto fail_mvm_log_level_sysfs;
 		}
 		mvm_dev->clk_time_elapsed =0;
 		mvm_dev->ddr_current_addr = &mvm_dev->log_buff->mvmlog_buffer[0];
@@ -797,8 +799,34 @@ static int mvm_sysfs_init(struct mvm_device *mvm_dev)
 	}
 	return 0;
 
-fail_sysfs:
-	sysfs_remove(mvm_dev);
+	if (mvm_dev->vm_variant == PVM_ONLY || mvm_dev->vm_variant == TELEVM) {
+fail_mvm_log_level_sysfs:
+	sysfs_remove_file(mvm_dev->kobj, &mvm_dev->pke_utilization_attr.attr);
+fail_pke_utilization_sysfs:
+	sysfs_remove_file(mvm_dev->kobj, &mvm_dev->pke_time_accumulator_attr.attr);
+fail_pke_time_accumulator_sysfs:
+	sysfs_remove_file(mvm_dev->kobj, &mvm_dev->mvm_crash_dump_attr.attr);
+fail_mvm_crash_dump_sysfs:
+	sysfs_remove_file(mvm_dev->kobj, &mvm_dev->trigger_ssr_attr.attr);
+fail_mvm_trigger_ssr_sysfs:
+	sysfs_remove_file(mvm_dev->kobj, &mvm_dev->mvm_transfer_attr.attr);
+fail_mvm_log_transfer_sysfs:
+	sysfs_remove_file(mvm_dev->kobj, &mvm_dev->mvm_policy_attr.attr);
+fail_mvm_log_policy_sysfs:
+	sysfs_remove_file(mvm_dev->kobj, &mvm_dev->mvm_log_attr.attr);
+fail_mvm_log_sysfs:
+	sysfs_remove_file(mvm_dev->kobj, &mvm_dev->mvm_rate_lut_attr.attr);
+fail_mvm_rate_lut_sysfs:
+	sysfs_remove_file(mvm_dev->kobj, &mvm_dev->mvm_max_clk_attr.attr);
+fail_mvm_max_clk_sysfs:
+	sysfs_remove_file(mvm_dev->kobj, &mvm_dev->mvm_capacity_attr.attr);
+fail_mvm_capacity_sysfs:
+	sysfs_remove_file(mvm_dev->kobj, &mvm_dev->mvm_curr_clk_attr.attr);
+fail_mvm_curr_clk_sysfs:
+	sysfs_remove_file(mvm_dev->kobj, &mvm_dev->mvm_state_attr.attr);
+	}
+fail_mvm_state_sysfs:
+	kobject_put(mvm_dev->kobj);
 	return ret;
 }
 
@@ -858,7 +886,7 @@ static ssize_t mvm_log_show(struct kobject *kobj,
 	struct mvm_device *mvm_dev = container_of(mvm_log_attr,
 							struct mvm_device,
 							mvm_log_attr);
-	
+
 	ssize_t actual_length = 0;
 	char *buff_total;
 	ssize_t length_tail_to_bufferend;
@@ -3060,10 +3088,6 @@ static int mvm_probe(struct platform_device *pdev)
 		if (ret)
 			goto iommu_init_fail;
 	}
-	if (ret) {
-		dev_err(mvm_dev->dev, "mvm sysfs initialisation failed\n");
-		goto sysfs_fail;
-	}
 	if(mvm_dev->vm_variant == HOSTVM) {
 		mvm_dev->rm_nb.notifier_call = qcom_mvm_rm_cb;
 		mvm_dev->rm_nb.priority = INT_MAX;
@@ -3099,7 +3123,12 @@ static int mvm_probe(struct platform_device *pdev)
 			goto shm_label_fail;
 		}
 	}
-        ret = mvm_sysfs_init(mvm_dev);
+
+	ret = mvm_sysfs_init(mvm_dev);
+	if (ret) {
+		dev_err(mvm_dev->dev, "mvm sysfs initialisation failed\n");
+		goto sysfs_fail;
+	}
 
 	if (mvm_dev->vm_variant == PVM_ONLY || mvm_dev->vm_variant == TELEVM) {
 		ret = register_isrs(pdev);
@@ -3166,17 +3195,18 @@ static int mvm_probe(struct platform_device *pdev)
 	return 0;
 
 doorbell_fail:
-	if (mvm_dev->vm_variant == PVM_ONLY) {
+	if (mvm_dev->vm_variant == PVM_ONLY  || mvm_dev->vm_variant == TELEVM) {
+		unregister_pm_notifier(&mvm_dev->pm_notifier);
+	}
+pm_err:
+	if (mvm_dev->vm_variant == PVM_ONLY  || mvm_dev->vm_variant == TELEVM) {
 		mutex_destroy(&mvm_dev->in_fifo_lock);
 		mutex_destroy(&mvm_dev->out_fifo_lock);
 		mutex_destroy(&mvm_dev->mvm_cli_lock);
 	}
-	if(mvm_dev->vm_variant == PVM_ONLY || mvm_dev->vm_variant == TELEVM) {
-		unregister_pm_notifier(&mvm_dev->pm_notifier);
-	}
-
-pm_err:
 isrs_fail:
+	sysfs_remove(mvm_dev);
+sysfs_fail:
 	if (mvm_dev->vm_variant == TELEVM) {
 		devm_iounmap(mvm_dev->dev, mvm_dev->ring_buff);
 		devm_iounmap(mvm_dev->dev, mvm_dev->dump_buff);
@@ -3189,15 +3219,6 @@ iommu_init_fail:
 	if (mvm_dev->vm_variant == PVM_ONLY || mvm_dev->vm_variant == HOSTVM)
 		mvm_dma_mem_free(mvm_dev);
 dma_mem_fail:
-	if(mvm_dev->vm_variant == PVM_ONLY || mvm_dev->vm_variant == TELEVM) {
-		sysfs_remove_file(mvm_dev->kobj, &mvm_dev->mvm_rate_lut_attr.attr);
-		sysfs_remove_file(mvm_dev->kobj, &mvm_dev->mvm_capacity_attr.attr);
-		sysfs_remove_file(mvm_dev->kobj, &mvm_dev->mvm_max_clk_attr.attr);
-		sysfs_remove_file(mvm_dev->kobj, &mvm_dev->mvm_curr_clk_attr.attr);
-	}
-	sysfs_remove_file(mvm_dev->kobj, &mvm_dev->mvm_state_attr.attr);
-	kobject_put(mvm_dev->kobj);
-sysfs_fail:
 	devm_iounmap(mvm_dev->dev, mvm_dev->mvm_base);
 	devm_iounmap(mvm_dev->dev, mvm_dev->apss_shared_base);
 ioremap_fail:
@@ -3265,10 +3286,9 @@ static int mvm_remove(struct platform_device *pdev)
 		clk_disable_unprepare(mvm_dev->snoc_m_axi_clk);
 		clk_disable_unprepare(mvm_dev->sysnoc_mvmss_clk);
 		unregister_pm_notifier(&mvm_dev->pm_notifier);
-		sysfs_remove(mvm_dev);
+		mvm_iommu_release(mvm_dev);
 	}
-	sysfs_remove_file(mvm_dev->kobj, &mvm_dev->mvm_state_attr.attr);
-	kobject_put(mvm_dev->kobj);
+	sysfs_remove(mvm_dev);
 	device_destroy(mvm_dev->mvm_class, mvm_dev->mvm_cdev_devid);
 	class_destroy(mvm_dev->mvm_class);
 	cdev_del(&mvm_dev->mvm_cdev);
