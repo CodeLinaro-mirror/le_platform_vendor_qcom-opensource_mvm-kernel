@@ -2154,25 +2154,12 @@ static int mvm_load_fw(struct mvm_device *mvm_dev)
 {
 	int ret = 0;
 
-	if (mvm_dev->vm_variant == PVM_ONLY || mvm_dev->vm_variant == TELEVM) {
-		ret = enable_gcc_clocks(mvm_dev);
-		if (ret) {
-			dev_err(mvm_dev->dev, "Failed to turn on gcc clocks\n");
-			goto ret;
-		}
-
-		ret = enable_mvm_gdsc(mvm_dev, true);
-		if (ret) {
-			dev_err(mvm_dev->dev, "Failed to turn on mvm gdsc\n");
-			goto gdsc_err;
-		}
-	}
         if (mvm_dev->vm_variant == TELEVM) {
 		gh_dbl_flags_t dbl_mask = MVM_LOAD_FW_DBL_MASK;
 		ret = gh_dbl_send(mvm_dev->televm_tx_dbl, &dbl_mask, 0);
 		if (ret) {
 			dev_err(mvm_dev->dev, "failed to send MVM_LOAD_FW_DBL to hostvm %d\n", ret);
-			goto doorbell_fail;
+			goto ret;
 		}
 		dev_dbg(mvm_dev->dev, "Sent MVM_LOAD_FW_DBL to hostvm\n");
 	}
@@ -2223,15 +2210,6 @@ static int mvm_load_fw(struct mvm_device *mvm_dev)
 
 out_release_firmware:
 	release_firmware(mvm_dev->fw);
-doorbell_fail:
-	if (mvm_dev->vm_variant == PVM_ONLY || mvm_dev->vm_variant == TELEVM)
-		enable_mvm_gdsc(mvm_dev,false);
-gdsc_err:
-	if (mvm_dev->vm_variant == PVM_ONLY || mvm_dev->vm_variant == TELEVM) {
-		clk_disable_unprepare(mvm_dev->cnoc_s_ahb_clk);
-		clk_disable_unprepare(mvm_dev->snoc_m_axi_clk);
-		clk_disable_unprepare(mvm_dev->sysnoc_mvmss_clk);
-	}
 ret:
 	return ret;
 }
@@ -2400,8 +2378,6 @@ static void trigger_ssr_work_hdlr(struct work_struct *work)
 	if (ret == 0) {
 		dev_err(mvm_dev->dev, "Timed out as mvm dump collection is not complete\n");
 	}
-        collapse_mvm_core(mvm_dev);
-        disable_gcc_clocks(mvm_dev);
 
 	mvm_dev->pending_dump_read = true;
 	wake_up_interruptible(&mvm_dev->mvm_ssr_waitqueue);
@@ -3166,6 +3142,19 @@ static int mvm_probe(struct platform_device *pdev)
 			goto pm_err;
 	}
 
+	if (mvm_dev->vm_variant == PVM_ONLY || mvm_dev->vm_variant == TELEVM) {
+		ret = enable_gcc_clocks(mvm_dev);
+		if (ret) {
+			dev_err(mvm_dev->dev, "Failed to turn on gcc clocks\n");
+			goto gcc_err;
+		}
+
+		ret = enable_mvm_gdsc(mvm_dev, true);
+		if (ret) {
+			dev_err(mvm_dev->dev, "Failed to turn on mvm gdsc\n");
+			goto gdsc_err;
+		}
+	}
 	if (mvm_dev->vm_variant == HOSTVM || mvm_dev->vm_variant == TELEVM) {
 		ret = mvm_doorbell_register(mvm_dev);
 		if (ret) {
@@ -3196,6 +3185,16 @@ static int mvm_probe(struct platform_device *pdev)
 
 doorbell_fail:
 	if (mvm_dev->vm_variant == PVM_ONLY  || mvm_dev->vm_variant == TELEVM) {
+		enable_mvm_gdsc(mvm_dev,false);
+	}
+gdsc_err:
+	if (mvm_dev->vm_variant == PVM_ONLY || mvm_dev->vm_variant == TELEVM) {
+		clk_disable_unprepare(mvm_dev->cnoc_s_ahb_clk);
+		clk_disable_unprepare(mvm_dev->snoc_m_axi_clk);
+		clk_disable_unprepare(mvm_dev->sysnoc_mvmss_clk);
+	}
+gcc_err:
+	if(mvm_dev->vm_variant == PVM_ONLY || mvm_dev->vm_variant == TELEVM) {
 		unregister_pm_notifier(&mvm_dev->pm_notifier);
 	}
 pm_err:
