@@ -429,6 +429,8 @@ static ssize_t pke_time_accumulator_read(struct kobject *kobj,
 static ssize_t pke_util_read(struct kobject *kobj,
 	struct kobj_attribute *pke_utilization_attr,
 	char *buf);
+static int register_isrs(struct mvm_device *mvm_dev);
+
 static int mvm_stats_timer_interval_ms = MVM_STATS_TIMER_DEFAULT_INTERVAL_MS;//set 300ms as default value
 
 static void send_mvm_state_to_user(struct mvm_device *mvm_dev, enum mvm_state state)
@@ -2283,6 +2285,8 @@ static void mvm_televm_rx_dbl_cb(int irq, void *data)
 
 	if (dbl_mask == MVM_INIT_FIFOS_DBL_MASK) {
 		initialise_fifos(mvm_dev);
+		dev_dbg(mvm_dev->dev,"initialise_fifos done, registering isrs\n");
+		register_isrs(mvm_dev);
 	}
 
 	ret = gh_dbl_reset(mvm_dev->televm_rx_dbl, GH_DBL_NONBLOCK);
@@ -2403,19 +2407,38 @@ static irqreturn_t mvm_wdog_irq_handler(int irq, void *dev_id)
 	return IRQ_HANDLED;
 }
 
-static int register_isrs(struct platform_device *pdev)
+static int get_irqs(struct platform_device *pdev)
 {
-	int ret = -1;
-	struct mvm_device *mvm_dev;
-	struct irq_data *data;
-
-	mvm_dev = platform_get_drvdata(pdev);
-
+	struct mvm_device *mvm_dev = platform_get_drvdata(pdev);
 	mvm_dev->mvm_ssr_done_irq = platform_get_irq_byname(pdev, "mvm_ssr_done");
 	if (mvm_dev->mvm_ssr_done_irq < 0) {
 		dev_err(mvm_dev->dev, "mvm_ssr_done irq not defined\n");
 		goto err;
 	}
+	mvm_dev->mvm_verif_done_irq = platform_get_irq_byname(pdev, "mvm_verif_done");
+	if (mvm_dev->mvm_verif_done_irq < 0) {
+		dev_err(mvm_dev->dev, "mvm_verification_done irq not defined\n");
+		goto err;
+	}
+	mvm_dev->wfi_irq = platform_get_irq_byname(pdev, "wfi");
+	if (mvm_dev->wfi_irq < 0) {
+		dev_err(mvm_dev->dev, "wfi irq not defined\n");
+		goto err;
+	}
+	mvm_dev->wdog_irq = platform_get_irq_byname(pdev, "wdog");
+        if (mvm_dev->wdog_irq < 0) {
+		dev_err(mvm_dev->dev, "wdog irq not defined\n");
+		goto err;
+	}
+	return 0;
+err:
+	return -1;
+}
+
+static int register_isrs(struct mvm_device *mvm_dev)
+{
+	int ret = -1;
+	struct irq_data *data;
 
 	ret = devm_request_threaded_irq(mvm_dev->dev, mvm_dev->mvm_ssr_done_irq,
 					NULL, mvm_ssr_done_irq_handler,
@@ -2431,11 +2454,6 @@ static int register_isrs(struct platform_device *pdev)
 
 	dev_dbg(mvm_dev->dev, "mvm_ssr_done irq registered\n");
 
-	mvm_dev->mvm_verif_done_irq = platform_get_irq_byname(pdev, "mvm_verif_done");
-	if (mvm_dev->mvm_verif_done_irq < 0) {
-		dev_err(mvm_dev->dev, "mvm_verification_done irq not defined\n");
-		goto err;
-	}
 	ret = devm_request_threaded_irq(mvm_dev->dev, mvm_dev->mvm_verif_done_irq,
 					NULL, mvm_verif_done_irq_handler,
 					IRQF_TRIGGER_HIGH | IRQF_ONESHOT,
@@ -2449,12 +2467,6 @@ static int register_isrs(struct platform_device *pdev)
 	mvm_dev->mvm_verif_done_hw_irq = data->hwirq;
 	dev_dbg(mvm_dev->dev, "mvm_verif_done registered\n");
 
-	mvm_dev->wfi_irq = platform_get_irq_byname(pdev, "wfi");
-	if (mvm_dev->wfi_irq < 0) {
-		dev_err(mvm_dev->dev, "wfi irq not defined\n");
-		goto err;
-	}
-
 	ret = devm_request_threaded_irq(mvm_dev->dev, mvm_dev->wfi_irq,
 					NULL, mvm_wfi_irq_handler,
 					IRQF_TRIGGER_RISING | IRQF_ONESHOT,
@@ -2465,12 +2477,6 @@ static int register_isrs(struct platform_device *pdev)
 		goto err;
 	}
 	dev_dbg(mvm_dev->dev, "wfi_irq registered\n");
-
-	mvm_dev->wdog_irq = platform_get_irq_byname(pdev, "wdog");
-	if (mvm_dev->wdog_irq < 0) {
-		dev_err(mvm_dev->dev, "wdog irq not defined\n");
-		goto err;
-	}
 
 	ret = devm_request_threaded_irq(mvm_dev->dev, mvm_dev->wdog_irq,
 					NULL, mvm_wdog_irq_handler,
@@ -3107,13 +3113,22 @@ static int mvm_probe(struct platform_device *pdev)
 	}
 
 	if (mvm_dev->vm_variant == PVM_ONLY || mvm_dev->vm_variant == TELEVM) {
-		ret = register_isrs(pdev);
+		ret = get_irqs(pdev);
+		if (ret) {
+			dev_err(mvm_dev->dev,
+				"getting irqs failed\n");
+			goto isrs_fail;
+		}
+	}
+	if (mvm_dev->vm_variant == PVM_ONLY) {
+		ret = register_isrs(mvm_dev);
 		if (ret) {
 			dev_err(mvm_dev->dev,
 				"registration of isrs failed\n");
 			goto isrs_fail;
 		}
-
+	}
+	if (mvm_dev->vm_variant == PVM_ONLY || mvm_dev->vm_variant == TELEVM) {
 		mutex_init(&mvm_dev->mvm_cli_lock);
 		mutex_init(&mvm_dev->in_fifo_lock);
 		mutex_init(&mvm_dev->out_fifo_lock);
