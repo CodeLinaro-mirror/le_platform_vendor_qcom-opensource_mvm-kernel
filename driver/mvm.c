@@ -1668,6 +1668,7 @@ static irqreturn_t mvm_wfi_irq_handler(int irq, void *dev_id)
 
 static void initialise_fifos(struct mvm_device *mvm_dev)
 {
+	int ret = 0;
 	uint32_t infifo_size, outfifo_size;
 	infifo_size = sizeof(struct input_fifo);
 	outfifo_size = sizeof(struct output_fifo);
@@ -1734,10 +1735,15 @@ static void initialise_fifos(struct mvm_device *mvm_dev)
 				mvm_dev->mvm_base + MVMSS_CSR_APSS_MVM_SCRATCH_PAD0);
 	/*Send an interrupt to MVM to indicate MVM_Init done */
 	writel_relaxed(IRQ_APSS0, mvm_dev->apss_shared_base + APSS_SHARED_IPC_INTERRUPT_OFFSET);
-	mvm_dev->state = MVM_ONLINE;
-	dev_info(mvm_dev->dev, "The current state of MVM is ONLINE\n");
-	update_marker("M - MVM is ONLINE");
-	send_mvm_state_to_user(mvm_dev, MVM_ONLINE);
+	if (mvm_dev->state == MVM_OFFLINE) {
+		ret = register_isrs(mvm_dev);
+		if (!ret) {
+			mvm_dev->state = MVM_ONLINE;
+			dev_info(mvm_dev->dev, "The current state of MVM is ONLINE\n");
+			update_marker("M - MVM is ONLINE");
+			send_mvm_state_to_user(mvm_dev, MVM_ONLINE);
+		}
+	}
 }
 
 static int mvm_televm_map_shared_mem(struct mvm_device *mvm_dev, char *compat, uint32_t shm_label)
@@ -2293,7 +2299,6 @@ static void mvm_televm_rx_dbl_cb(int irq, void *data)
 	if (dbl_mask == MVM_INIT_FIFOS_DBL_MASK) {
 		initialise_fifos(mvm_dev);
 		dev_dbg(mvm_dev->dev,"initialise_fifos done, registering isrs\n");
-		register_isrs(mvm_dev);
 	}
 
 	ret = gh_dbl_reset(mvm_dev->televm_rx_dbl, GH_DBL_NONBLOCK);
