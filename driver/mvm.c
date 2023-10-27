@@ -46,7 +46,7 @@
 #define OUT_BUFF_SIZE			32
 #define TIMEOUT_MS			10000
 #define WFI_TIMEOUT_MS				5000
-#define MAX_CLIENT_COUNT			15
+#define MAX_CLIENT_COUNT			2
 #define MIN_CLOCK_CHANGE_TIME_MS	500
 
 /* CSR to enable WFI interrupt from E21 to APPS */
