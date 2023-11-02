@@ -48,6 +48,7 @@
 #define WFI_TIMEOUT_MS				5000
 #define MAX_CLIENT_COUNT			2
 #define MIN_CLOCK_CHANGE_TIME_MS	500
+#define P0_BUFFER_SIZE_FOR_CTRL_MSG	8
 
 /* CSR to enable WFI interrupt from E21 to APPS */
 #define MVMSS_CSR_RVSS_CFG_OFFSET	0x00000010
@@ -1300,7 +1301,7 @@ static void drain_out_fifo_work_hdlr(struct work_struct *work)
 		readl_relaxed(mvm_dev->mvm_base + MVMSS_CSR_INPUT_RING1_TAIL_PTR_OFFSET);
 
 	if(!fifo_full(mvm_dev->ring_buff->in_fifo[0].head,
-			mvm_dev->ring_buff->in_fifo[0].size,
+			(mvm_dev->ring_buff->in_fifo[0].size - P0_BUFFER_SIZE_FOR_CTRL_MSG),
 			mvm_dev->ring_buff->in_fifo[0].tail)){
 		complete(&mvm_dev->p0_fifo_slot_available);
 	}
@@ -1504,9 +1505,15 @@ push_to_input_ring:
 					   mvm_dev->ring_buff->in_fifo[fifo_index].head,
 					   mvm_dev->ring_buff->in_fifo[fifo_index].tail,
 					   mvm_dev->ring_buff->in_fifo[fifo_index].size);
-		full = fifo_full(mvm_dev->ring_buff->in_fifo[fifo_index].head,
-				 mvm_dev->ring_buff->in_fifo[fifo_index].size,
-				 mvm_dev->ring_buff->in_fifo[fifo_index].tail);
+		if (fifo_index == 0) {
+			full = fifo_full(mvm_dev->ring_buff->in_fifo[fifo_index].head,
+					(mvm_dev->ring_buff->in_fifo[fifo_index].size - P0_BUFFER_SIZE_FOR_CTRL_MSG),
+					mvm_dev->ring_buff->in_fifo[fifo_index].tail);
+		} else {
+			full = fifo_full(mvm_dev->ring_buff->in_fifo[fifo_index].head,
+					mvm_dev->ring_buff->in_fifo[fifo_index].size,
+					mvm_dev->ring_buff->in_fifo[fifo_index].tail);
+		}
 		dev_dbg(mvm_dev->dev, "fifo %d is %d\n", fifo_index, full);
 		if (full) {
 			if (fifo_index == 0) {
