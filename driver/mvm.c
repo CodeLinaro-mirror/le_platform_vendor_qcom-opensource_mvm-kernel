@@ -168,6 +168,7 @@ each of the actual P0 and P1 buffer starts */
 #define SVS_THRESH_RANGE		51 ... 70
 #define NOMINAL_THRESH_RANGE	71 ... 100
 #define LOWSVS_RATE_LIMIT		3000
+#define MAX_IDLE_TIME_PER_CLIENT        200
 
 /**
  * enum mvm_state - state of mvm subsystem
@@ -274,6 +275,7 @@ struct mvm_client {
 	struct task_struct *task;
 	unsigned int msgs_sent;
 	unsigned int results_recvd;
+	ktime_t client_release_req_time;
 };
 
 struct mvm_stats_client {
@@ -1407,6 +1409,7 @@ static int mvm_release(struct inode *inode, struct file *filp)
 	struct mvm_device, mvm_cdev);
 	struct mvm_client *mvm_cli = filp->private_data;
 
+	mvm_cli->client_release_req_time = ktime_get();
 	mvm_cli->state = CLIENT_DISCONNECTING;
 	if(mvm_cli->msgs_sent == mvm_cli->results_recvd)
 	{
@@ -2884,7 +2887,9 @@ static void change_clk_freq_work_hdlr(struct work_struct *work)
 	int ret = 0;
 	unsigned int pke_utility_now = 0;
 	bool change_clock = true;
-	ktime_t now,de_bounce_time;
+	ktime_t now,de_bounce_time,client_idle_time;
+	struct mvm_client *mvm_cli;
+	struct mvm_client *mvm_cli_temp;
 
 	/*Do not change clock frequency when entering suspend or when MVM has crashed */
 	if (mvm_dev->state == MVM_CRASHED || mvm_dev->state == MVM_SUSPEND)
@@ -2941,6 +2946,17 @@ static void change_clk_freq_work_hdlr(struct work_struct *work)
 			}
 			else {
 				dev_err(mvm_dev->dev, "change_clk_freq_work_hdlr failed with null mvm_ctrl pointer\n");
+			}
+		}
+	}
+
+	list_for_each_entry_safe(mvm_cli,mvm_cli_temp, &mvm_dev->client_list, list) {
+		if (mvm_cli->state == CLIENT_DISCONNECTING) {
+			now = ktime_get();
+			client_idle_time = ktime_sub(now, mvm_cli->client_release_req_time);
+			if (ktime_to_ms(client_idle_time) > MAX_IDLE_TIME_PER_CLIENT) {
+				dev_dbg(mvm_dev->dev, "removing the disconnected client from list %d\n",mvm_cli->client_id);
+				mvm_client_remove(mvm_dev,mvm_cli);
 			}
 		}
 	}
