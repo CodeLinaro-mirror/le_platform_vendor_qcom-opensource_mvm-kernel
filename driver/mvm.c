@@ -1740,12 +1740,13 @@ static void initialise_fifos(struct mvm_device *mvm_dev)
 	writel_relaxed(IRQ_APSS0, mvm_dev->apss_shared_base + APSS_SHARED_IPC_INTERRUPT_OFFSET);
 	if (mvm_dev->state == MVM_OFFLINE) {
 		ret = register_isrs(mvm_dev);
-		if (!ret) {
-			mvm_dev->state = MVM_ONLINE;
-			dev_info(mvm_dev->dev, "The current state of MVM is ONLINE\n");
-			update_marker("M - MVM is ONLINE");
-			send_mvm_state_to_user(mvm_dev, MVM_ONLINE);
-		}
+	}
+
+	if (!ret) {
+		mvm_dev->state = MVM_ONLINE;
+		dev_info(mvm_dev->dev, "The current state of MVM is ONLINE\n");
+		update_marker("M - MVM is ONLINE");
+		send_mvm_state_to_user(mvm_dev, MVM_ONLINE);
 	}
 }
 
@@ -2198,7 +2199,6 @@ static int mvm_load_fw(struct mvm_device *mvm_dev)
 		}
 		dev_info(mvm_dev->dev, "MVM subsystem brought out of reset\n");
 		update_marker("M - MVM subsystem brought out of reset");
-		mvm_dev->state = MVM_ONLINE;
 
 		/* qcom_pil_info_store writes the PIL info to the IMEM address so that
 		 * MVM SDI dump collection will be enabled. If this imem write returns
@@ -2220,6 +2220,7 @@ static int mvm_load_fw(struct mvm_device *mvm_dev)
 			goto out_release_firmware;
 		}
 		dev_dbg(mvm_dev->dev, "Sent MVM_INIT_FIFOS_DBL to televm\n");
+		mvm_dev->state = MVM_ONLINE;
 	}
 	else if (mvm_dev->vm_variant == PVM_ONLY)
 		initialise_fifos(mvm_dev);
@@ -3148,14 +3149,7 @@ static int mvm_probe(struct platform_device *pdev)
 			goto isrs_fail;
 		}
 	}
-	if (mvm_dev->vm_variant == PVM_ONLY) {
-		ret = register_isrs(mvm_dev);
-		if (ret) {
-			dev_err(mvm_dev->dev,
-				"registration of isrs failed\n");
-			goto isrs_fail;
-		}
-	}
+
 	if (mvm_dev->vm_variant == PVM_ONLY || mvm_dev->vm_variant == TELEVM) {
 		mutex_init(&mvm_dev->mvm_cli_lock);
 		mutex_init(&mvm_dev->in_fifo_lock);
