@@ -2184,7 +2184,10 @@ static int mvm_load_fw(struct mvm_device *mvm_dev)
 	}
 	if (mvm_dev->vm_variant == PVM_ONLY || mvm_dev->vm_variant == HOSTVM) {
 		update_marker("M - Loading MVM firmware");
-
+		if (mvm_dev->fw == NULL) {
+			dev_err(mvm_dev->dev, "Firmware object is NULL, Failed to load firmware\n");
+			goto ret;
+		}
 		ret = qcom_mdt_load(mvm_dev->dev, mvm_dev->fw, "mvm_ecc.mdt", MVM_PROC_ID,
 				    mvm_dev->mvm_fw, mvm_dev->mvm_fw_dma, MVM_FW_SIZE, NULL);
 		if (ret) {
@@ -2229,6 +2232,7 @@ static int mvm_load_fw(struct mvm_device *mvm_dev)
 
 out_release_firmware:
 	release_firmware(mvm_dev->fw);
+	mvm_dev->fw = NULL;
 ret:
 	return ret;
 }
