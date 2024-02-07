@@ -13,6 +13,8 @@ enum mvm_ctrl_msg_type {
 	MVM_TRIGGER_SSR,	           /* Control message to trigger SSR of MVM */
 	MVM_MAX_RATE,		   /* Control message to send max allowed rate */
 	MVM_CHANGE_CLK_FREQ,
+	MVM_SET_P1_INT_MOD,	/* Control message to set p1_int_mod(number of message)*/
+	MVM_SET_P1_INT_DELAY,	/* Control message to set p1 msg interrupt delay*/
 	MVM_MAX,
 };
 
@@ -96,7 +98,15 @@ struct mvm_max_rate {
 
 struct mvm_clk_freq {
 	mvm_clk_freq clk_freq;
-};		
+};
+
+struct mvm_p1_int_mod {
+	uint32_t new_p1_int_mod;
+};
+
+struct mvm_p1_int_delay {
+	uint32_t new_p1_int_delay;
+};
 
 /*
  * struct mvm_control
@@ -113,6 +123,8 @@ struct mvm_control {
 		struct mvm_trigger_ssr ssr;
 		struct mvm_max_rate max_rate;
 		struct mvm_clk_freq mvm_clk_freq;
+		struct mvm_p1_int_mod p1_int_mod;
+		struct mvm_p1_int_delay p1_int_delay;
 	} mvm_ctrl_msg;
 } __attribute__((packed));
 
