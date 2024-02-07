@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: GPL-2.0-only
-/* Copyright (c) 2022-2023 Qualcomm Innovation Center, Inc. All rights reserved.
+/* Copyright (c) 2022-2024 Qualcomm Innovation Center, Inc. All rights reserved.
  */
 #include <linux/platform_device.h>
 #include <linux/module.h>
@@ -169,7 +169,8 @@ each of the actual P0 and P1 buffer starts */
 #define NOMINAL_THRESH_RANGE	71 ... 100
 #define LOWSVS_RATE_LIMIT		3000
 #define MAX_IDLE_TIME_PER_CLIENT        200
-
+#define MVM_P1_INT_MOD_DEFAULT          20
+#define MVM_P1_INT_DELAY_DEFAULT_MS     7
 /**
  * enum mvm_state - state of mvm subsystem
  * @MVM_OFFLINE: MVM firmware is not loaded/authenticated yet.
@@ -330,6 +331,8 @@ struct mvm_device {
 	struct kobj_attribute mvm_crash_dump_attr;
 	struct kobj_attribute pke_time_accumulator_attr;
 	struct kobj_attribute pke_utilization_attr;
+	struct kobj_attribute p1_int_mod_attr;
+	struct kobj_attribute p1_int_delay_ms_attr;
 	struct dentry *dir;
 	uint32_t *mvm_fw;
 	struct mvm_crashdump_buffer *dump_buff;
@@ -388,7 +391,8 @@ struct mvm_device {
 	int crash_dump_show_count;
 	struct notifier_block rm_nb;
 	gh_vmid_t televm_vmid;
-
+	uint32_t p1_int_mod;
+	uint32_t p1_int_delay_ms;
 };
 
 static const uint32_t mvm_rate_lut[MAX_FREQ_PLAN][MAX_CURVES] = {
@@ -404,6 +408,7 @@ static dma_addr_t crashdump_dma_addr = 0;
 __attribute__((used))
 static size_t crashdump_size = MVM_CRASH_DUMP_SIZE;
 
+static size_t mvm_send_p1_interrupt_moderation_request(int msg_type, uint32_t requested_value, struct mvm_device *mvm_dev);
 static bool fifo_full(unsigned int fifo_head, unsigned int fifo_size, unsigned int fifo_tail);
 static int send_ctrl_msg_to_mvm(struct mvm_control *mvm_ctrl, struct mvm_device *mvm_dev);
 static int enable_gcc_clocks(struct mvm_device *mvm_dev);
@@ -432,7 +437,20 @@ static ssize_t pke_time_accumulator_read(struct kobject *kobj,
 static ssize_t pke_util_read(struct kobject *kobj,
 	struct kobj_attribute *pke_utilization_attr,
 	char *buf);
+static ssize_t mvm_p1_mod_store(struct kobject *kobj,
+	struct kobj_attribute *p1_int_mod_attr,
+	const char *buf, size_t count);
+static ssize_t mvm_p1_int_delay_store(struct kobject *kobj,
+	struct kobj_attribute *p1_int_delay_ms_attr,
+	const char *buf, size_t count);
 static int register_isrs(struct mvm_device *mvm_dev);
+static ssize_t mvm_p1_int_mod_show(struct kobject *kobj,
+	struct kobj_attribute *p1_int_mod_attr,
+	char *buf);
+
+static ssize_t mvm_p1_int_delay_ms_show(struct kobject *kobj,
+	struct kobj_attribute *p1_int_delay_ms_attr,
+	char *buf);
 
 static int mvm_stats_timer_interval_ms = MVM_STATS_TIMER_DEFAULT_INTERVAL_MS;//set 300ms as default value
 
@@ -556,6 +574,26 @@ static ssize_t mvm_state_show(struct kobject *kobj,
 	return snprintf(buf, 10, "%s\n", mvm_states[mvm_dev->state]);
 }
 
+static ssize_t mvm_p1_int_mod_show(struct kobject *kobj,
+				struct kobj_attribute *p1_int_mod_attr,
+				char *buf)
+{
+	struct mvm_device *mvm_dev = container_of(p1_int_mod_attr,
+						struct mvm_device,
+						p1_int_mod_attr);
+	return snprintf(buf, 10, "%d\n",mvm_dev->p1_int_mod);
+}
+
+static ssize_t mvm_p1_int_delay_ms_show(struct kobject *kobj,
+				struct kobj_attribute *p1_int_delay_ms_attr,
+				char *buf)
+{
+	struct mvm_device *mvm_dev = container_of(p1_int_delay_ms_attr,
+						struct mvm_device,
+						p1_int_delay_ms_attr);
+	return snprintf(buf, 10, "%d\n", mvm_dev->p1_int_delay_ms);
+}
+
 static ssize_t mvm_curr_clk_show(struct kobject *kobj,
                                 struct kobj_attribute *mvm_curr_clk_attr,
                                 char *buf)
@@ -606,6 +644,8 @@ static void sysfs_remove(struct mvm_device *mvm_dev)
 		sysfs_remove_file(mvm_dev->kobj, &mvm_dev->pke_utilization_attr.attr);
 		sysfs_remove_file(mvm_dev->kobj, &mvm_dev->pke_time_accumulator_attr.attr);
 		sysfs_remove_file(mvm_dev->kobj, &mvm_dev->mvm_crash_dump_attr.attr);
+		sysfs_remove_file(mvm_dev->kobj, &mvm_dev->p1_int_delay_ms_attr.attr);
+		sysfs_remove_file(mvm_dev->kobj, &mvm_dev->p1_int_mod_attr.attr);
 		sysfs_remove_file(mvm_dev->kobj, &mvm_dev->trigger_ssr_attr.attr);
 		sysfs_remove_file(mvm_dev->kobj, &mvm_dev->mvm_transfer_attr.attr);
 		sysfs_remove_file(mvm_dev->kobj, &mvm_dev->mvm_policy_attr.attr);
@@ -740,6 +780,32 @@ static int mvm_sysfs_init(struct mvm_device *mvm_dev)
 			goto fail_mvm_trigger_ssr_sysfs;
 		}
 
+		sysfs_attr_init(&mvm_dev->p1_int_mod_attr.attr);
+		mvm_dev->p1_int_mod_attr.attr.mode = S_IRUGO|S_IWUSR;
+		mvm_dev->p1_int_mod_attr.attr.name = "mvm_p1_int_mod";
+		mvm_dev->p1_int_mod_attr.show = mvm_p1_int_mod_show;
+		mvm_dev->p1_int_mod_attr.store = mvm_p1_mod_store;
+
+		ret = sysfs_create_file(mvm_dev->kobj, &mvm_dev->p1_int_mod_attr.attr);
+		if (ret) {
+			dev_err(mvm_dev->dev, "%s: sysfs_create_file p1_int_mod_attr failed\n",
+							__func__);
+			goto fail_mvm_p1_int_mod_sysfs;
+		}
+
+		sysfs_attr_init(&mvm_dev->p1_int_delay_ms_attr.attr);
+		mvm_dev->p1_int_delay_ms_attr.attr.mode = S_IRUGO|S_IWUSR;
+		mvm_dev->p1_int_delay_ms_attr.attr.name = "mvm_p1_interrupt_delay";
+		mvm_dev->p1_int_delay_ms_attr.show = mvm_p1_int_delay_ms_show;
+		mvm_dev->p1_int_delay_ms_attr.store = mvm_p1_int_delay_store;
+
+		ret = sysfs_create_file(mvm_dev->kobj, &mvm_dev->p1_int_delay_ms_attr.attr);
+		if (ret) {
+			dev_err(mvm_dev->dev, "%s: sysfs_create_file p1_int_delay_ms_attr failed\n",
+							__func__);
+			goto fail_mvm__p1_int_delay_ms_sysfs;
+		}
+
 		sysfs_attr_init(&mvm_dev->mvm_crash_dump_attr.attr);
 		mvm_dev->mvm_crash_dump_attr.attr.mode = S_IRUGO|S_IWUSR;
 		mvm_dev->mvm_crash_dump_attr.attr.name = "mvm_crash_dump";
@@ -797,6 +863,8 @@ static int mvm_sysfs_init(struct mvm_device *mvm_dev)
 		mvm_dev->active_buffer_index = -1;
 		mvm_dev->ddr_buf_len = 0;
 		mvm_dev->filled_dma_bytes = 0;
+		mvm_dev->p1_int_delay_ms = MVM_P1_INT_DELAY_DEFAULT_MS;
+		mvm_dev->p1_int_mod = MVM_P1_INT_MOD_DEFAULT;
 		init_waitqueue_head(&mvm_dev->mvm_log_waitqueue);
 		init_waitqueue_head(&mvm_dev->mvm_ssr_waitqueue);
 		mvm_dev->crash_dump_show_count = 0;
@@ -812,6 +880,10 @@ fail_pke_utilization_sysfs:
 fail_pke_time_accumulator_sysfs:
 	sysfs_remove_file(mvm_dev->kobj, &mvm_dev->mvm_crash_dump_attr.attr);
 fail_mvm_crash_dump_sysfs:
+	sysfs_remove_file(mvm_dev->kobj, &mvm_dev->p1_int_delay_ms_attr.attr);
+fail_mvm__p1_int_delay_ms_sysfs:
+	sysfs_remove_file(mvm_dev->kobj, &mvm_dev->p1_int_mod_attr.attr);
+fail_mvm_p1_int_mod_sysfs:
 	sysfs_remove_file(mvm_dev->kobj, &mvm_dev->trigger_ssr_attr.attr);
 fail_mvm_trigger_ssr_sysfs:
 	sysfs_remove_file(mvm_dev->kobj, &mvm_dev->mvm_transfer_attr.attr);
@@ -1092,6 +1164,67 @@ static ssize_t pke_util_read(struct kobject *kobj,
 							struct mvm_device,
 							pke_utilization_attr);
 	return snprintf(buf, 12, "0x%x\n",mvm_dev->curr_pke_util);
+}
+
+static size_t mvm_send_p1_interrupt_moderation_request(int msg_type, uint32_t requested_value, struct mvm_device *mvm_dev)
+{
+	struct mvm_control *mvm_ctrl;
+	ssize_t ret = 0;
+	if (requested_value > 0) {
+		mvm_ctrl = kzalloc(sizeof(struct mvm_control), GFP_KERNEL);
+		if(mvm_ctrl) {
+			mvm_ctrl->type = msg_type;
+			if (msg_type == MVM_SET_P1_INT_MOD)
+				mvm_ctrl->mvm_ctrl_msg.p1_int_mod.new_p1_int_mod = requested_value;
+			else if (msg_type == MVM_SET_P1_INT_DELAY)
+                                mvm_ctrl->mvm_ctrl_msg.p1_int_delay.new_p1_int_delay = requested_value;
+			ret = send_ctrl_msg_to_mvm(mvm_ctrl, mvm_dev);
+			kfree(mvm_ctrl);
+		}
+		else {
+			dev_err(mvm_dev->dev, "mvm_p1_mod_store failed with null mvm_ctrl pointer\n");
+			ret = -1;
+		}
+	}
+	return ret;
+}
+
+static ssize_t mvm_p1_mod_store(struct kobject *kobj,
+							struct kobj_attribute *p1_int_mod_attr,
+							const char *buf, size_t count)
+{
+	ssize_t ret = 0;
+	unsigned int mvm_p1_ind_mod = 0;
+	struct mvm_device *mvm_dev = container_of(p1_int_mod_attr,
+							struct mvm_device,
+							p1_int_mod_attr);
+
+	sscanf(buf,"%d",&mvm_p1_ind_mod);
+	ret = mvm_send_p1_interrupt_moderation_request(MVM_SET_P1_INT_MOD, mvm_p1_ind_mod, mvm_dev);
+	if (!ret)//mvm_send_p1_interrupt_moderation_request function will return 0 if susccess.
+		mvm_dev->p1_int_mod = mvm_p1_ind_mod;//store mvm_p1_ind_mod in driver
+	else
+		dev_err(mvm_dev->dev,"failed to set mvm_p1_ind_mod\n");
+	return count;
+}
+
+static ssize_t mvm_p1_int_delay_store(struct kobject *kobj,
+							struct kobj_attribute *p1_int_delay_ms_attr,
+							const char *buf, size_t count)
+{
+	ssize_t ret = 0;
+	unsigned int mvm_p1_int_delay = 0;
+	struct mvm_device *mvm_dev = container_of(p1_int_delay_ms_attr,
+							struct mvm_device,
+							p1_int_delay_ms_attr);
+
+	sscanf(buf,"%d",&mvm_p1_int_delay);
+	ret = mvm_send_p1_interrupt_moderation_request(MVM_SET_P1_INT_DELAY, mvm_p1_int_delay, mvm_dev);
+	if (!ret)//mvm_send_p1_interrupt_moderation_request function will return 0 if susccess.
+		mvm_dev->p1_int_delay_ms = mvm_p1_int_delay;//store mvm_p1_int_delay in driver.
+	else
+		dev_err(mvm_dev->dev,"failed to set mvm_p1_int_delay\n");
+	return count;
 }
 
 static void process_control_message(struct mvm_control *mvm_ctrl_recv, struct mvm_device *mvm_dev)
@@ -2411,6 +2544,10 @@ static void trigger_ssr_work_hdlr(struct work_struct *work)
 	send_mvm_state_to_user(mvm_dev, MVM_RESTARTING);
 	mvm_load_fw(mvm_dev);
 
+	if (mvm_dev->p1_int_delay_ms != MVM_P1_INT_DELAY_DEFAULT_MS)
+		mvm_send_p1_interrupt_moderation_request(MVM_SET_P1_INT_DELAY, mvm_dev->p1_int_delay_ms, mvm_dev);
+	if (mvm_dev->p1_int_mod != MVM_P1_INT_MOD_DEFAULT)
+		mvm_send_p1_interrupt_moderation_request(MVM_SET_P1_INT_MOD, mvm_dev->p1_int_mod, mvm_dev);
 	mod_timer(&mvm_dev->mvm_stats_timer,jiffies + msecs_to_jiffies(mvm_stats_timer_interval_ms));
 	return;
 }
