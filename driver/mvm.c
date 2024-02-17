@@ -155,22 +155,17 @@ each of the actual P0 and P1 buffer starts */
 #define MVM_INITIAL_CAPACITY 		100
 
 #define CLK_CHANGE_MIN_CAPACITY		3001
-#define PKE_UTIL_ADJUST_THRESH		90
-#define PKE_UTIL_UPPER_THRESH		70
-#define PKE_UTIL_LOWER_THRESH		40
-#define MAX_PKE_UTIL_LOW_SVS		100
-#define PKE_UTIL_ADJUST_FACTOR_LOWSVS(x)	(x/2)
-#define PKE_UTIL_ADJUST_FACTOR_SVS(x)		((x*3)/4)
 #define MVM_STATS_TIMER_DEFAULT_INTERVAL_MS	300
 #define PKE_UTIL_PERIOD_TICKS (19200 * mvm_stats_timer_interval_ms)
 #define PKE_COUNT 3
-#define LOW_SVS_THRESH_RANGE	1 ... 50
-#define SVS_THRESH_RANGE		51 ... 70
-#define NOMINAL_THRESH_RANGE	71 ... 100
 #define LOWSVS_RATE_LIMIT		3000
 #define MAX_IDLE_TIME_PER_CLIENT        200
 #define MVM_P1_INT_MOD_DEFAULT          20
 #define MVM_P1_INT_DELAY_DEFAULT_MS     7
+#define LOW_SVS_UPPER_THRESH            95
+#define SVS_LOWER_THRESH                30
+#define SVS_UPPER_THRESH                95
+#define NOMINAL_LOWER_THRESH            30
 /**
  * enum mvm_state - state of mvm subsystem
  * @MVM_OFFLINE: MVM firmware is not loaded/authenticated yet.
@@ -3047,34 +3042,18 @@ static void change_clk_freq_work_hdlr(struct work_struct *work)
 	if (mvm_dev->max_rate < CLK_CHANGE_MIN_CAPACITY) {//When max_rate is 3000 or less, operate at LOW_SVS.
 		change_clock = false;
 	}
-	if (mvm_dev->curr_clk == LOW_SVS) {
-		if (mvm_dev->curr_pke_util < MAX_PKE_UTIL_LOW_SVS)
-			change_clock = false;//operate in low_svs untill utilization upto MAX_PKE_UTIL_LOW_SVS
-		else
-			pke_utility_now = PKE_UTIL_ADJUST_FACTOR_LOWSVS(pke_utility_now);
-		/*Once pke utilisation goes beyond MAX_PKE_UTIL_LOW_SVS, then clock will be switched to SVS.
-		Since we are running at a higher frequency compared to the previous run, utilisation will drop now.
-		Hence adjust the pke utilisation with the division factor to avoid switching to LOW_SVS or NOMINAL*/
-	}
-	else if((mvm_dev->curr_clk == SVS)&& (mvm_dev->curr_pke_util > PKE_UTIL_UPPER_THRESH) &&(mvm_dev->curr_pke_util < PKE_UTIL_ADJUST_THRESH)){
-		/*When operating at SVS, do not switch the clock unless the pke utilisation is more than PKE_UTIL_ADJUST_THRESH.*/
-		pke_utility_now = PKE_UTIL_ADJUST_FACTOR_SVS(pke_utility_now);//Adjust the pke utilisation value by PKE_UTIL_ADJUST_FACTOR_SVS to ensure we dont switch clock unnecessarily.
-	}
 	de_bounce_time = ktime_sub(now, mvm_dev->clk_time_elapsed);
 	if((mvm_dev->req_clk == mvm_dev->curr_clk) && (ktime_to_ms(de_bounce_time) > MIN_CLOCK_CHANGE_TIME_MS) && (change_clock)){
-		switch (pke_utility_now) {
-		 case LOW_SVS_THRESH_RANGE:
-		 	mvm_dev->req_clk = LOW_SVS;
-		 	break;
-		 case SVS_THRESH_RANGE:
+		if (mvm_dev->curr_clk == LOW_SVS && mvm_dev->curr_pke_util > LOW_SVS_UPPER_THRESH)
 			mvm_dev->req_clk = SVS;
-		 	break;
-		 case NOMINAL_THRESH_RANGE:
-		 	mvm_dev->req_clk = NOMINAL;
-		 	break;
-		 default:
-		 	break;
+		else if (mvm_dev->curr_clk == SVS) {
+			if(mvm_dev->curr_pke_util < SVS_LOWER_THRESH)
+				mvm_dev->req_clk = LOW_SVS;
+			else if (mvm_dev->curr_pke_util > SVS_UPPER_THRESH)
+				mvm_dev->req_clk = NOMINAL;
 		}
+		else if (mvm_dev->curr_clk == NOMINAL && mvm_dev->curr_pke_util < NOMINAL_LOWER_THRESH)
+			mvm_dev->req_clk = SVS;
 		if (mvm_dev->req_clk != mvm_dev->curr_clk) {
 			/* Send control message to change the clock frequency */
 			struct mvm_control *mvm_ctrl = kzalloc(sizeof(struct mvm_control), GFP_KERNEL);
