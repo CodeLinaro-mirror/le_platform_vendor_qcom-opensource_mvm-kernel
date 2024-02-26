@@ -923,6 +923,7 @@ static int send_ctrl_msg_to_mvm(struct mvm_control *mvm_ctrl, struct mvm_device 
 	bool full;
 	int ret = 0;
 
+	mutex_lock(&mvm_dev->in_fifo_lock);
 	mvm_dev->ring_buff->in_fifo[0].tail =
 		readl_relaxed(mvm_dev->mvm_base + MVMSS_CSR_INPUT_RING0_TAIL_PTR_OFFSET);
 	mvm_dev->ring_buff->in_fifo[0].head =
@@ -954,8 +955,10 @@ static int send_ctrl_msg_to_mvm(struct mvm_control *mvm_ctrl, struct mvm_device 
 		dev_err(mvm_dev->dev, "send_ctrl_msg_to_mvm failed with null inp_msg pointer\n");
 		ret = -1;
 	}
+	mutex_unlock(&mvm_dev->in_fifo_lock);
 	return ret;
 }
+
 static ssize_t mvm_log_show(struct kobject *kobj,
 						struct kobj_attribute *mvm_log_attr,
 						char *buf)
