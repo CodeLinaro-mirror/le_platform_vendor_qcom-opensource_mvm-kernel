@@ -2966,6 +2966,8 @@ static int mvm_suspend(struct device *dev)
 			reinit_completion(&mvm_dev->mvm_wfi_irq_recvd);
 			mvm_dev->resume_frm_pwr_collapse = true;
 			enable_wfi_int(mvm_dev, false);
+			mvm_dev->state = MVM_ONLINE;
+			send_mvm_state_to_user(mvm_dev, MVM_ONLINE);
 			list_for_each_entry(mvm_cli, &mvm_dev->client_list, list) { //if suspend is failed ,then keep client enabled
 				if (mvm_cli->state != CLIENT_DISCONNECTING) {
 					mvm_cli->state = CLIENT_READY;
