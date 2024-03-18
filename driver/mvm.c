@@ -3424,13 +3424,10 @@ static int mvm_remove(struct platform_device *pdev)
 		del_timer_sync(&mvm_dev->mvm_stats_timer);
 	}
 
-        if (mvm_dev->vm_variant == HOSTVM) {
-                gh_rm_mem_reclaim(mvm_dev->mvmss_mem_handle, 0);
-                gh_rm_mem_reclaim(mvm_dev->apss_mem_handle, 0);
-		mvm_hostvm_unshare_mem(mvm_dev);
+	if (mvm_dev->vm_variant == HOSTVM) {
 		gh_dbl_tx_unregister(mvm_dev->hostvm_tx_dbl);
 		gh_dbl_rx_unregister(mvm_dev->hostvm_rx_dbl);
-        }
+	}
 
 	if (mvm_dev->vm_variant == TELEVM) {
 		gh_dbl_tx_unregister(mvm_dev->televm_tx_dbl);
@@ -3439,7 +3436,7 @@ static int mvm_remove(struct platform_device *pdev)
 
 	if (mvm_dev->vm_variant == PVM_ONLY || mvm_dev->vm_variant == HOSTVM) {
 		mvm_iommu_release(mvm_dev);
-                mvm_dma_mem_free(mvm_dev);
+		mvm_dma_mem_free(mvm_dev);
 	}
 	if(mvm_dev->vm_variant == PVM_ONLY || mvm_dev->vm_variant == TELEVM) {
 		enable_mvm_gdsc(mvm_dev,false);
@@ -3447,13 +3444,14 @@ static int mvm_remove(struct platform_device *pdev)
 		clk_disable_unprepare(mvm_dev->snoc_m_axi_clk);
 		clk_disable_unprepare(mvm_dev->sysnoc_mvmss_clk);
 		unregister_pm_notifier(&mvm_dev->pm_notifier);
-		mvm_iommu_release(mvm_dev);
 	}
 	sysfs_remove(mvm_dev);
-	device_destroy(mvm_dev->mvm_class, mvm_dev->mvm_cdev_devid);
-	class_destroy(mvm_dev->mvm_class);
-	cdev_del(&mvm_dev->mvm_cdev);
-	unregister_chrdev_region(mvm_dev->mvm_cdev_devid, 1);
+	if(mvm_dev->vm_variant == PVM_ONLY || mvm_dev->vm_variant == TELEVM) {
+		device_destroy(mvm_dev->mvm_class, mvm_dev->mvm_cdev_devid);
+		class_destroy(mvm_dev->mvm_class);
+		cdev_del(&mvm_dev->mvm_cdev);
+		unregister_chrdev_region(mvm_dev->mvm_cdev_devid, 1);
+	}
 	return 0;
 }
 
