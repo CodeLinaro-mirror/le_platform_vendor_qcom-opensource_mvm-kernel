@@ -2490,6 +2490,7 @@ static void trigger_ssr_work_hdlr(struct work_struct *work)
 	bool p0_fifo_has_results =0 ,p1_fifo_has_results =0;
 	gh_dbl_flags_t dbl_mask;
 
+	reinit_completion(&mvm_dev->mvm_dump_collection_done);
 	del_timer_sync(&mvm_dev->mvm_stats_timer);
 	if (mvm_dev->vm_variant == TELEVM) {
 		dbl_mask = MVM_SHUTDOWN_DBL_MASK;
@@ -2506,7 +2507,7 @@ static void trigger_ssr_work_hdlr(struct work_struct *work)
 			return;
 		}
 	}
-	reinit_completion(&mvm_dev->mvm_dump_collection_done);
+
 	mutex_lock(&mvm_dev->out_fifo_lock);
 	p0_fifo_has_results = out_fifo_get_results(mvm_dev, 0);
 	p1_fifo_has_results = out_fifo_get_results(mvm_dev, 1);
