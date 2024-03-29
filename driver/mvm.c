@@ -911,6 +911,15 @@ static bool fifo_full(unsigned int fifo_head, unsigned int fifo_size, unsigned i
 	return head == fifo_tail;
 }
 
+static bool fifo_over_buffer(unsigned int fifo_head, unsigned int fifo_size, unsigned int fifo_tail,
+	unsigned int buffer_size)
+{
+	unsigned int room = fifo_size - fifo_head + fifo_tail;
+	if(fifo_tail > fifo_head)
+		room -= fifo_size;
+	return room < buffer_size;
+}
+
 static int send_ctrl_msg_to_mvm(struct mvm_control *mvm_ctrl, struct mvm_device *mvm_dev)
 {
 	struct input_msg *inp_msg;
@@ -1433,9 +1442,10 @@ static void drain_out_fifo_work_hdlr(struct work_struct *work)
 	mvm_dev->ring_buff->in_fifo[1].tail =
 		readl_relaxed(mvm_dev->mvm_base + MVMSS_CSR_INPUT_RING1_TAIL_PTR_OFFSET);
 
-	if(!fifo_full(mvm_dev->ring_buff->in_fifo[0].head,
-			(mvm_dev->ring_buff->in_fifo[0].size - P0_BUFFER_SIZE_FOR_CTRL_MSG),
-			mvm_dev->ring_buff->in_fifo[0].tail)){
+	if(!fifo_over_buffer(mvm_dev->ring_buff->in_fifo[0].head,
+			mvm_dev->ring_buff->in_fifo[0].size,
+			mvm_dev->ring_buff->in_fifo[0].tail,
+			P0_BUFFER_SIZE_FOR_CTRL_MSG)){
 		complete(&mvm_dev->p0_fifo_slot_available);
 	}
 
@@ -1640,9 +1650,10 @@ push_to_input_ring:
 					   mvm_dev->ring_buff->in_fifo[fifo_index].tail,
 					   mvm_dev->ring_buff->in_fifo[fifo_index].size);
 		if (fifo_index == 0) {
-			full = fifo_full(mvm_dev->ring_buff->in_fifo[fifo_index].head,
-					(mvm_dev->ring_buff->in_fifo[fifo_index].size - P0_BUFFER_SIZE_FOR_CTRL_MSG),
-					mvm_dev->ring_buff->in_fifo[fifo_index].tail);
+			full = fifo_over_buffer(mvm_dev->ring_buff->in_fifo[fifo_index].head,
+					mvm_dev->ring_buff->in_fifo[fifo_index].size,
+					mvm_dev->ring_buff->in_fifo[fifo_index].tail,
+					P0_BUFFER_SIZE_FOR_CTRL_MSG);
 		} else {
 			full = fifo_full(mvm_dev->ring_buff->in_fifo[fifo_index].head,
 					mvm_dev->ring_buff->in_fifo[fifo_index].size,
