@@ -12,7 +12,7 @@ Conflicts=shutdown.target
 Restart=on-failure
 RemainAfterExit=yes
 ExecStart=/bin/sh -c '/sbin/insmod /lib/modules/$(uname -r)/extra/mvm.ko mvm_stats_timer_interval_ms=300'
-ExecStop=/bin/sh -c '/sbin/rmmod mvm'
+ExecStop=/bin/sh -c '/sbin/rmmod mvm_dlkm'
 
 [Install]
 WantedBy=sysinit.target
