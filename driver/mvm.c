@@ -3458,6 +3458,11 @@ static int mvm_remove(struct platform_device *pdev)
 		unregister_pm_notifier(&mvm_dev->pm_notifier);
 	}
 	sysfs_remove(mvm_dev);
+#ifdef CONFIG_GUNYAH
+	if (mvm_dev->vm_variant == HOSTVM) {
+		gh_unregister_vm_notifier(&mvm_dev->rm_nb);
+	}
+#endif /* CONFIG_GUNYAH */
 	if(mvm_dev->vm_variant == PVM_ONLY || mvm_dev->vm_variant == TELEVM) {
 		device_destroy(mvm_dev->mvm_class, mvm_dev->mvm_cdev_devid);
 		class_destroy(mvm_dev->mvm_class);
