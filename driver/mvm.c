@@ -277,6 +277,7 @@ struct mvm_client {
 struct mvm_stats_client {
 	struct list_head list;
 	struct task_struct *task;
+	struct mvm_device *mvm_dev;
 };
 
 struct mvm_device {
@@ -473,6 +474,7 @@ static void send_mvm_capacity_to_user(struct mvm_device *mvm_dev)
 {
 	struct kernel_siginfo info;
 	struct mvm_stats_client *mvm_stats_cli;
+	struct mvm_stats_client *mvm_stats_cli_temp;
 	int i;
 	uint8_t rate_idx = 0;
 
@@ -486,7 +488,7 @@ static void send_mvm_capacity_to_user(struct mvm_device *mvm_dev)
 	for (i=0; i< MAX_CURVES; i++)
 		mvm_dev->mvm_capacity[i] = min(mvm_dev->max_rate, mvm_rate_lut[rate_idx][i]);
 
-	list_for_each_entry(mvm_stats_cli, &mvm_dev->mvm_stats_client_list, list) {
+	list_for_each_entry_safe(mvm_stats_cli,mvm_stats_cli_temp, &mvm_dev->mvm_stats_client_list, list) {
 		if (mvm_stats_cli->task != NULL) {
 			if(send_sig_info(MVM_NOTIFY_SIGNO, &info, mvm_stats_cli->task) < 0)
 				dev_err(mvm_dev->dev, "Unable to send mvm capacity signal to userspace\n");
@@ -2801,7 +2803,8 @@ static const struct file_operations mvm_fileops = {
 static long mvm_stats_ioctl(struct file *filp, unsigned int cmd, unsigned long arg)
 {
 	int ret = 0;
-	struct mvm_device *mvm_dev = filp->private_data;
+	struct mvm_stats_client *mvm_stats_cli = filp->private_data;
+	struct mvm_device *mvm_dev = mvm_stats_cli->mvm_dev;
 
 	switch (cmd) {
 	case GET_MVM_CAPACITY:
@@ -2836,20 +2839,30 @@ static int mvm_stats_open(struct inode *inode, struct file *filp)
 	mvm_stats_cli = kzalloc(sizeof(*mvm_stats_cli), GFP_KERNEL);
 	if (!mvm_stats_cli) {
 		ret = -ENOMEM;
-		goto ret;
+		goto exit;
 	}
-
 	INIT_LIST_HEAD(&mvm_stats_cli->list);
+	mvm_stats_cli->mvm_dev = mvm_dev;
 	mvm_stats_cli->task = get_current();
 	list_add_tail(&mvm_stats_cli->list, &mvm_dev->mvm_stats_client_list);
-	filp->private_data = mvm_dev;
+	filp->private_data = mvm_stats_cli;
 
-ret:
+exit:
+	return ret;
+}
+
+static int mvm_stats_release(struct inode *inode, struct file *filp)
+{
+	struct mvm_device *mvm_dev = container_of(inode->i_cdev,
+				struct mvm_device, mvm_stats_cdev);
+	struct mvm_stats_client *mvm_stats_cli = filp->private_data;;
+	mvm_stats_client_remove(mvm_dev,mvm_stats_cli);
 	return 0;
 }
 
 static const struct file_operations mvm_stats_fileops = {
 	.open = mvm_stats_open,
+	.release = mvm_stats_release,
 	.unlocked_ioctl = mvm_stats_ioctl,
 #ifdef CONFIG_COMPAT
         .compat_ioctl = mvm_stats_compat_ioctl,
