@@ -4,7 +4,7 @@
 [Unit]
 Description= Load mvm dlkm service
 AssertPathExists=/lib/modules/
-After=systemd-tmpfiles-setup.service
+After=systemd-tmpfiles-setup.service firmware-mount.service
 DefaultDependencies=no
 Conflicts=shutdown.target
 
