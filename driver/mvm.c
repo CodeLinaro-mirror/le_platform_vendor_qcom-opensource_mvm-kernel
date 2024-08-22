@@ -995,15 +995,13 @@ static ssize_t mvm_log_show(struct kobject *kobj,
 	}
 
 	if (mvm_dev->ddr_head_pos > mvm_dev->ddr_tail_pos) {
-		if (count >= (mvm_dev->ddr_head_pos - mvm_dev->ddr_tail_pos)) {
+		if (count >= (mvm_dev->ddr_head_pos - mvm_dev->ddr_tail_pos)*(sizeof(uint32_t))) {
 			memcpy(buf, mvm_dev->ddr_tail_pos, (mvm_dev->ddr_head_pos - mvm_dev->ddr_tail_pos)*4);
 			actual_length = (mvm_dev->ddr_head_pos - mvm_dev->ddr_tail_pos)*4;
-			mvm_dev->ddr_tail_pos = mvm_dev->ddr_head_pos;
-			return actual_length;
 		} else  {
 			memcpy(buf, mvm_dev->ddr_tail_pos, count);
 			mvm_dev->ddr_tail_pos = (mvm_dev->ddr_tail_pos +(count/4));
-			return count;
+			actual_length = count;
 		}
 	} else if (mvm_dev->ddr_head_pos < mvm_dev->ddr_tail_pos) {
 		memcpy(buf, mvm_dev->ddr_tail_pos, (&mvm_dev->log_buff->mvmlog_buffer[MVM_ULOG_BUFFER_SIZE] - mvm_dev->ddr_tail_pos));
@@ -1013,9 +1011,11 @@ static ssize_t mvm_log_show(struct kobject *kobj,
 			memcpy(buff_total, &mvm_dev->log_buff->mvmlog_buffer[0], (mvm_dev->ddr_head_pos - &mvm_dev->log_buff->mvmlog_buffer[0]));
 			actual_length = length_tail_to_bufferend + (mvm_dev->ddr_head_pos - &mvm_dev->log_buff->mvmlog_buffer[0]);
 		}
-		mvm_dev->ddr_tail_pos = mvm_dev->ddr_head_pos;
-		return actual_length;
 	}
+
+	//PAGE_SIZE will be 4096 and defined in sysfs.h
+	if (actual_length >= (ssize_t)PAGE_SIZE)
+		actual_length = PAGE_SIZE - 1;
 	return actual_length;
 }
 
