@@ -2329,6 +2329,7 @@ static int mvm_load_fw(struct mvm_device *mvm_dev)
 	if (mvm_dev->vm_variant == PVM_ONLY || mvm_dev->vm_variant == HOSTVM) {
 		update_marker("M - Loading MVM firmware");
 		if (mvm_dev->fw == NULL) {
+			ret = -1;
 			dev_err(mvm_dev->dev, "Firmware object is NULL, Failed to load firmware\n");
 			goto ret;
 		}
@@ -3355,6 +3356,7 @@ static int mvm_probe(struct platform_device *pdev)
 		ret = request_firmware(&mvm_dev->fw, "mvm_ecc.mdt", mvm_dev->dev);
 		if (ret) {
 			dev_err(mvm_dev->dev, "request_firmware for mvm failed\n");
+			goto doorbell_fail;
 		}
 	}
 	if (mvm_dev->vm_variant == PVM_ONLY || mvm_dev->vm_variant == TELEVM) {
