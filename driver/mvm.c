@@ -995,15 +995,13 @@ static ssize_t mvm_log_show(struct kobject *kobj,
 	}
 
 	if (mvm_dev->ddr_head_pos > mvm_dev->ddr_tail_pos) {
-		if (count >= (mvm_dev->ddr_head_pos - mvm_dev->ddr_tail_pos)) {
+		if (count >= (mvm_dev->ddr_head_pos - mvm_dev->ddr_tail_pos)*(sizeof(uint32_t))) {
 			memcpy(buf, mvm_dev->ddr_tail_pos, (mvm_dev->ddr_head_pos - mvm_dev->ddr_tail_pos)*4);
 			actual_length = (mvm_dev->ddr_head_pos - mvm_dev->ddr_tail_pos)*4;
-			mvm_dev->ddr_tail_pos = mvm_dev->ddr_head_pos;
-			return actual_length;
 		} else  {
 			memcpy(buf, mvm_dev->ddr_tail_pos, count);
 			mvm_dev->ddr_tail_pos = (mvm_dev->ddr_tail_pos +(count/4));
-			return count;
+			actual_length = count;
 		}
 	} else if (mvm_dev->ddr_head_pos < mvm_dev->ddr_tail_pos) {
 		memcpy(buf, mvm_dev->ddr_tail_pos, (&mvm_dev->log_buff->mvmlog_buffer[MVM_ULOG_BUFFER_SIZE] - mvm_dev->ddr_tail_pos));
@@ -1013,9 +1011,11 @@ static ssize_t mvm_log_show(struct kobject *kobj,
 			memcpy(buff_total, &mvm_dev->log_buff->mvmlog_buffer[0], (mvm_dev->ddr_head_pos - &mvm_dev->log_buff->mvmlog_buffer[0]));
 			actual_length = length_tail_to_bufferend + (mvm_dev->ddr_head_pos - &mvm_dev->log_buff->mvmlog_buffer[0]);
 		}
-		mvm_dev->ddr_tail_pos = mvm_dev->ddr_head_pos;
-		return actual_length;
 	}
+
+	//PAGE_SIZE will be 4096 and defined in sysfs.h
+	if (actual_length >= (ssize_t)PAGE_SIZE)
+		actual_length = PAGE_SIZE - 1;
 	return actual_length;
 }
 
@@ -2329,6 +2329,7 @@ static int mvm_load_fw(struct mvm_device *mvm_dev)
 	if (mvm_dev->vm_variant == PVM_ONLY || mvm_dev->vm_variant == HOSTVM) {
 		update_marker("M - Loading MVM firmware");
 		if (mvm_dev->fw == NULL) {
+			ret = -1;
 			dev_err(mvm_dev->dev, "Firmware object is NULL, Failed to load firmware\n");
 			goto ret;
 		}
@@ -3355,6 +3356,7 @@ static int mvm_probe(struct platform_device *pdev)
 		ret = request_firmware(&mvm_dev->fw, "mvm_ecc.mdt", mvm_dev->dev);
 		if (ret) {
 			dev_err(mvm_dev->dev, "request_firmware for mvm failed\n");
+			goto doorbell_fail;
 		}
 	}
 	if (mvm_dev->vm_variant == PVM_ONLY || mvm_dev->vm_variant == TELEVM) {
