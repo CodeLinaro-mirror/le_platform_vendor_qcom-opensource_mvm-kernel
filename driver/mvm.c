@@ -1505,6 +1505,12 @@ static int mvm_open(struct inode *inode, struct file *filp)
 					struct mvm_device, mvm_cdev);
 	struct mvm_client *mvm_cli;
 
+	if (mvm_dev->state != MVM_ONLINE){
+		dev_dbg(mvm_dev->dev, "mvm is not ONLINE,cannot accept client connections\n");
+		ret = -EUSERS;
+		goto exit;
+	}
+
 	mutex_lock(&mvm_dev->mvm_cli_lock);
 	if (bitmap_full(mvm_dev->client_id_bitmap, MAX_CLIENT_COUNT)) {
 		dev_err(mvm_dev->dev, "Cannot accept new connections\n");
