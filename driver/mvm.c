@@ -2571,7 +2571,7 @@ static void trigger_ssr_work_hdlr(struct work_struct *work)
 
 
 	list_for_each_entry_safe(mvm_cli, mvm_cli_temp, &mvm_dev->client_list, list) {
-		if (mvm_cli->state == CLIENT_DISCONNECTING ) {
+		if ((mvm_cli->state == CLIENT_DISCONNECTING ) && (mvm_cli->results_recvd == mvm_cli->msgs_sent)){
 			mvm_client_remove(mvm_dev,mvm_cli);
 		}
 		else {
