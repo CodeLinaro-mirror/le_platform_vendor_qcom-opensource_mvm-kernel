@@ -329,6 +329,7 @@ struct mvm_device {
 	struct kobj_attribute pke_utilization_attr;
 	struct kobj_attribute p1_int_mod_attr;
 	struct kobj_attribute p1_int_delay_ms_attr;
+	struct kobj_attribute fw_version_attr;
 	struct dentry *dir;
 	uint32_t *mvm_fw;
 	struct mvm_crashdump_buffer *dump_buff;
@@ -389,6 +390,7 @@ struct mvm_device {
 	gh_vmid_t televm_vmid;
 	uint32_t p1_int_mod;
 	uint32_t p1_int_delay_ms;
+	struct mvm_fw_version fw_version;
 };
 
 static const uint32_t mvm_rate_lut[MAX_FREQ_PLAN][MAX_CURVES] = {
@@ -446,6 +448,9 @@ static ssize_t mvm_p1_int_mod_show(struct kobject *kobj,
 
 static ssize_t mvm_p1_int_delay_ms_show(struct kobject *kobj,
 	struct kobj_attribute *p1_int_delay_ms_attr,
+	char *buf);
+static ssize_t mvm_fw_version_show(struct kobject *kobj,
+	struct kobj_attribute *fw_version_attr,
 	char *buf);
 
 static int mvm_stats_timer_interval_ms = MVM_STATS_TIMER_DEFAULT_INTERVAL_MS;//set 300ms as default value
@@ -853,6 +858,18 @@ static int mvm_sysfs_init(struct mvm_device *mvm_dev)
 							__func__);
 			goto fail_mvm_log_level_sysfs;
 		}
+
+		sysfs_attr_init(&mvm_dev->fw_version_attr.attr);
+		mvm_dev->fw_version_attr.attr.mode = S_IRUGO;
+		mvm_dev->fw_version_attr.attr.name = "fw_version";
+		mvm_dev->fw_version_attr.show = mvm_fw_version_show;
+
+		ret = sysfs_create_file(mvm_dev->kobj, &mvm_dev->fw_version_attr.attr);
+		if (ret) {
+			dev_err(mvm_dev->dev, "%s: sysfs_create_file fw_version_attr failed\n",
+					__func__);
+			goto fail_fw_version_sysfs;
+		}
 		mvm_dev->clk_time_elapsed =0;
 		mvm_dev->ddr_current_addr = &mvm_dev->log_buff->mvmlog_buffer[0];
 		mvm_dev->ddr_head_pos = &mvm_dev->log_buff->mvmlog_buffer[0];
@@ -870,6 +887,8 @@ static int mvm_sysfs_init(struct mvm_device *mvm_dev)
 	return 0;
 
 	if (mvm_dev->vm_variant == PVM_ONLY || mvm_dev->vm_variant == TELEVM) {
+fail_fw_version_sysfs:
+	sysfs_remove_file(mvm_dev->kobj, &mvm_dev->mvm_log_level_attr.attr);
 fail_mvm_log_level_sysfs:
 	sysfs_remove_file(mvm_dev->kobj, &mvm_dev->pke_utilization_attr.attr);
 fail_pke_utilization_sysfs:
@@ -1175,6 +1194,19 @@ static ssize_t pke_util_read(struct kobject *kobj,
 	return snprintf(buf, 12, "0x%x\n",mvm_dev->curr_pke_util);
 }
 
+static ssize_t mvm_fw_version_show(struct kobject *kobj,
+		struct kobj_attribute *fw_version_attr,
+		char *buf)
+{
+	struct mvm_device *mvm_dev = container_of(fw_version_attr,
+			struct mvm_device,
+			fw_version_attr);
+	return snprintf(buf, 12, "%02d.%02d.%02d\n",
+			mvm_dev->fw_version.major,
+			mvm_dev->fw_version.minor,
+			mvm_dev->fw_version.patch);
+}
+
 static size_t mvm_send_p1_interrupt_moderation_request(int msg_type, uint32_t requested_value, struct mvm_device *mvm_dev)
 {
 	struct mvm_control *mvm_ctrl;
@@ -1331,6 +1363,13 @@ static bool drain_out_fifo(struct mvm_device *mvm_dev, unsigned int fifo_index, 
 							mvm_clk_freq_plan[mvm_dev->curr_clk],
 							mvm_clk_freq_plan[mvm_ctrl_recv->mvm_ctrl_msg.mvm_clk_freq.clk_freq]);
 					mvm_dev->curr_clk = mvm_ctrl_recv->mvm_ctrl_msg.mvm_clk_freq.clk_freq;
+					break;
+				case MVM_FW_VERSION:
+					mvm_dev->fw_version = mvm_ctrl_recv->mvm_ctrl_msg.fw_version;
+					dev_info(mvm_dev->dev, "MVM FW version is %02d.%02d.%02d\n",
+							mvm_dev->fw_version.major,
+							mvm_dev->fw_version.minor,
+							mvm_dev->fw_version.patch);
 					break;
 				default:
 					break;
@@ -1504,6 +1543,12 @@ static int mvm_open(struct inode *inode, struct file *filp)
 	struct mvm_device *mvm_dev = container_of(inode->i_cdev,
 					struct mvm_device, mvm_cdev);
 	struct mvm_client *mvm_cli;
+
+	if (mvm_dev->state != MVM_ONLINE){
+		dev_dbg(mvm_dev->dev, "mvm is not ONLINE,cannot accept client connections\n");
+		ret = -EUSERS;
+		goto exit;
+	}
 
 	mutex_lock(&mvm_dev->mvm_cli_lock);
 	if (bitmap_full(mvm_dev->client_id_bitmap, MAX_CLIENT_COUNT)) {
@@ -2532,7 +2577,7 @@ static void trigger_ssr_work_hdlr(struct work_struct *work)
 
 
 	list_for_each_entry_safe(mvm_cli, mvm_cli_temp, &mvm_dev->client_list, list) {
-		if (mvm_cli->state == CLIENT_DISCONNECTING ) {
+		if ((mvm_cli->state == CLIENT_DISCONNECTING ) && (mvm_cli->results_recvd == mvm_cli->msgs_sent)){
 			mvm_client_remove(mvm_dev,mvm_cli);
 		}
 		else {
