@@ -304,6 +304,7 @@ struct mvm_device {
 	wait_queue_head_t mvm_waitqueue;
 	wait_queue_head_t mvm_log_waitqueue;
 	wait_queue_head_t mvm_ssr_waitqueue;
+	wait_queue_head_t pm_wait_queue;
 	struct work_struct drain_out_fifo_work;
 	struct work_struct trigger_ssr_work;
 	struct work_struct change_clk_freq_work;
@@ -391,6 +392,15 @@ struct mvm_device {
 	uint32_t p1_int_mod;
 	uint32_t p1_int_delay_ms;
 	struct mvm_fw_version fw_version;
+	atomic_t mvm_pm_state;
+};
+
+enum mvm_pm_state {
+	PM_STATE_IDLE,
+	PM_STATE_SSR,
+	PM_STATE_SUSPENDING,
+	PM_STATE_RESUMING,
+	PM_STATE_SUSPENDED,
 };
 
 static const uint32_t mvm_rate_lut[MAX_FREQ_PLAN][MAX_CURVES] = {
@@ -452,8 +462,15 @@ static ssize_t mvm_p1_int_delay_ms_show(struct kobject *kobj,
 static ssize_t mvm_fw_version_show(struct kobject *kobj,
 	struct kobj_attribute *fw_version_attr,
 	char *buf);
+static void set_mvm_pm_state(struct mvm_device *mvm_dev, enum mvm_pm_state new_state);
 
 static int mvm_stats_timer_interval_ms = MVM_STATS_TIMER_DEFAULT_INTERVAL_MS;//set 300ms as default value
+
+static void set_mvm_pm_state(struct mvm_device *mvm_dev, enum mvm_pm_state new_state)
+{
+	atomic_set(&mvm_dev->mvm_pm_state, new_state);
+	wake_up(&mvm_dev->pm_wait_queue);
+}
 
 static void send_mvm_state_to_user(struct mvm_device *mvm_dev, enum mvm_state state)
 {
@@ -941,14 +958,13 @@ static bool fifo_over_buffer(unsigned int fifo_head, unsigned int fifo_size, uns
 	return room < buffer_size;
 }
 
-static int send_ctrl_msg_to_mvm(struct mvm_control *mvm_ctrl, struct mvm_device *mvm_dev)
+static int send_ctrl_msg_locked(struct mvm_control *mvm_ctrl, struct mvm_device *mvm_dev)
 {
 	struct input_msg *inp_msg;
 	unsigned int *in_fifo_addr = NULL;
 	bool full;
 	int ret = 0;
 
-	mutex_lock(&mvm_dev->in_fifo_lock);
 	mvm_dev->ring_buff->in_fifo[0].tail =
 		readl_relaxed(mvm_dev->mvm_base + MVMSS_CSR_INPUT_RING0_TAIL_PTR_OFFSET);
 	mvm_dev->ring_buff->in_fifo[0].head =
@@ -980,6 +996,14 @@ static int send_ctrl_msg_to_mvm(struct mvm_control *mvm_ctrl, struct mvm_device 
 		dev_err(mvm_dev->dev, "send_ctrl_msg_to_mvm failed with null inp_msg pointer\n");
 		ret = -1;
 	}
+	return ret;
+}
+
+static int send_ctrl_msg_to_mvm(struct mvm_control *mvm_ctrl, struct mvm_device *mvm_dev)
+{
+	int ret = 0;
+	mutex_lock(&mvm_dev->in_fifo_lock);
+	ret = send_ctrl_msg_locked(mvm_ctrl, mvm_dev);
 	mutex_unlock(&mvm_dev->in_fifo_lock);
 	return ret;
 }
@@ -2443,7 +2467,7 @@ static int send_pwr_collpase_ctrl_msg(struct mvm_device *mvm_dev, bool pwr_colla
 	if (mvm_ctrl) {
 		mvm_ctrl->type = MVM_POWER;
 		mvm_ctrl->mvm_ctrl_msg.power.enter_pwr_collapse = pwr_collapse;
-		ret = send_ctrl_msg_to_mvm(mvm_ctrl, mvm_dev);
+		ret = send_ctrl_msg_locked(mvm_ctrl, mvm_dev);
 		kfree(mvm_ctrl);
 	}
 	else {
@@ -2551,6 +2575,8 @@ static void trigger_ssr_work_hdlr(struct work_struct *work)
 	bool p0_fifo_has_results =0 ,p1_fifo_has_results =0;
 	gh_dbl_flags_t dbl_mask;
 
+	//Prevent PM state changes during SSR.
+	set_mvm_pm_state(mvm_dev, PM_STATE_SSR);
 	reinit_completion(&mvm_dev->mvm_dump_collection_done);
 	del_timer_sync(&mvm_dev->mvm_stats_timer);
 	if (mvm_dev->vm_variant == TELEVM) {
@@ -2609,6 +2635,8 @@ static void trigger_ssr_work_hdlr(struct work_struct *work)
 	if (mvm_dev->p1_int_mod != MVM_P1_INT_MOD_DEFAULT)
 		mvm_send_p1_interrupt_moderation_request(MVM_SET_P1_INT_MOD, mvm_dev->p1_int_mod, mvm_dev);
 	mod_timer(&mvm_dev->mvm_stats_timer,jiffies + msecs_to_jiffies(mvm_stats_timer_interval_ms));
+	//SSR completed, allow PM state changes again
+	set_mvm_pm_state(mvm_dev, PM_STATE_IDLE);
 	return;
 }
 
@@ -2967,8 +2995,12 @@ static int mvm_pm_notify(struct notifier_block *notifier,
 			pm_notifier);
 	int ret = 0;
 	struct mvm_client *mvm_cli;
+
 	switch (mode) {
 	case PM_SUSPEND_PREPARE:
+		//wait until the driver is in IDLE state
+		wait_event(mvm_dev->pm_wait_queue,
+			atomic_read(&mvm_dev->mvm_pm_state) == PM_STATE_IDLE);
 		if (mvm_dev->resume_frm_pwr_collapse ) {
 			if (mvm_dev->vm_variant == PVM_ONLY || mvm_dev->vm_variant == TELEVM) {
 				mvm_dev->resume_frm_pwr_collapse = false;
@@ -2976,6 +3008,8 @@ static int mvm_pm_notify(struct notifier_block *notifier,
 				send_mvm_state_to_user(mvm_dev, MVM_SUSPEND);
 				del_timer_sync(&mvm_dev->mvm_stats_timer);
 				reinit_completion(&mvm_dev->mvm_wfi_irq_recvd);
+				//Lock the input FIFO until resume, to prevent sending messages during suspend
+				mutex_lock(&mvm_dev->in_fifo_lock);
 				ret =  send_pwr_collpase_ctrl_msg(mvm_dev, 1);
 				list_for_each_entry(mvm_cli, &mvm_dev->client_list, list) {
 					if (mvm_cli->state != CLIENT_DISCONNECTING) {
@@ -2986,6 +3020,23 @@ static int mvm_pm_notify(struct notifier_block *notifier,
 			}
 		}
 		break;
+	case PM_POST_SUSPEND:
+		//PM_POST_SUSPEND notification will be recieved for every PM_SUSPEND_PREPARE.
+		//if PM_SUSPEND fails,then PM_RESUME will not be called but PM_POST_SUSPEND will be called
+		//reset driver/e21 back to normal state if failure observed in PM_SUSPEND
+		set_mvm_pm_state(mvm_dev, PM_STATE_IDLE);
+		if(mvm_dev->resume_frm_pwr_collapse == false){
+			//We are expecting resume has not called due failure in suspend routine!
+			//we need unlock input fifo the mutex
+			//send a control message to e21,make sure its comes out of power collapse state.
+			//disable the wfi bit to avoid surge of wfi interrupts
+			mutex_unlock(&mvm_dev->in_fifo_lock);
+			mvm_dev->resume_frm_pwr_collapse = true;
+			enable_wfi_int(mvm_dev, false);
+			send_pwr_collpase_ctrl_msg(mvm_dev, 0);
+			dev_info(mvm_dev->dev, "mvm post suspend:resetting power collapse\n");
+		}
+	    break;
 	default:
 		break;
 	}
@@ -3022,15 +3073,21 @@ static int mvm_suspend(struct device *dev)
 		break;
 	case PVM_ONLY:
 	case TELEVM:
+		set_mvm_pm_state(mvm_dev, PM_STATE_SUSPENDING);
 		dev_info(mvm_dev->dev, "mvm_info:pvm suspend recieved \n");
 		is_suspend = wait_for_mvmss_wfi_interrupt(mvm_dev);
 		if (is_suspend == 0) {
 			collapse_mvm_core(mvm_dev);
 			disable_gcc_clocks(mvm_dev);
 			dev_dbg(mvm_dev->dev, "MVM subsystem in power collapse mode\n");
+			set_mvm_pm_state(mvm_dev, PM_STATE_SUSPENDED);
 		}
 		if (is_suspend)
 		{
+			//Error: timeout waiting for wfi interrupt
+			//Bring back PM state back to idle
+			set_mvm_pm_state(mvm_dev, PM_STATE_IDLE);
+			mutex_unlock(&mvm_dev->in_fifo_lock);
 			reinit_completion(&mvm_dev->mvm_wfi_irq_recvd);
 			mvm_dev->resume_frm_pwr_collapse = true;
 			enable_wfi_int(mvm_dev, false);
@@ -3066,6 +3123,8 @@ static int mvm_resume(struct device *dev)
 	case PVM_ONLY:
 	case TELEVM:
 		dev_info(mvm_dev->dev, "pvm resume recieved \n");
+		wait_event(mvm_dev->pm_wait_queue,
+			atomic_read(&mvm_dev->mvm_pm_state) == PM_STATE_SUSPENDED);
 		is_resume = enable_gcc_clocks(mvm_dev);
 		if (is_resume)
 			dev_err(mvm_dev->dev, "Failed to turn on gcc clocks\n");
@@ -3075,6 +3134,9 @@ static int mvm_resume(struct device *dev)
 		}
 		enable_wfi_int(mvm_dev, false);
 		ret =  send_pwr_collpase_ctrl_msg(mvm_dev, 0);
+
+		//In fifo was locked prior to suspend, unlock now that MVM resumed
+		mutex_unlock(&mvm_dev->in_fifo_lock);
 		break;
 	default:
 		break;
@@ -3093,6 +3155,7 @@ static int mvm_resume(struct device *dev)
 		mvm_dev->prev_pke_time = 0;
 		mod_timer(&mvm_dev->mvm_stats_timer,jiffies + msecs_to_jiffies(mvm_stats_timer_interval_ms));
 	}
+	set_mvm_pm_state(mvm_dev, PM_STATE_IDLE);
 	return is_resume;
 }
 
@@ -3132,7 +3195,8 @@ static void change_clk_freq_work_hdlr(struct work_struct *work)
 		}
 		else if (mvm_dev->curr_clk == NOMINAL && mvm_dev->curr_pke_util < NOMINAL_LOWER_THRESH)
 			mvm_dev->req_clk = SVS;
-		if (mvm_dev->req_clk != mvm_dev->curr_clk) {
+		if ((mvm_dev->req_clk != mvm_dev->curr_clk) &&
+			(atomic_read(&mvm_dev->mvm_pm_state) == PM_STATE_IDLE)) {
 			/* Send control message to change the clock frequency */
 			struct mvm_control *mvm_ctrl = kzalloc(sizeof(struct mvm_control), GFP_KERNEL);
 			if (mvm_ctrl) {
@@ -3366,6 +3430,9 @@ static int mvm_probe(struct platform_device *pdev)
 		INIT_WORK(&mvm_dev->drain_out_fifo_work, drain_out_fifo_work_hdlr);
 		INIT_WORK(&mvm_dev->trigger_ssr_work, trigger_ssr_work_hdlr);
 		INIT_WORK(&mvm_dev->change_clk_freq_work, change_clk_freq_work_hdlr);
+
+		atomic_set(&mvm_dev->mvm_pm_state, PM_STATE_IDLE);
+		init_waitqueue_head(&mvm_dev->pm_wait_queue);
 
 		bitmap_zero(mvm_dev->client_id_bitmap, MAX_CLIENT_COUNT);
 		mvm_dev->pending_dump_read = false;
