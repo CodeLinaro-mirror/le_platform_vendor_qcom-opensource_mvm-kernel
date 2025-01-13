@@ -3480,6 +3480,9 @@ static int mvm_remove(struct platform_device *pdev)
 
 	mvm_dev = dev_get_drvdata(&pdev->dev);
 	if (mvm_dev->vm_variant == PVM_ONLY || mvm_dev->vm_variant == TELEVM) {
+		flush_work(&mvm_dev->drain_out_fifo_work);
+		flush_work(&mvm_dev->trigger_ssr_work);
+		flush_work(&mvm_dev->change_clk_freq_work);
 		list_for_each_entry_safe(mvm_cli, mvm_cli_temp, &mvm_dev->client_list, list) {
 				mvm_client_remove(mvm_dev,mvm_cli);
 		}
