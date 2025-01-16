@@ -3441,15 +3441,16 @@ static int mvm_remove(struct platform_device *pdev)
 
 	mvm_dev = dev_get_drvdata(&pdev->dev);
 	if (mvm_dev->vm_variant == PVM_ONLY || mvm_dev->vm_variant == TELEVM) {
-		flush_work(&mvm_dev->drain_out_fifo_work);
-		flush_work(&mvm_dev->trigger_ssr_work);
-		flush_work(&mvm_dev->change_clk_freq_work);
 		list_for_each_entry_safe(mvm_cli, mvm_cli_temp, &mvm_dev->client_list, list) {
 				mvm_client_remove(mvm_dev,mvm_cli);
 		}
 		list_for_each_entry_safe(mvm_stats_cli,mvm_stats_cli_temp, &mvm_dev->mvm_stats_client_list, list) {
 				mvm_stats_client_remove(mvm_dev,mvm_stats_cli);
 		}
+		del_timer_sync(&mvm_dev->mvm_stats_timer);
+		cancel_work_sync(&mvm_dev->drain_out_fifo_work);
+		cancel_work_sync(&mvm_dev->trigger_ssr_work);
+		cancel_work_sync(&mvm_dev->change_clk_freq_work);
 		mutex_destroy(&mvm_dev->in_fifo_lock);
 		mutex_destroy(&mvm_dev->out_fifo_lock);
 		mutex_destroy(&mvm_dev->mvm_cli_lock);
@@ -3457,7 +3458,6 @@ static int mvm_remove(struct platform_device *pdev)
 		class_destroy(mvm_dev->mvm_stats_class);
 		cdev_del(&mvm_dev->mvm_stats_cdev);
 		unregister_chrdev_region(mvm_dev->mvm_stats_cdev_devid, 1);
-		del_timer_sync(&mvm_dev->mvm_stats_timer);
 	}
 
 	if (mvm_dev->vm_variant == HOSTVM) {
