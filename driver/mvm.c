@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: GPL-2.0-only
-/* Copyright (c) 2022-2024 Qualcomm Innovation Center, Inc. All rights reserved.
+/* Copyright (c) 2022-2025 Qualcomm Innovation Center, Inc. All rights reserved.
  */
 #include <linux/platform_device.h>
 #include <linux/module.h>
@@ -1017,6 +1017,7 @@ static ssize_t mvm_log_show(struct kobject *kobj,
 		if (count >= (mvm_dev->ddr_head_pos - mvm_dev->ddr_tail_pos)*(sizeof(uint32_t))) {
 			memcpy(buf, mvm_dev->ddr_tail_pos, (mvm_dev->ddr_head_pos - mvm_dev->ddr_tail_pos)*4);
 			actual_length = (mvm_dev->ddr_head_pos - mvm_dev->ddr_tail_pos)*4;
+			mvm_dev->ddr_tail_pos = mvm_dev->ddr_tail_pos + (mvm_dev->ddr_head_pos - mvm_dev->ddr_tail_pos);
 		} else  {
 			memcpy(buf, mvm_dev->ddr_tail_pos, count);
 			mvm_dev->ddr_tail_pos = (mvm_dev->ddr_tail_pos +(count/4));
@@ -1029,6 +1030,7 @@ static ssize_t mvm_log_show(struct kobject *kobj,
 			buff_total = (buf+length_tail_to_bufferend);
 			memcpy(buff_total, &mvm_dev->log_buff->mvmlog_buffer[0], (mvm_dev->ddr_head_pos - &mvm_dev->log_buff->mvmlog_buffer[0]));
 			actual_length = length_tail_to_bufferend + (mvm_dev->ddr_head_pos - &mvm_dev->log_buff->mvmlog_buffer[0]);
+			mvm_dev->ddr_tail_pos = mvm_dev->ddr_head_pos;
 		}
 	}
 
