@@ -3154,8 +3154,8 @@ static int mvm_resume(struct device *dev)
 		mvm_dev->req_clk = LOW_SVS;
 		mvm_dev->prev_pke_time = 0;
 		mod_timer(&mvm_dev->mvm_stats_timer,jiffies + msecs_to_jiffies(mvm_stats_timer_interval_ms));
+		set_mvm_pm_state(mvm_dev, PM_STATE_IDLE);
 	}
-	set_mvm_pm_state(mvm_dev, PM_STATE_IDLE);
 	return is_resume;
 }
 
