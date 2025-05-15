@@ -420,6 +420,7 @@ static size_t mvm_send_p1_interrupt_moderation_request(int msg_type, uint32_t re
 static bool fifo_full(unsigned int fifo_head, unsigned int fifo_size, unsigned int fifo_tail);
 static int send_ctrl_msg_to_mvm(struct mvm_control *mvm_ctrl, struct mvm_device *mvm_dev);
 static int enable_gcc_clocks(struct mvm_device *mvm_dev);
+static int register_gcc_clocks(struct mvm_device *mvm_dev);
 int qcom_pil_info_store(const char *image, phys_addr_t base, size_t size);
 static ssize_t mvm_log_show(struct kobject *kobj,
 	struct kobj_attribute *mvm_log_attr,
@@ -2950,18 +2951,6 @@ static int enable_gcc_clocks(struct mvm_device *mvm_dev)
 {
 	int ret = 0;
 
-	mvm_dev->cnoc_s_ahb_clk = devm_clk_get(mvm_dev->dev, "mvmss_cnoc_ahb_clk");
-	if (IS_ERR(mvm_dev->cnoc_s_ahb_clk))
-		return PTR_ERR(mvm_dev->cnoc_s_ahb_clk);
-
-	mvm_dev->snoc_m_axi_clk = devm_clk_get(mvm_dev->dev, "mvmss_snoc_axi_clk");
-	if (IS_ERR(mvm_dev->snoc_m_axi_clk))
-		return PTR_ERR(mvm_dev->snoc_m_axi_clk);
-
-	mvm_dev->sysnoc_mvmss_clk = devm_clk_get(mvm_dev->dev, "sysnoc_mvmss_clk");
-	if (IS_ERR(mvm_dev->sysnoc_mvmss_clk))
-		return PTR_ERR(mvm_dev->sysnoc_mvmss_clk);
-
 	ret = clk_prepare_enable(mvm_dev->cnoc_s_ahb_clk);
 	if (ret) {
 		dev_err(mvm_dev->dev, "Failed to vote for cnoc_s_ahb_clk\n");
@@ -2986,6 +2975,22 @@ unprepare_cnoc_s_ahb:
 	return ret;
 }
 
+static int register_gcc_clocks(struct mvm_device *mvm_dev)
+{
+	mvm_dev->cnoc_s_ahb_clk = devm_clk_get(mvm_dev->dev, "mvmss_cnoc_ahb_clk");
+	if (IS_ERR(mvm_dev->cnoc_s_ahb_clk))
+		return PTR_ERR(mvm_dev->cnoc_s_ahb_clk);
+
+	mvm_dev->snoc_m_axi_clk = devm_clk_get(mvm_dev->dev, "mvmss_snoc_axi_clk");
+	if (IS_ERR(mvm_dev->snoc_m_axi_clk))
+		return PTR_ERR(mvm_dev->snoc_m_axi_clk);
+
+	mvm_dev->sysnoc_mvmss_clk = devm_clk_get(mvm_dev->dev, "sysnoc_mvmss_clk");
+	if (IS_ERR(mvm_dev->sysnoc_mvmss_clk))
+		return PTR_ERR(mvm_dev->sysnoc_mvmss_clk);
+
+	return 0;
+}
 
 static int mvm_pm_notify(struct notifier_block *notifier,
 			     unsigned long mode, void *_unused)
@@ -3445,6 +3450,11 @@ static int mvm_probe(struct platform_device *pdev)
 	}
 
 	if (mvm_dev->vm_variant == PVM_ONLY || mvm_dev->vm_variant == TELEVM) {
+		ret = register_gcc_clocks(mvm_dev);
+		if (ret) {
+			dev_err(mvm_dev->dev, "Failed to register gcc clocks\n");
+			goto gcc_err;
+		}
 		ret = enable_gcc_clocks(mvm_dev);
 		if (ret) {
 			dev_err(mvm_dev->dev, "Failed to turn on gcc clocks\n");
