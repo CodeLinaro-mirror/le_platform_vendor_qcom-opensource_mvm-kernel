@@ -409,6 +409,29 @@ static const uint32_t mvm_rate_lut[MAX_FREQ_PLAN][MAX_CURVES] = {
 	{9551, 4955, 10706, 3291, 1663},   /* SVS */
 	{14285, 7434, 16064, 4938, 2493}}; /*NOMINAL */
 
+
+struct cmd_map {
+    unsigned long cmd;
+    const char *name;
+};
+
+static const struct cmd_map cmd_mappings[] = {
+    { GH_VM_BEFORE_POWERUP,  "GH_VM_BEFORE_POWERUP" },
+    { GH_VM_POWERUP_FAIL,    "GH_VM_POWERUP_FAIL" },
+    { GH_VM_EARLY_POWEROFF,  "GH_VM_EARLY_POWEROFF" },
+    { GH_VM_POWEROFF,        "GH_VM_POWEROFF" },
+};
+
+static const char *get_cmd_name(unsigned long cmd)
+{
+    int i;
+    for (i = 0; i < ARRAY_SIZE(cmd_mappings); i++) {
+        if (cmd_mappings[i].cmd == cmd)
+            return cmd_mappings[i].name;
+    }
+    return "UNKNOWN_CMD";
+}
+
 // Static copies for crashscope to access these variables
 static struct mvm_crashdump_buffer *crashdump_buffer = NULL;
 __attribute__((used))
@@ -2311,6 +2334,9 @@ static int qcom_mvm_rm_cb(struct notifier_block *nb, unsigned long cmd,
 
 	mvm_dev = container_of(nb, struct mvm_device, rm_nb);
 	vm_status_payload = data;
+
+	dev_info(mvm_dev->dev, "%s: Received command: %s vmid =%u \n", __func__, get_cmd_name(cmd), vm_status_payload->vmid);
+
 	ret = gh_rm_get_vmid(GH_TELE_VM, &vmid);
 	if (ret) {
 		dev_err(mvm_dev->dev, "gh_rm_get_vmid failed\n");
