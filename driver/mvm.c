@@ -2301,6 +2301,23 @@ ret:
 	return ret;
 }
 
+static int send_pwr_collpase_ctrl_msg(struct mvm_device *mvm_dev, bool pwr_collapse) {
+	struct mvm_control *mvm_ctrl;
+	int ret = 0;
+	mvm_ctrl = kzalloc(sizeof(struct mvm_control), GFP_KERNEL);
+	if (mvm_ctrl) {
+		mvm_ctrl->type = MVM_POWER;
+		mvm_ctrl->mvm_ctrl_msg.power.enter_pwr_collapse = pwr_collapse;
+		ret = send_ctrl_msg_locked(mvm_ctrl, mvm_dev);
+		kfree(mvm_ctrl);
+	}
+	else {
+		dev_err(mvm_dev->dev, "send_pwr_collpase_ctrl_msg failed with null mvm_ctrl pointer\n");
+		ret = -1;
+	}
+	return ret;
+}
+
 static void mvm_hostvm_unshare_mem(struct mvm_device *mvm_dev)
 {
 	int ret;
@@ -2323,6 +2340,13 @@ static void mvm_hostvm_unshare_mem(struct mvm_device *mvm_dev)
 	if (ret)
 		dev_err(mvm_dev->dev,"hyp_unassign_mem_reclaim failed for label %u with ret = %d\n",
 					mvm_dev->mvm_log_buff_shm_label, ret);
+}
+
+static void disable_gcc_clocks(struct mvm_device *mvm_dev)
+{
+	clk_disable_unprepare(mvm_dev->snoc_m_axi_clk);
+	clk_disable_unprepare(mvm_dev->cnoc_s_ahb_clk);
+	clk_disable_unprepare(mvm_dev->sysnoc_mvmss_clk);
 }
 
 static int qcom_mvm_rm_cb(struct notifier_block *nb, unsigned long cmd,
@@ -2373,7 +2397,10 @@ static int qcom_mvm_rm_cb(struct notifier_block *nb, unsigned long cmd,
 			dev_err(mvm_dev->dev, "mem reclaim of apss_mem_handle failed with ret = %d\n",ret);
 
 		mvm_hostvm_unshare_mem(mvm_dev);
+		collapse_mvm_core(mvm_dev);
+		disable_gcc_clocks(mvm_dev);
 	}
+
 	return NOTIFY_DONE;
 
 hostvm_mem_share_fail:
@@ -2477,30 +2504,6 @@ out_release_firmware:
 	release_firmware(mvm_dev->fw);
 	mvm_dev->fw = NULL;
 ret:
-	return ret;
-}
-
-static void disable_gcc_clocks(struct mvm_device *mvm_dev)
-{
-	clk_disable_unprepare(mvm_dev->snoc_m_axi_clk);
-	clk_disable_unprepare(mvm_dev->cnoc_s_ahb_clk);
-	clk_disable_unprepare(mvm_dev->sysnoc_mvmss_clk);
-}
-
-static int send_pwr_collpase_ctrl_msg(struct mvm_device *mvm_dev, bool pwr_collapse) {
-	struct mvm_control *mvm_ctrl;
-	int ret = 0;
-	mvm_ctrl = kzalloc(sizeof(struct mvm_control), GFP_KERNEL);
-	if (mvm_ctrl) {
-		mvm_ctrl->type = MVM_POWER;
-		mvm_ctrl->mvm_ctrl_msg.power.enter_pwr_collapse = pwr_collapse;
-		ret = send_ctrl_msg_locked(mvm_ctrl, mvm_dev);
-		kfree(mvm_ctrl);
-	}
-	else {
-		dev_err(mvm_dev->dev, "send_pwr_collpase_ctrl_msg failed with null mvm_ctrl pointer\n");
-		ret = -1;
-	}
 	return ret;
 }
 
@@ -3614,15 +3617,16 @@ static int mvm_remove(struct platform_device *pdev)
 		gh_dbl_rx_unregister(mvm_dev->televm_rx_dbl);
 	}
 
+	if(mvm_dev->vm_variant == PVM_ONLY) {
+		collapse_mvm_core(mvm_dev);
+		disable_gcc_clocks(mvm_dev);
+	}
+
 	if (mvm_dev->vm_variant == PVM_ONLY || mvm_dev->vm_variant == HOSTVM) {
 		mvm_iommu_release(mvm_dev);
 		mvm_dma_mem_free(mvm_dev);
 	}
 	if(mvm_dev->vm_variant == PVM_ONLY || mvm_dev->vm_variant == TELEVM) {
-		enable_mvm_gdsc(mvm_dev,false);
-		clk_disable_unprepare(mvm_dev->cnoc_s_ahb_clk);
-		clk_disable_unprepare(mvm_dev->snoc_m_axi_clk);
-		clk_disable_unprepare(mvm_dev->sysnoc_mvmss_clk);
 		unregister_pm_notifier(&mvm_dev->pm_notifier);
 	}
 	sysfs_remove(mvm_dev);
