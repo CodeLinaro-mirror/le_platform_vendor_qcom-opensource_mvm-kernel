@@ -393,6 +393,7 @@ struct mvm_device {
 	uint32_t p1_int_delay_ms;
 	struct mvm_fw_version fw_version;
 	atomic_t mvm_pm_state;
+	atomic_t shutting_down;  /* Flag to indicate driver is being removed */
 };
 
 enum mvm_pm_state {
@@ -1525,8 +1526,13 @@ bool out_fifo_get_results(struct mvm_device *mvm_dev, unsigned int fifo_index)
 
 static void drain_out_fifo_work_hdlr(struct work_struct *work)
 {
+
 	struct mvm_device *mvm_dev = container_of(work, struct mvm_device, drain_out_fifo_work);
 	bool p0_fifo_has_results, p1_fifo_has_results, wake_up = false;
+
+	if (mvm_dev->state == MVM_SUSPEND || mvm_dev->state == MVM_CRASHED || atomic_read(&mvm_dev->shutting_down)) {
+		return;
+	}
 
 	mvm_dev->ring_buff->in_fifo[0].tail =
 		readl_relaxed(mvm_dev->mvm_base + MVMSS_CSR_INPUT_RING0_TAIL_PTR_OFFSET);
@@ -3040,7 +3046,9 @@ static int mvm_pm_notify(struct notifier_block *notifier,
 				mvm_dev->resume_frm_pwr_collapse = false;
 				mvm_dev->state = MVM_SUSPEND;
 				send_mvm_state_to_user(mvm_dev, MVM_SUSPEND);
+				cancel_work_sync(&mvm_dev->change_clk_freq_work);
 				del_timer_sync(&mvm_dev->mvm_stats_timer);
+				cancel_work_sync(&mvm_dev->drain_out_fifo_work);
 				reinit_completion(&mvm_dev->mvm_wfi_irq_recvd);
 				//Lock the input FIFO until resume, to prevent sending messages during suspend
 				mutex_lock(&mvm_dev->in_fifo_lock);
@@ -3445,7 +3453,7 @@ static int mvm_probe(struct platform_device *pdev)
 			goto isrs_fail;
 		}
 	}
-
+	atomic_set(&mvm_dev->shutting_down, 0);
 	if (mvm_dev->vm_variant == PVM_ONLY || mvm_dev->vm_variant == TELEVM) {
 		mutex_init(&mvm_dev->mvm_cli_lock);
 		mutex_init(&mvm_dev->in_fifo_lock);
@@ -3587,7 +3595,14 @@ static int mvm_remove(struct platform_device *pdev)
 	struct mvm_stats_client *mvm_stats_cli_temp;
 
 	mvm_dev = dev_get_drvdata(&pdev->dev);
+	atomic_set(&mvm_dev->shutting_down, 1);
+	smp_mb__after_atomic();
+
 	if (mvm_dev->vm_variant == PVM_ONLY || mvm_dev->vm_variant == TELEVM) {
+		if (mvm_dev->mvm_verif_done_irq) {
+			disable_irq(mvm_dev->mvm_verif_done_irq);
+			synchronize_irq(mvm_dev->mvm_verif_done_irq);
+		}
 		list_for_each_entry_safe(mvm_cli, mvm_cli_temp, &mvm_dev->client_list, list) {
 				mvm_client_remove(mvm_dev,mvm_cli);
 		}
