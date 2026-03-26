@@ -149,6 +149,13 @@ each of the actual P0 and P1 buffer starts */
 #define MVM_SHUTDOWN_DBL_MASK		0x1
 #define MVM_LOAD_FW_DBL_MASK		0x2
 #define MVM_INIT_FIFOS_DBL_MASK		0x3
+#define MVM_SHM_READY_DBL_MASK      0x4   /* host finished sharing buffers   */
+#define MVM_TELEVM_ONLINE_DBL_MASK  0x5  /* tele-VM finished ioremap       */
+#define MVM_FW_READY_DBL_MASK       0x8   /* host finished loading firmware  */
+#define MVM_SHUTDOWN_ACK_DBL_MASK   0x20  /* host acked tele-VM shutdown    */
+#define MVM_MEM_STATE_DBL_MASK      0x40
+#define MVM_MEM_STATE_READY         0x80
+#define MVM_MEM_STATE_ERROR         0x100
 #define MAX_CURVES			5
 #define MAX_FREQ_PLAN			3
 #define MVM_STATS_TIMEOUT_MS		100
@@ -206,6 +213,13 @@ enum mvm_curve {
 enum crash_dump_state {
 	INITIAL_STATE,
 	COLLECTION_IN_PROGRESS,
+};
+
+enum mvm_mem_state {
+    MVM_MEM_UNINITIALIZED,
+    MVM_MEM_SHARING_IN_PROGRESS,
+    MVM_MEM_READY,
+    MVM_MEM_ERROR
 };
 
 static const char * const mvm_states[] = {
@@ -314,6 +328,9 @@ struct mvm_device {
 	struct completion mvm_dump_collection_done;
 	struct completion mvm_suspend_done;
 	struct completion mvm_resume_done;
+	struct completion tele_online;  /* host waits for TELEVM_ONLINE */
+	bool load_firmware;                /* set when TELEVM_ONLINE is received */
+	struct completion   shutdown_ack;   /* host waits for Tele‑VM shutdown ACK */
 	struct kobject *kobj;
 	struct kobj_attribute mvm_state_attr;
 	struct kobj_attribute mvm_capacity_attr;
@@ -439,6 +456,19 @@ __attribute__((used))
 static dma_addr_t crashdump_dma_addr = 0;
 __attribute__((used))
 static size_t crashdump_size = MVM_CRASH_DUMP_SIZE;
+
+static void mvm_fw_cleanup(struct mvm_device *mvm_dev)
+{
+	if (mvm_dev->fw) {
+		release_firmware(mvm_dev->fw);
+		mvm_dev->fw = NULL;
+	}
+	if (mvm_dev->mvm_fw) {
+		dma_free_coherent(mvm_dev->dev, MVM_FW_SIZE,
+				  mvm_dev->mvm_fw, mvm_dev->mvm_fw_dma);
+		mvm_dev->mvm_fw = NULL;
+	}
+}
 
 static size_t mvm_send_p1_interrupt_moderation_request(int msg_type, uint32_t requested_value, struct mvm_device *mvm_dev);
 static bool fifo_full(unsigned int fifo_head, unsigned int fifo_size, unsigned int fifo_tail);
@@ -2157,6 +2187,7 @@ static int mvm_hostvm_mem_share(struct mvm_device *mvm_dev)
 {
 	struct gh_acl_desc *mvm_acl_desc;
 	struct gh_sgl_desc *mvm_sgl_desc;
+	gh_dbl_flags_t shm_ready_mask;
 	int srcVMperm[1] = {PERM_READ | PERM_WRITE};
 	int srcVM[1] = {AC_VM_HLOS};
 	int destVM[2] = {AC_VM_HLOS, mvm_dev->televm_vmid};
@@ -2208,10 +2239,19 @@ static int mvm_hostvm_mem_share(struct mvm_device *mvm_dev)
 				   round_up(sizeof(struct mvmlog_buffers), PAGE_SIZE),
 				   mvm_dev->mvm_log_buff_shm_label,
 				   &mvm_dev->log_buff_mem_handle);
-	if (ret)
+	if (ret) {
+	    dev_info(mvm_dev->dev, "Host Vm Failed with memory\n");
 		goto mem_share_log_buff_fail;
-	else
-		goto free_mem;
+	}
+	else {
+		/* Send SHM_READY notification to TeleVM */
+		shm_ready_mask = MVM_SHM_READY_DBL_MASK;
+		ret = gh_dbl_send(mvm_dev->hostvm_tx_dbl, &shm_ready_mask, 0);
+		if (ret) {
+			dev_err(mvm_dev->dev, "Failed to send MVM_SHM_READY_DBL to televm %d\n", ret);
+		}
+		return ret;
+	}
 
 
 mem_share_log_buff_fail:
@@ -2375,7 +2415,8 @@ static int qcom_mvm_rm_cb(struct notifier_block *nb, unsigned long cmd,
 	}
 	if (vm_status_payload->vmid == vmid && cmd == GH_VM_BEFORE_POWERUP) {
 		mvm_dev->televm_vmid = vmid;
-
+		reinit_completion(&mvm_dev->tele_online);
+		mvm_dev->load_firmware = false;
 		ret = read_shm_labels(mvm_dev);
 		if (ret) {
 			dev_err(mvm_dev->dev, "read_shm_labels failed\n");
@@ -2394,6 +2435,7 @@ static int qcom_mvm_rm_cb(struct notifier_block *nb, unsigned long cmd,
 		}
 	}
 	else if (vm_status_payload->vmid == mvm_dev->televm_vmid && cmd == GH_VM_POWEROFF) {
+		mvm_dev->load_firmware = false;
 		ret = gh_rm_mem_reclaim(mvm_dev->mvmss_mem_handle, 0);
 		if (ret)
 			dev_err(mvm_dev->dev,"mem reclaim of mvmss_mem_handle failed with ret = %d\n",ret);
@@ -2401,12 +2443,11 @@ static int qcom_mvm_rm_cb(struct notifier_block *nb, unsigned long cmd,
 		ret = gh_rm_mem_reclaim(mvm_dev->apss_mem_handle, 0);
 		if (ret)
 			dev_err(mvm_dev->dev, "mem reclaim of apss_mem_handle failed with ret = %d\n",ret);
-
 		mvm_hostvm_unshare_mem(mvm_dev);
+		mvm_fw_cleanup(mvm_dev);
 		collapse_mvm_core(mvm_dev);
 		disable_gcc_clocks(mvm_dev);
 	}
-
 	return NOTIFY_DONE;
 
 hostvm_mem_share_fail:
@@ -2447,18 +2488,30 @@ err:
 static int mvm_load_fw(struct mvm_device *mvm_dev)
 {
 	int ret = 0;
+	gh_dbl_flags_t dbl_mask;
+	gh_dbl_flags_t fw_ready_mask;
 
-        if (mvm_dev->vm_variant == TELEVM) {
-		gh_dbl_flags_t dbl_mask = MVM_LOAD_FW_DBL_MASK;
+    if (mvm_dev->vm_variant == TELEVM) {
+		dbl_mask = MVM_LOAD_FW_DBL_MASK;
 		ret = gh_dbl_send(mvm_dev->televm_tx_dbl, &dbl_mask, 0);
 		if (ret) {
 			dev_err(mvm_dev->dev, "failed to send MVM_LOAD_FW_DBL to hostvm %d\n", ret);
 			goto ret;
 		}
-		dev_dbg(mvm_dev->dev, "Sent MVM_LOAD_FW_DBL to hostvm\n");
+	}
+
+	if ((mvm_dev->vm_variant == HOSTVM) && (!mvm_dev->load_firmware)) {
+		ret = wait_for_completion_interruptible_timeout(&mvm_dev->tele_online,
+											 msecs_to_jiffies(10000)); // 5 second timeout
+		if (ret == 0)
+		{
+			goto ret;
+		}
 	}
 	if (mvm_dev->vm_variant == PVM_ONLY || mvm_dev->vm_variant == HOSTVM) {
 		update_marker("M - Loading MVM firmware");
+		
+		/* Clean up any existing firmware resources before loading new firmware */
 		if (mvm_dev->fw == NULL) {
 			ret = -1;
 			dev_err(mvm_dev->dev, "Firmware object is NULL, Failed to load firmware\n");
@@ -2492,13 +2545,21 @@ static int mvm_load_fw(struct mvm_device *mvm_dev)
 		}
 	}
 	if (mvm_dev->vm_variant == HOSTVM) {
-		gh_dbl_flags_t dbl_mask = MVM_INIT_FIFOS_DBL_MASK;
+		dbl_mask = MVM_INIT_FIFOS_DBL_MASK;
 		ret = gh_dbl_send(mvm_dev->hostvm_tx_dbl, &dbl_mask, 0);
 		if (ret) {
 			dev_err(mvm_dev->dev, "Failed to send MVM_INIT_FIFOS_DBL to televm %d\n", ret);
 			goto out_release_firmware;
 		}
 		dev_dbg(mvm_dev->dev, "Sent MVM_INIT_FIFOS_DBL to televm\n");
+
+		/* Send FW_READY notification to TeleVM */
+		fw_ready_mask = MVM_FW_READY_DBL_MASK;
+		ret = gh_dbl_send(mvm_dev->hostvm_tx_dbl, &fw_ready_mask, 0);
+		if (ret) {
+			dev_err(mvm_dev->dev, "Failed to send MVM_FW_READY_DBL to televm %d\n", ret);
+			goto out_release_firmware;
+		}
 		mvm_dev->state = MVM_ONLINE;
 	}
 	else if (mvm_dev->vm_variant == PVM_ONLY)
@@ -2507,15 +2568,16 @@ static int mvm_load_fw(struct mvm_device *mvm_dev)
 	goto ret;
 
 out_release_firmware:
-	release_firmware(mvm_dev->fw);
-	mvm_dev->fw = NULL;
+	mvm_fw_cleanup(mvm_dev);
 ret:
 	return ret;
 }
 
+
 static void mvm_hostvm_rx_dbl_cb(int irq, void *data)
 {
 	gh_dbl_flags_t dbl_mask = DBL_MASK;
+	gh_dbl_flags_t ack_mask;
 	struct mvm_device *mvm_dev;
 	int ret;
 
@@ -2524,7 +2586,6 @@ static void mvm_hostvm_rx_dbl_cb(int irq, void *data)
 	if(ret){
 		dev_err(mvm_dev->dev, "Error reading from doorbell\n");
 	}
-	dev_dbg(mvm_dev->dev, "Received mvm_hostvm_rx_dbl_cb with mask %x\n", dbl_mask);
 
 	if (dbl_mask == MVM_SHUTDOWN_DBL_MASK) {
 		mvm_dev->state = MVM_CRASHED;
@@ -2533,14 +2594,28 @@ static void mvm_hostvm_rx_dbl_cb(int irq, void *data)
 			dev_err(mvm_dev->dev, "Error sending shutdown request to MVM\n");
 			return;
 		}
+		/* Send acknowledgment back to TeleVM */
+		ack_mask = MVM_SHUTDOWN_ACK_DBL_MASK;
+		ret = gh_dbl_send(mvm_dev->hostvm_tx_dbl, &ack_mask, 0);
+		if (ret) {
+			dev_err(mvm_dev->dev, "Failed to send MVM_SHUTDOWN_ACK_DBL to televm %d\n", ret);
+		} else {
+			dev_dbg(mvm_dev->dev, "Sent MVM_SHUTDOWN_ACK_DBL to televm\n");
+		}
+
+		release_firmware(mvm_dev->fw);
 	} else if (dbl_mask == MVM_LOAD_FW_DBL_MASK) {
+		dev_info(mvm_dev->dev, "-televm MVM_LOAD_FW_DBL_MASK is up firmware load \n");
 		mvm_dev->state = (mvm_dev->state == MVM_CRASHED)? MVM_RESTARTING : mvm_dev->state;
+		mvm_dev->load_firmware = true;
+		complete(&mvm_dev->tele_online);
 		mvm_load_fw(mvm_dev);
 	}
+
 	ret = gh_dbl_reset(mvm_dev->hostvm_rx_dbl, GH_DBL_NONBLOCK);
-	if(ret){
-		dev_err(mvm_dev->dev, "Error resetting rx doorbell\n");
-	}
+  	if(ret){
+ 		dev_err(mvm_dev->dev, "Error resetting rx doorbell\n");
+ 	}
 }
 
 static void mvm_televm_rx_dbl_cb(int irq, void *data)
@@ -2554,11 +2629,23 @@ static void mvm_televm_rx_dbl_cb(int irq, void *data)
 	if(ret){
 		dev_err(mvm_dev->dev, "Error reading from doorbell\n");
 	}
-	dev_dbg(mvm_dev->dev, "Received mvm_televm_rx_dbl_cb with mask %x\n", dbl_mask);
+	dev_info(mvm_dev->dev, "Received mvm_televm_rx_dbl_cb with mask %x\n", dbl_mask);
 
-	if (dbl_mask == MVM_INIT_FIFOS_DBL_MASK) {
+	if (dbl_mask & MVM_INIT_FIFOS_DBL_MASK) {
 		initialise_fifos(mvm_dev);
-		dev_dbg(mvm_dev->dev,"initialise_fifos done, registering isrs\n");
+		dev_info(mvm_dev->dev,"initialise_fifos done and registering isrs\n");
+	} else if (dbl_mask == MVM_SHM_READY_DBL_MASK) {
+		/* Host has finished sharing buffers */
+		dev_dbg(mvm_dev->dev, "Host has finished sharing buffers\n");
+	} else if (dbl_mask == MVM_FW_READY_DBL_MASK) {
+		/* Host has finished loading firmware */
+		dev_dbg(mvm_dev->dev, "Host has finished loading firmware\n");
+		/* TeleVM can now proceed with any initialization that depends on firmware */
+	} else if (dbl_mask == MVM_SHUTDOWN_ACK_DBL_MASK) {
+		/* Host has acknowledged TeleVM shutdown */
+		dev_dbg(mvm_dev->dev, "Host has acknowledged TeleVM shutdown\n");
+		/* TeleVM can now proceed with shutdown sequence */
+		complete(&mvm_dev->shutdown_ack);
 	}
 
 	ret = gh_dbl_reset(mvm_dev->televm_rx_dbl, GH_DBL_NONBLOCK);
@@ -2614,6 +2701,10 @@ static void trigger_ssr_work_hdlr(struct work_struct *work)
 	//Prevent PM state changes during SSR.
 	set_mvm_pm_state(mvm_dev, PM_STATE_SSR);
 	reinit_completion(&mvm_dev->mvm_dump_collection_done);
+	reinit_completion(&mvm_dev->tele_online);
+	reinit_completion(&mvm_dev->shutdown_ack);
+	mvm_dev->load_firmware = false;
+	mvm_dev->state = MVM_CRASHED;
 	del_timer_sync(&mvm_dev->mvm_stats_timer);
 	if (mvm_dev->vm_variant == TELEVM) {
 		dbl_mask = MVM_SHUTDOWN_DBL_MASK;
@@ -2623,6 +2714,10 @@ static void trigger_ssr_work_hdlr(struct work_struct *work)
 			return;
 		}
 		dev_dbg(mvm_dev->dev, "Sent MVM_SHUTDOWN_DBL to hostvm\n");
+		ret = wait_for_completion_interruptible_timeout(&mvm_dev->shutdown_ack,
+                                          msecs_to_jiffies(9000));
+		if (ret == 0)
+			dev_warn(mvm_dev->dev, "Timed out waiting for Tele‑VM shutdown‑ACK\n");
 	} else if (mvm_dev->vm_variant == PVM_ONLY) {
 		ret = qcom_scm_pas_shutdown(MVM_PROC_ID);
 		if (ret) {
@@ -3352,6 +3447,14 @@ static int mvm_probe(struct platform_device *pdev)
 		dev_err(mvm_dev->dev, "qcom,vm_variant property not defined\n");
 	}
 
+	if (mvm_dev->vm_variant == HOSTVM || mvm_dev->vm_variant == TELEVM) {
+		ret = mvm_doorbell_register(mvm_dev);
+		if (ret) {
+			dev_err(mvm_dev->dev, "mvm_doorbell_register failed\n");
+			goto drv_err;
+		}
+	}
+
 	if (mvm_dev->vm_variant == PVM_ONLY || mvm_dev->vm_variant == TELEVM) {
 		struct device *dev;
 
@@ -3402,6 +3505,34 @@ static int mvm_probe(struct platform_device *pdev)
 		ret = mvm_iommu_init(mvm_dev);
 		if (ret)
 			goto iommu_init_fail;
+	}
+	init_completion(&mvm_dev->shutdown_ack);
+	init_completion(&mvm_dev->tele_online);
+	mvm_dev->load_firmware = false;
+	if (mvm_dev->vm_variant == PVM_ONLY || mvm_dev->vm_variant == TELEVM) {
+		mutex_init(&mvm_dev->mvm_cli_lock);
+		mutex_init(&mvm_dev->in_fifo_lock);
+		mutex_init(&mvm_dev->out_fifo_lock);
+
+		init_completion(&mvm_dev->p0_fifo_slot_available);
+		init_completion(&mvm_dev->p1_fifo_slot_available);
+		init_completion(&mvm_dev->mvm_dump_collection_done);
+		init_completion(&mvm_dev->mvm_wfi_irq_recvd);
+		init_completion(&mvm_dev->mvm_suspend_done);
+		init_completion(&mvm_dev->mvm_resume_done);
+
+		INIT_LIST_HEAD(&mvm_dev->client_list);
+		INIT_LIST_HEAD(&mvm_dev->mvm_stats_client_list);
+		init_waitqueue_head(&mvm_dev->mvm_waitqueue);
+		INIT_WORK(&mvm_dev->drain_out_fifo_work, drain_out_fifo_work_hdlr);
+		INIT_WORK(&mvm_dev->trigger_ssr_work, trigger_ssr_work_hdlr);
+		INIT_WORK(&mvm_dev->change_clk_freq_work, change_clk_freq_work_hdlr);
+
+		atomic_set(&mvm_dev->mvm_pm_state, PM_STATE_IDLE);
+		init_waitqueue_head(&mvm_dev->pm_wait_queue);
+
+		bitmap_zero(mvm_dev->client_id_bitmap, MAX_CLIENT_COUNT);
+		mvm_dev->pending_dump_read = false;
 	}
 	if(mvm_dev->vm_variant == HOSTVM) {
 		mvm_dev->rm_nb.notifier_call = qcom_mvm_rm_cb;
@@ -3455,31 +3586,6 @@ static int mvm_probe(struct platform_device *pdev)
 	}
 	atomic_set(&mvm_dev->shutting_down, 0);
 	if (mvm_dev->vm_variant == PVM_ONLY || mvm_dev->vm_variant == TELEVM) {
-		mutex_init(&mvm_dev->mvm_cli_lock);
-		mutex_init(&mvm_dev->in_fifo_lock);
-		mutex_init(&mvm_dev->out_fifo_lock);
-
-		init_completion(&mvm_dev->p0_fifo_slot_available);
-		init_completion(&mvm_dev->p1_fifo_slot_available);
-		init_completion(&mvm_dev->mvm_dump_collection_done);
-		init_completion(&mvm_dev->mvm_wfi_irq_recvd);
-		init_completion(&mvm_dev->mvm_suspend_done);
-		init_completion(&mvm_dev->mvm_resume_done);
-
-		INIT_LIST_HEAD(&mvm_dev->client_list);
-		INIT_LIST_HEAD(&mvm_dev->mvm_stats_client_list);
-		init_waitqueue_head(&mvm_dev->mvm_waitqueue);
-		INIT_WORK(&mvm_dev->drain_out_fifo_work, drain_out_fifo_work_hdlr);
-		INIT_WORK(&mvm_dev->trigger_ssr_work, trigger_ssr_work_hdlr);
-		INIT_WORK(&mvm_dev->change_clk_freq_work, change_clk_freq_work_hdlr);
-
-		atomic_set(&mvm_dev->mvm_pm_state, PM_STATE_IDLE);
-		init_waitqueue_head(&mvm_dev->pm_wait_queue);
-
-		bitmap_zero(mvm_dev->client_id_bitmap, MAX_CLIENT_COUNT);
-		mvm_dev->pending_dump_read = false;
-	}
-	if (mvm_dev->vm_variant == PVM_ONLY || mvm_dev->vm_variant == TELEVM) {
 		mvm_dev->pm_notifier.notifier_call = mvm_pm_notify;
 		ret = register_pm_notifier(&mvm_dev->pm_notifier);
 		if (ret)
@@ -3504,13 +3610,7 @@ static int mvm_probe(struct platform_device *pdev)
 			goto gdsc_err;
 		}
 	}
-	if (mvm_dev->vm_variant == HOSTVM || mvm_dev->vm_variant == TELEVM) {
-		ret = mvm_doorbell_register(mvm_dev);
-		if (ret) {
-			dev_err(mvm_dev->dev, "mvm_doorbell_register failed\n");
-			goto doorbell_fail;
-		}
-	}
+
 	mvm_dev->resume_frm_pwr_collapse = true;
 	if (mvm_dev->vm_variant == PVM_ONLY || mvm_dev->vm_variant == HOSTVM) {
 
@@ -3531,6 +3631,20 @@ static int mvm_probe(struct platform_device *pdev)
 			goto doorbell_fail;
 		}
 	}
+
+	if (mvm_dev->vm_variant == TELEVM)
+	{
+		gh_dbl_flags_t online_mask;
+		/* if all goood Send TELEVM_ONLINE notification to HostVM */
+		dev_info(mvm_dev->dev, "Televm ready to load firmware");
+		online_mask = MVM_TELEVM_ONLINE_DBL_MASK;
+		ret = gh_dbl_send(mvm_dev->televm_tx_dbl, &online_mask, 0);
+		if (ret) {
+			dev_info(mvm_dev->dev, "Failed to send MVM_TELEVM_ONLINE_DBL to hostvm %d\n", ret);
+		} else {
+			dev_info(mvm_dev->dev, "new::Sent MVM_TELEVM_ONLINE_DBL to hostvm\n");
+		}
+    }
 	return 0;
 
 doorbell_fail:
@@ -3603,6 +3717,19 @@ static int mvm_remove(struct platform_device *pdev)
 			disable_irq(mvm_dev->mvm_verif_done_irq);
 			synchronize_irq(mvm_dev->mvm_verif_done_irq);
 		}
+	    mvm_dev->load_firmware = false;
+		if (mvm_dev->mvm_ssr_done_irq) {
+            disable_irq(mvm_dev->mvm_ssr_done_irq);
+            synchronize_irq(mvm_dev->mvm_ssr_done_irq);
+        }
+		if (mvm_dev->wfi_irq) {
+            disable_irq(mvm_dev->wfi_irq);
+            synchronize_irq(mvm_dev->wfi_irq);
+        }
+		if (mvm_dev->wdog_irq) {
+            disable_irq(mvm_dev->wdog_irq);
+            synchronize_irq(mvm_dev->wdog_irq);
+        }
 		list_for_each_entry_safe(mvm_cli, mvm_cli_temp, &mvm_dev->client_list, list) {
 				mvm_client_remove(mvm_dev,mvm_cli);
 		}
@@ -3633,6 +3760,7 @@ static int mvm_remove(struct platform_device *pdev)
 	}
 
 	if(mvm_dev->vm_variant == PVM_ONLY) {
+		mvm_fw_cleanup(mvm_dev);
 		collapse_mvm_core(mvm_dev);
 		disable_gcc_clocks(mvm_dev);
 	}
