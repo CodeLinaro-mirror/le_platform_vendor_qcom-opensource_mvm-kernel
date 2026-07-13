@@ -457,18 +457,7 @@ static dma_addr_t crashdump_dma_addr = 0;
 __attribute__((used))
 static size_t crashdump_size = MVM_CRASH_DUMP_SIZE;
 
-static void mvm_fw_cleanup(struct mvm_device *mvm_dev)
-{
-	if (mvm_dev->fw) {
-		release_firmware(mvm_dev->fw);
-		mvm_dev->fw = NULL;
-	}
-	if (mvm_dev->mvm_fw) {
-		dma_free_coherent(mvm_dev->dev, MVM_FW_SIZE,
-				  mvm_dev->mvm_fw, mvm_dev->mvm_fw_dma);
-		mvm_dev->mvm_fw = NULL;
-	}
-}
+
 
 static size_t mvm_send_p1_interrupt_moderation_request(int msg_type, uint32_t requested_value, struct mvm_device *mvm_dev);
 static bool fifo_full(unsigned int fifo_head, unsigned int fifo_size, unsigned int fifo_tail);
@@ -2444,7 +2433,6 @@ static int qcom_mvm_rm_cb(struct notifier_block *nb, unsigned long cmd,
 		if (ret)
 			dev_err(mvm_dev->dev, "mem reclaim of apss_mem_handle failed with ret = %d\n",ret);
 		mvm_hostvm_unshare_mem(mvm_dev);
-		mvm_fw_cleanup(mvm_dev);
 		collapse_mvm_core(mvm_dev);
 		disable_gcc_clocks(mvm_dev);
 	}
@@ -2568,7 +2556,6 @@ static int mvm_load_fw(struct mvm_device *mvm_dev)
 	goto ret;
 
 out_release_firmware:
-	mvm_fw_cleanup(mvm_dev);
 ret:
 	return ret;
 }
@@ -3711,7 +3698,6 @@ static int mvm_remove(struct platform_device *pdev)
 	mvm_dev = dev_get_drvdata(&pdev->dev);
 	atomic_set(&mvm_dev->shutting_down, 1);
 	smp_mb__after_atomic();
-
 	if (mvm_dev->vm_variant == PVM_ONLY || mvm_dev->vm_variant == TELEVM) {
 		if (mvm_dev->mvm_verif_done_irq) {
 			disable_irq(mvm_dev->mvm_verif_done_irq);
@@ -3760,7 +3746,6 @@ static int mvm_remove(struct platform_device *pdev)
 	}
 
 	if(mvm_dev->vm_variant == PVM_ONLY) {
-		mvm_fw_cleanup(mvm_dev);
 		collapse_mvm_core(mvm_dev);
 		disable_gcc_clocks(mvm_dev);
 	}
