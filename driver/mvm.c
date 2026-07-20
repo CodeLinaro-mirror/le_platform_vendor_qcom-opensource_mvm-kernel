@@ -2590,7 +2590,6 @@ static void mvm_hostvm_rx_dbl_cb(int irq, void *data)
 			dev_dbg(mvm_dev->dev, "Sent MVM_SHUTDOWN_ACK_DBL to televm\n");
 		}
 
-		release_firmware(mvm_dev->fw);
 	} else if (dbl_mask == MVM_LOAD_FW_DBL_MASK) {
 		dev_info(mvm_dev->dev, "-televm MVM_LOAD_FW_DBL_MASK is up firmware load \n");
 		mvm_dev->state = (mvm_dev->state == MVM_CRASHED)? MVM_RESTARTING : mvm_dev->state;
