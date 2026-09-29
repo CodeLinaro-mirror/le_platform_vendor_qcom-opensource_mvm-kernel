@@ -1704,6 +1704,11 @@ static long mvm_ioctl(struct file *filp, unsigned int cmd, unsigned long arg)
 		mvm_cli->state = CLIENT_READY;
 		mvm_cli->out_buff->head = 0;
 		mvm_cli->out_buff->tail = 0;
+		mvm_cli->out_buff->count = 0;
+		mvm_cli->msgs_sent = 0;
+		mvm_cli->results_recvd = 0;
+		memset(mvm_cli->out_buff->out_msg, 0,
+			sizeof(struct output_msg) * OUT_BUFF_SIZE);
 		break;
 	}
 
@@ -1939,6 +1944,18 @@ static void initialise_fifos(struct mvm_device *mvm_dev)
 	uint32_t infifo_size, outfifo_size;
 	infifo_size = sizeof(struct input_fifo);
 	outfifo_size = sizeof(struct output_fifo);
+
+	/* Clear ring buffer message data to prevent stale data from being
+	 * read after SSR. Only the base[] arrays need clearing; the
+	 * head/tail/count/size fields are reset explicitly below. */
+	memset(mvm_dev->ring_buff->in_fifo[0].base, 0,
+		sizeof(mvm_dev->ring_buff->in_fifo[0].base));
+	memset(mvm_dev->ring_buff->in_fifo[1].base, 0,
+		sizeof(mvm_dev->ring_buff->in_fifo[1].base));
+	memset(mvm_dev->ring_buff->out_fifo[0].base, 0,
+		sizeof(mvm_dev->ring_buff->out_fifo[0].base));
+	memset(mvm_dev->ring_buff->out_fifo[1].base, 0,
+		sizeof(mvm_dev->ring_buff->out_fifo[1].base));
 
 	/*initialise P0 Input Ring buffer pointers */
 	mvm_dev->ring_buff->in_fifo[0].head = 0;
